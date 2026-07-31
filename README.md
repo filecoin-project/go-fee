@@ -33,7 +33,7 @@ pinned to it by [cross-implementation test vectors](./vectors/README.md).
 go get github.com/filecoin-project/go-fee
 ```
 
-Requires Go 1.26+. The package name is `fee` (the module path ends in
+Requires Go 1.25+. The package name is `fee` (the module path ends in
 `go-fee`), so an explicit import name keeps things readable:
 
 ```go
