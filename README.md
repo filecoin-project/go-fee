@@ -294,7 +294,9 @@ func readRange(blob, cek []byte, off, length int64) ([]byte, error) {
     }
 
     // Which contiguous ciphertext bytes cover the requested plaintext range?
-    start, n, err := aesstream.CiphertextRange(int64(len(ciphertext)), chunkSize, off, length)
+    // The third result (ignored here) is the clamped plaintext length of the
+    // range — available before any fetch, e.g. for an HTTP Content-Length.
+    start, n, _, err := aesstream.CiphertextRange(int64(len(ciphertext)), chunkSize, off, length)
     if err != nil {
         return nil, err
     }

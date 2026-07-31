@@ -51,6 +51,12 @@
 // Reader.Read (or any non-nil error from Open) as "the plaintext is
 // incomplete and must be discarded": only a clean io.EOF means the whole
 // segment was received intact.
+//
+// The truncation guarantee above is Reader's, which sees the stream to
+// its end. Range decryption (CiphertextRange / SpanReader / OpenSpan)
+// authenticates every chunk it reads but necessarily trusts the declared
+// total ciphertext length; see SpanReader for what that means for
+// whole-object integrity.
 package aesstream
 
 import (

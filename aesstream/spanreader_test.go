@@ -27,7 +27,7 @@ func seal(t *testing.T, cfg aesstream.Config, pt []byte) []byte {
 // aren't themselves checking CiphertextRange's output.)
 func fetchSpan(t *testing.T, ct []byte, ciphertextSize int64, chunkSize int, off, length int64) io.Reader {
 	t.Helper()
-	start, n, err := aesstream.CiphertextRange(ciphertextSize, chunkSize, off, length)
+	start, n, _, err := aesstream.CiphertextRange(ciphertextSize, chunkSize, off, length)
 	require.NoErrorf(t, err, "CiphertextRange off=%d len=%d", off, length)
 	return bytes.NewReader(ct[start : start+n])
 }
@@ -102,11 +102,13 @@ func TestSpanReader(t *testing.T) {
 				size := int64(len(ct))
 				want := pt[tc.off : tc.off+tc.wantLen]
 
-				// CiphertextRange reports exactly the expected span.
-				start, n, err := aesstream.CiphertextRange(size, cs, tc.off, tc.length)
+				// CiphertextRange reports exactly the expected span, and the
+				// clamped plaintext length of the range.
+				start, n, plainLen, err := aesstream.CiphertextRange(size, cs, tc.off, tc.length)
 				require.NoError(t, err, "CiphertextRange")
 				require.Equal(t, tc.wantStart, start, "start")
 				require.Equal(t, tc.wantN, n, "n")
+				require.Equal(t, tc.wantLen, plainLen, "plainLen")
 
 				// Decrypt from a reader over exactly that span — sliced by the
 				// literal bounds, so this does not lean on CiphertextRange —
@@ -117,10 +119,13 @@ func TestSpanReader(t *testing.T) {
 				require.Equal(t, want, got, "OpenSpan output")
 				require.Equal(t, tc.wantN, cr.n, "should consume exactly the span")
 
-				// The streaming reader, drained one byte at a time, agrees.
-				rr, err := aesstream.NewSpanReader(bytes.NewReader(ct[tc.wantStart:tc.wantStart+tc.wantN]), size, cfg, tc.off, tc.length)
+				// The streaming reader, drained one byte at a time, agrees —
+				// and its Len matches CiphertextRange's plainLen, tying the
+				// clamping rule to a single place.
+				rr, err := aesstream.NewSpanReader(bytes.NewReader(ct[tc.wantStart:tc.wantStart+tc.wantN]), cfg, size, tc.off, tc.length)
 				require.NoError(t, err, "NewSpanReader")
 				require.Equal(t, tc.wantLen, rr.Len(), "Len")
+				require.Equal(t, plainLen, rr.Len(), "Len agrees with CiphertextRange plainLen")
 				require.Equal(t, want, drainTiny(t, rr), "streamed output")
 			})
 		}
@@ -153,7 +158,7 @@ func TestSpanReader(t *testing.T) {
 					require.NoErrorf(t, err, "OpenSpan plen=%d w=%d off=%d", plen, w, off)
 					oneShot = append(oneShot, got...)
 
-					rr, err := aesstream.NewSpanReader(fetchSpan(t, ct, size, cs, off, w), size, cfg, off, w)
+					rr, err := aesstream.NewSpanReader(fetchSpan(t, ct, size, cs, off, w), cfg, size, off, w)
 					require.NoErrorf(t, err, "NewSpanReader plen=%d w=%d off=%d", plen, w, off)
 					data, err := io.ReadAll(rr)
 					require.NoErrorf(t, err, "ReadAll plen=%d w=%d off=%d", plen, w, off)
@@ -191,17 +196,20 @@ func TestSpanReader(t *testing.T) {
 		})
 	})
 
-	// ShortSpan: a span shorter than the geometry requires is reported as a
-	// truncation rather than yielding partial plaintext.
+	// ShortSpan: a span shorter than the geometry requires is reported as
+	// ErrShortSpan (an under-fetch — a retryable fetch-side problem) rather
+	// than yielding partial plaintext, and is distinguishable from
+	// ErrTruncated (a stored stream that was itself cut short).
 	t.Run("ShortSpan", func(t *testing.T) {
 		cfg := baseConfig(cs)
 		ct := seal(t, cfg, pattern(2*cs))
 		size := int64(len(ct))
-		start, n, err := aesstream.CiphertextRange(size, cs, 0, 2*cs)
+		start, n, _, err := aesstream.CiphertextRange(size, cs, 0, 2*cs)
 		require.NoError(t, err)
 		short := ct[start : start+n-1] // one byte short of the needed span
 		_, err = aesstream.OpenSpan(cfg, bytes.NewReader(short), size, 0, 2*cs)
-		require.ErrorIs(t, err, aesstream.ErrTruncated)
+		require.ErrorIs(t, err, aesstream.ErrShortSpan)
+		require.NotErrorIs(t, err, aesstream.ErrTruncated, "a short span is not stream truncation")
 	})
 
 	// WrongCiphertextSize shows the declared total length pins the
@@ -236,7 +244,7 @@ func TestSpanReader(t *testing.T) {
 			{"off past end", int64(n) + 1, 0},
 		}
 		for _, c := range bad {
-			_, err := aesstream.NewSpanReader(bytes.NewReader(nil), size, cfg, c.off, c.length)
+			_, err := aesstream.NewSpanReader(bytes.NewReader(nil), cfg, size, c.off, c.length)
 			require.ErrorIsf(t, err, aesstream.ErrRange, "%s", c.name)
 		}
 
@@ -263,7 +271,7 @@ func TestSpanReader(t *testing.T) {
 		require.NoError(t, err, "OpenSpan(empty, off=0)")
 		require.Empty(t, got, "empty plaintext yields no bytes")
 
-		_, err = aesstream.NewSpanReader(bytes.NewReader(nil), size, cfg, 1, 0)
+		_, err = aesstream.NewSpanReader(bytes.NewReader(nil), cfg, size, 1, 0)
 		require.ErrorIs(t, err, aesstream.ErrRange, "OpenSpan(empty, off=1)")
 	})
 
@@ -273,7 +281,7 @@ func TestSpanReader(t *testing.T) {
 		cfg := baseConfig(cs)
 
 		for _, size := range []int64{0, 1, aesstream.TagSize - 1, enc + 5} {
-			_, err := aesstream.NewSpanReader(bytes.NewReader(nil), size, cfg, 0, 1)
+			_, err := aesstream.NewSpanReader(bytes.NewReader(nil), cfg, size, 0, 1)
 			require.ErrorIsf(t, err, aesstream.ErrCiphertextSize, "NewSpanReader(size=%d)", size)
 
 			_, err = aesstream.DecryptedSize(size, cs)
@@ -285,7 +293,7 @@ func TestSpanReader(t *testing.T) {
 	t.Run("BadConfig", func(t *testing.T) {
 		cfg := baseConfig(cs)
 		cfg.Key = cfg.Key[:16] // wrong length
-		_, err := aesstream.NewSpanReader(bytes.NewReader(nil), 64, cfg, 0, 1)
+		_, err := aesstream.NewSpanReader(bytes.NewReader(nil), cfg, 64, 0, 1)
 		require.ErrorIs(t, err, aesstream.ErrKeySize)
 	})
 
@@ -310,6 +318,127 @@ func TestSpanReader(t *testing.T) {
 			require.Equalf(t, pt[c.off:c.off+c.length], got, "off=%d len=%d", c.off, c.length)
 		}
 	})
+
+	// StickyError: once a Read has failed, every later Read must repeat the
+	// same error and yield no bytes — the property the "plaintext is
+	// incomplete and must be discarded" contract rests on.
+	t.Run("StickyError", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		pt := pattern(2 * cs)
+		ct := seal(t, cfg, pt)
+		size := int64(len(ct))
+
+		assertSticky := func(t *testing.T, r *aesstream.SpanReader, want error) {
+			t.Helper()
+			buf := make([]byte, cs)
+			var firstErr error
+			for firstErr == nil {
+				_, firstErr = r.Read(buf)
+			}
+			require.ErrorIs(t, firstErr, want, "first error")
+			for range 3 {
+				n, err := r.Read(buf)
+				require.Zero(t, n, "no bytes after a terminal error")
+				require.ErrorIs(t, err, want, "the error must repeat, not resume")
+			}
+		}
+
+		t.Run("Corrupted", func(t *testing.T) {
+			tampered := append([]byte(nil), ct...)
+			tampered[enc+10] ^= 0x01 // inside chunk 1
+			r, err := aesstream.NewSpanReader(bytes.NewReader(tampered), cfg, size, 0, int64(2*cs))
+			require.NoError(t, err)
+			assertSticky(t, r, aesstream.ErrCorrupted)
+		})
+
+		t.Run("ShortSpan", func(t *testing.T) {
+			r, err := aesstream.NewSpanReader(bytes.NewReader(ct[:len(ct)-1]), cfg, size, 0, int64(2*cs))
+			require.NoError(t, err)
+			assertSticky(t, r, aesstream.ErrShortSpan)
+		})
+	})
+
+	// OverlongSpan: real servers over-serve range requests, so bytes past the
+	// chunks the range needs are ignored and never read — a deliberate
+	// divergence from the whole-stream Reader's ErrTrailingData.
+	t.Run("OverlongSpan", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		pt := pattern(3 * cs)
+		ct := seal(t, cfg, pt)
+		size := int64(len(ct))
+
+		// A range within chunk 0, handed the whole stream plus garbage.
+		over := append(append([]byte(nil), ct...), 0xAA, 0xBB, 0xCC)
+		cr := &countingReader{r: bytes.NewReader(over)}
+		got, err := aesstream.OpenSpan(cfg, cr, size, 10, 100)
+		require.NoError(t, err, "an over-long span must be tolerated")
+		require.Equal(t, pt[10:110], got)
+		require.Equal(t, enc, cr.n, "only the chunks the range needs are read")
+	})
+
+	// AADMismatch: a range read under an AAD that doesn't match the sealed
+	// stream fails authentication (the key and nonce are correct, so this
+	// isolates the AAD binding on the span path).
+	t.Run("AADMismatch", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		ct := seal(t, cfg, pattern(cs+100))
+		size := int64(len(ct))
+
+		bad := cfg
+		bad.AAD = []byte("a different enc-structure")
+		_, err := aesstream.OpenSpan(bad, fetchSpan(t, ct, size, cs, 0, 50), size, 0, 50)
+		require.ErrorIs(t, err, aesstream.ErrCorrupted)
+	})
+
+	// AADAliasing: NewSpanReader copies cfg.AAD, so mutating the caller's
+	// slice after construction must not change what the reader authenticates.
+	t.Run("AADAliasing", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		pt := pattern(cs + 100)
+		ct := seal(t, cfg, pt)
+		size := int64(len(ct))
+
+		r, err := aesstream.NewSpanReader(fetchSpan(t, ct, size, cs, 0, 100), cfg, size, 0, 100)
+		require.NoError(t, err)
+		cfg.AAD[0] ^= 0xFF
+		got, err := io.ReadAll(r)
+		require.NoError(t, err, "mutating the caller's AAD after construction must not affect the reader")
+		require.Equal(t, pt[:100], got)
+	})
+
+	// SourceError: a span source that dies with a non-EOF error (errReader,
+	// standing in for a transport failure mid-fetch) surfaces that error
+	// wrapped with the chunk index, not misclassified as a short span.
+	t.Run("SourceError", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		ct := seal(t, cfg, pattern(cs))
+		size := int64(len(ct))
+
+		r, err := aesstream.NewSpanReader(&errReader{}, cfg, size, 0, 10)
+		require.NoError(t, err)
+		_, err = io.ReadAll(r)
+		require.ErrorIs(t, err, errReadBoom, "the transport error must surface, wrapped")
+		require.NotErrorIs(t, err, aesstream.ErrShortSpan)
+		require.ErrorContains(t, err, "chunk 0")
+	})
+
+	// ZeroLengthRange: Len and ChunkSize are well-defined on an empty range,
+	// no ciphertext is read, and Read reports EOF immediately.
+	t.Run("ZeroLengthRange", func(t *testing.T) {
+		cfg := baseConfig(cs)
+		ct := seal(t, cfg, pattern(100))
+		size := int64(len(ct))
+
+		cr := &countingReader{r: bytes.NewReader(nil)}
+		r, err := aesstream.NewSpanReader(cr, cfg, size, 5, 0)
+		require.NoError(t, err)
+		require.Zero(t, r.Len(), "Len")
+		require.Equal(t, cs, r.ChunkSize(), "ChunkSize")
+		n, err := r.Read(make([]byte, 8))
+		require.Zero(t, n)
+		require.ErrorIs(t, err, io.EOF)
+		require.Zero(t, cr.n, "no ciphertext read for an empty range")
+	})
 }
 
 // TestCiphertextRange covers CiphertextRange's input validation. Its
@@ -319,14 +448,42 @@ func TestCiphertextRange(t *testing.T) {
 	ct := seal(t, baseConfig(cs), pattern(2*cs))
 	size := int64(len(ct))
 
-	_, _, err := aesstream.CiphertextRange(size, cs, -1, 10)
+	_, _, _, err := aesstream.CiphertextRange(size, cs, -1, 10)
 	require.ErrorIs(t, err, aesstream.ErrRange, "negative off")
-	_, _, err = aesstream.CiphertextRange(size, cs, 0, -1)
+	_, _, _, err = aesstream.CiphertextRange(size, cs, 0, -1)
 	require.ErrorIs(t, err, aesstream.ErrRange, "negative length")
-	_, _, err = aesstream.CiphertextRange(size, cs, size, 1) // past plaintext end
+	_, _, _, err = aesstream.CiphertextRange(size, cs, size, 1) // past plaintext end
 	require.ErrorIs(t, err, aesstream.ErrRange, "off past end")
-	_, _, err = aesstream.CiphertextRange(aesstream.TagSize-1, cs, 0, 1)
+	_, _, _, err = aesstream.CiphertextRange(aesstream.TagSize-1, cs, 0, 1)
 	require.ErrorIs(t, err, aesstream.ErrCiphertextSize, "invalid ciphertext size")
+}
+
+// TestGeometryChunkSizeValidation checks that the bare-chunkSize geometry
+// helpers agree with Config.validate: zero selects the default, anything
+// else outside [MinChunkSize, MaxChunkSize] is ErrChunkSize rather than a
+// plausible wrong geometry. (DecryptedSize feeds Content-Length decisions
+// without any ciphertext in hand, so a silent mis-plumbed chunk size there
+// surfaces late — as ErrCorrupted mid-stream — or not at all.)
+func TestGeometryChunkSizeValidation(t *testing.T) {
+	const cs = aesstream.MinChunkSize
+	ct := seal(t, baseConfig(cs), pattern(10000))
+	size := int64(len(ct))
+
+	for _, bad := range []int{-1, 1, 7, 512, aesstream.MinChunkSize - 1, aesstream.MaxChunkSize + 1} {
+		_, err := aesstream.DecryptedSize(size, bad)
+		require.ErrorIsf(t, err, aesstream.ErrChunkSize, "DecryptedSize(chunkSize=%d)", bad)
+		_, _, _, err = aesstream.CiphertextRange(size, bad, 0, 10)
+		require.ErrorIsf(t, err, aesstream.ErrChunkSize, "CiphertextRange(chunkSize=%d)", bad)
+	}
+
+	// Zero still selects DefaultChunkSize in both helpers.
+	dct := seal(t, baseConfig(0), pattern(100))
+	n, err := aesstream.DecryptedSize(int64(len(dct)), 0)
+	require.NoError(t, err, "DecryptedSize(chunkSize=0)")
+	require.Equal(t, int64(100), n, "DecryptedSize at the default chunk size")
+	_, _, plainLen, err := aesstream.CiphertextRange(int64(len(dct)), 0, 10, 20)
+	require.NoError(t, err, "CiphertextRange(chunkSize=0)")
+	require.Equal(t, int64(20), plainLen, "CiphertextRange at the default chunk size")
 }
 
 // TestDecryptedSize_InvertsEncryptedSize checks the geometry helpers agree:
