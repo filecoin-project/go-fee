@@ -74,8 +74,8 @@ type Wrapped struct {
 // ephemeral public key the recipient needs to unwrap it.
 //
 // recipientPub must be an X25519 key. cek must be a valid AES key — a multiple
-// of 8 bytes, at least 16 (so 16, 24, or 32 bytes; FilOne CEKs are 32). The cek
-// slice is not retained or modified.
+// of 8 bytes, at least 16 (so 16, 24, or 32 bytes). The cek slice is not
+// retained or modified.
 func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 	if recipientPub == nil {
 		return nil, errors.New("ecdhkw nil recipient public key")

@@ -28,7 +28,7 @@ func mustDecode(t *testing.T, s string) []byte {
 
 // AC: "I can wrap a CEK to an X25519 public key and unwrap it with the
 // corresponding private key, recovering the original CEK." Checked across the
-// valid CEK sizes (16/24/32; FilOne uses 32).
+// valid CEK sizes (16/24/32).
 func TestWrapUnwrapRoundTrip(t *testing.T) {
 	recipient := newRecipient(t)
 	for _, size := range []int{16, 24, 32} {

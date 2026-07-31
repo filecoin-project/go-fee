@@ -1,5 +1,5 @@
 // Package aesstream implements the chunked AES-256-GCM STREAM body
-// cipher used by the FilOne File Encryption Envelope (FEE).
+// cipher used by the Filecoin Encryption Envelope (FEE).
 //
 // FEE encrypts an object segment by splitting its plaintext into
 // fixed-size chunks and sealing each chunk independently with

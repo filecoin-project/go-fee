@@ -1,9 +1,9 @@
 # FEE cross-implementation test vectors
 
-Fixed fixtures that pin the **FEE (FilOne File Encryption Envelope)** wire format
+Fixed fixtures that pin the **FEE (Filecoin Encryption Envelope)** wire format
 across two implementations:
 
-- **Go** — this repo's `fee/cose`, `fee/aesstream`, `fee/ecdhkw`, `fee/aeskw`.
+- **Go** — this repo's `cose`, `aesstream`, `ecdhkw`, `aeskw`.
 - **TypeScript** — the reference `foc-encryption`
   ([`Kubuxu/foc-encryption-demo`](https://github.com/Kubuxu/foc-encryption-demo),
   `packages/foc-encryption`), **pinned** in
@@ -14,7 +14,7 @@ across two implementations:
   vectors are only comparable against this commit or later.
 
 The reference is the **source of truth** for the wire format; these vectors pin
-to it and this repo's `fee/*` matches it (see [Wire format](#wire-format)).
+to it and this repo matches it (see [Wire format](#wire-format)).
 
 ## What's covered (acceptance criteria)
 
@@ -30,7 +30,7 @@ Each `testdata/<name>/` holds `blob.bin` (`envelope‖ciphertext`),
 
 Both directions are exercised:
 
-- **Go decrypts every fixture** — `go test ./fee/vectors` (`TestVectors`). For
+- **Go decrypts every fixture** — `go test ./vectors` (`TestVectors`). For
   the tag-96 fixture it also *unwraps* each recipient's CEK (ECDH-ES+A256KW over
   X25519, and A256KW) and checks it equals the shared CEK — the assertion the
   reference can't make, since it has no key-unwrap code.
@@ -69,11 +69,11 @@ run deterministic decrypt/unwrap). To recreate them:
 
 ```bash
 # Go-produced fixtures (single-chunk-go, multi-chunk-go, multi-recipient-go):
-FEE_VECTORS_REGEN=1 GOWORK=off go test ./fee/vectors -run TestGenerate -v
+FEE_VECTORS_REGEN=1 go test ./vectors -run TestGenerate -v
 
 # TS-produced fixture (multi-chunk-ts) + verify every fixture decrypts under the
 # real, pinned foc-encryption:
-./fee/vectors/pull-foc-encryption.sh
+./vectors/pull-foc-encryption.sh
 ```
 
 `pull-foc-encryption.sh` vendors the pinned reference into `ts/vendor/`

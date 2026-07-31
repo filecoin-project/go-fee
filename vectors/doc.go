@@ -1,4 +1,4 @@
-// Package vectors holds the FEE (FilOne File Encryption Envelope)
+// Package vectors holds the FEE (Filecoin Encryption Envelope)
 // cross-implementation test vectors: fixed fixture blobs that must decrypt
 // identically under this Go implementation (fee/cose, fee/aesstream,
 // fee/ecdhkw, fee/aeskw) and under the TypeScript reference implementation,

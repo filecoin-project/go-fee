@@ -1,4 +1,4 @@
-// Package fee composes the FEE (FilOne File Encryption Envelope) primitives
+// Package fee composes the FEE (Filecoin Encryption Envelope) primitives
 // into a single, small public API for encrypting and decrypting whole objects.
 //
 // The cryptographic building blocks each live in a sub-package and are
