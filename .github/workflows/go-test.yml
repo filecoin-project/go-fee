@@ -1,0 +1,26 @@
+name: Go Test
+
+on:
+  pull_request:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Speed-up tests run with race detector by reducing default exit sleep of 1 s to 0.
+  # See: https://go.dev/doc/articles/race_detector#Options
+  GORACE: atexit_sleep_ms=0
+
+jobs:
+  go-test:
+    uses: filecoin-project/unified-github-workflows/.github/workflows/go-test.yml@v1.0
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
