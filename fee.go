@@ -77,8 +77,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/fil-forge/ingot/fee/aesstream"
-	"github.com/fil-forge/ingot/fee/cose"
+	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/filecoin-project/go-fee/cose"
 )
 
 // EnvelopeType is the COSE "typ" (RFC 9596, header label 16) that every FEE

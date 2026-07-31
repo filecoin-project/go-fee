@@ -11,10 +11,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/fil-forge/ingot/fee/aeskw"
-	"github.com/fil-forge/ingot/fee/aesstream"
-	"github.com/fil-forge/ingot/fee/cose"
-	"github.com/fil-forge/ingot/fee/ecdhkw"
+	"github.com/filecoin-project/go-fee/aeskw"
+	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/filecoin-project/go-fee/cose"
+	"github.com/filecoin-project/go-fee/ecdhkw"
 )
 
 // FEE wire constants. These MUST match the foc-encryption reference

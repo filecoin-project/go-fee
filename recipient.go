@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/fil-forge/ingot/fee/aeskw"
-	"github.com/fil-forge/ingot/fee/cose"
-	"github.com/fil-forge/ingot/fee/ecdhkw"
+	"github.com/filecoin-project/go-fee/aeskw"
+	"github.com/filecoin-project/go-fee/cose"
+	"github.com/filecoin-project/go-fee/ecdhkw"
 )
 
 // COSE_Key parameters for the X25519 ephemeral public key an ECDH-ES+A256KW

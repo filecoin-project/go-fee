@@ -9,10 +9,10 @@ import (
 	"testing"
 	"testing/iotest"
 
-	"github.com/fil-forge/ingot/fee"
-	"github.com/fil-forge/ingot/fee/aeskw"
-	"github.com/fil-forge/ingot/fee/aesstream"
-	"github.com/fil-forge/ingot/fee/cose"
+	"github.com/filecoin-project/go-fee"
+	"github.com/filecoin-project/go-fee/aeskw"
+	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/filecoin-project/go-fee/cose"
 	"github.com/stretchr/testify/require"
 )
 

@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/fil-forge/ingot/fee/aesstream"
+	"github.com/filecoin-project/go-fee/aesstream"
 )
 
 // seal encrypts pt under cfg, failing the test on error. (The package's own
