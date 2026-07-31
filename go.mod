@@ -1,6 +1,6 @@
 module github.com/filecoin-project/go-fee
 
-go 1.26.5
+go 1.26
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.2
