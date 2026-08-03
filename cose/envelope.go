@@ -1,6 +1,7 @@
 package cose
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/fxamacker/cbor/v2"
@@ -115,7 +116,7 @@ func (e *Envelope) EncStructure(externalAAD []byte) ([]byte, error) {
 // the byte string that appears on the wire and inside the Enc_structure. It is
 // RawProtected for a decoded envelope and the deterministic serialization of
 // Headers.Protected otherwise. The result is empty when the protected header is
-// empty.
+// empty, and is always a fresh slice the caller owns.
 func (e *Envelope) ProtectedBytes() ([]byte, error) {
 	return e.Headers.ProtectedBytes()
 }
@@ -144,9 +145,13 @@ func encStructureBytes(context string, protected, externalAAD []byte) ([]byte, e
 //
 // Recipient headers need this as well as body headers: a key-agreement recipient
 // binds its own protected bytes into the KDF context (RFC 9053 §5.2).
+//
+// The result is a fresh slice the caller owns. These bytes decide whether an
+// envelope verifies and which KEK a recipient derives, so handing out the
+// RawProtected slice itself would let a caller rewrite them by accident.
 func (h Headers) ProtectedBytes() ([]byte, error) {
 	if h.RawProtected != nil {
-		return h.RawProtected, nil
+		return bytes.Clone(h.RawProtected), nil
 	}
 	if len(h.Protected) == 0 {
 		return []byte{}, nil
