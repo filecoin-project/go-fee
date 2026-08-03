@@ -26,6 +26,30 @@
 // CEK as the recipient ciphertext, keyed by a kid) is the job of the
 // higher-level fee package. Keys are passed as crypto/ecdh values directly; any
 // custody or key-provider abstraction lives above this layer.
+//
+// # Migrating from v0.1.0
+//
+// v0.1.0 derived the KEK with the COSE Concat-KDF and took no protected header:
+// Wrap(recipientPub, cek) and Unwrap(recipientPriv, w). Both signatures now take
+// the serialized COSE_Recipient protected header as a trailing argument, and the
+// derivation is HKDF-SHA-256 as RFC 9053 §6.3.1 requires.
+//
+// Callers that build the recipient with the cose package pass the bytes that
+// package produces:
+//
+//	protected, err := cose.Headers{Protected: hdr}.ProtectedBytes()
+//	w, err := ecdhkw.Wrap(recipientPub, cek, protected)
+//
+// A recipient with an empty protected bucket takes a nil or zero-length slice,
+// which reproduces v0.1.0's context except for the KDF itself. On the unwrap
+// side, pass the recipient's protected bytes exactly as they arrived on the
+// wire; cose.Headers.ProtectedBytes returns those for a decoded envelope.
+//
+// Wraps written by v0.1.0 do not survive the change. The two derivations produce
+// different KEKs from the same ECDH secret, so Unwrap on an old wrap fails with
+// aeskw.ErrIntegrity, and nothing on the wire distinguishes the two: both use
+// alg -31. Envelopes encrypted to X25519 recipients under v0.1.0 have to be
+// decrypted with v0.1.0 and re-encrypted with this version.
 package ecdhkw
 
 import (

@@ -351,7 +351,11 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
   `keyDataLength` 256, and the recipient's serialized protected header
   `h'a101381e'`. JOSE derives ECDH-ES differently (RFC 7518 §4.6 uses the NIST
-  SP 800-56A single-step KDF); a KEK derived that way will not unwrap.
+  SP 800-56A single-step KDF); a KEK derived that way will not unwrap. v0.1.0
+  used the COSE Concat-KDF here, so envelopes it encrypted to X25519 recipients
+  need decrypting with v0.1.0 and re-encrypting with this version; see the
+  [`ecdhkw` package documentation](https://pkg.go.dev/github.com/filecoin-project/go-fee/ecdhkw)
+  for the API change that comes with it.
 
 ## Security notes
 
