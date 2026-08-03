@@ -46,8 +46,8 @@ import (
 
 | Package | Purpose |
 |---|---|
-| [`fee`](.) (root) | Composes the primitives below into a small encrypt/decrypt API for whole objects. Adds no cryptography of its own. |
-| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range-decryption API (`CiphertextRange`, `SpanReader`, `OpenSpan`). |
+| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt` plus byte-range `DecryptRange`. Adds no cryptography of its own. |
+| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
 | [`cose`](./cose) | Just enough of COSE (RFC 9052): `COSE_Encrypt` (tag 96) / `COSE_Encrypt0` (tag 16) with a detached payload, and the `Enc_structure` AAD. |
 | [`ecdhkw`](./ecdhkw) | ECDH-ES+A256KW key wrap over X25519 (COSE algorithm −31). |
 | [`aeskw`](./aeskw) | RFC 3394 AES Key Wrap / A256KW (COSE algorithm −5). |
@@ -254,73 +254,63 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 ### Range (seekable) decryption
 
 Because chunks are sealed independently, any plaintext byte range can be
-decrypted from a single contiguous slice of the ciphertext — one HTTP range
-request against a remote blob. The root `fee` package covers whole-object
-decryption only; ranges use the `cose` and `aesstream` packages directly:
+decrypted without fetching or decrypting the rest of the object.
+`fee.DecryptRange` takes the stored blob as an `io.ReaderAt` plus its exact size,
+unwraps the CEK just as `fee.Decrypt` does, and returns a reader over exactly the
+requested bytes:
 
 ```go
 import (
-    "bytes"
-    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strconv"
 
     fee "github.com/filecoin-project/go-fee"
-    "github.com/filecoin-project/go-fee/aesstream"
-    "github.com/filecoin-project/go-fee/cose"
 )
 
-// readRange decrypts plaintext[off : off+length] from a FEE blob without
-// decrypting the whole object. cek is the content-encryption key, obtained out
-// of band or unwrapped from a recipient entry (see ecdhkw / aeskw).
-func readRange(blob, cek []byte, off, length int64) ([]byte, error) {
-    const labelChunkSize = int64(-65790)
-
-    // Decode the envelope header: base nonce, chunk size, and the
-    // Enc_structure that every chunk is authenticated against.
-    env, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
+// serveRange answers an HTTP range request straight from an encrypted object.
+func serveRange(w http.ResponseWriter, f *os.File, size int64, u fee.RecipientUnwrapper, off, length int64) error {
+    r, err := fee.DecryptRange(f, size, u, off, length)
     if err != nil {
-        return nil, err
-    }
-    baseNonce, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
-    if !ok {
-        return nil, errors.New("missing base nonce")
-    }
-    chunkSize := aesstream.DefaultChunkSize
-    if n, ok := env.Headers.Unprotected.Int(labelChunkSize); ok {
-        chunkSize = int(n)
-    }
-    aad, err := env.EncStructure(nil)
-    if err != nil {
-        return nil, err
+        return err // aesstream.ErrRange here means a 416
     }
 
-    // Which contiguous ciphertext bytes cover the requested plaintext range?
-    // The third result (ignored here) is the clamped plaintext length of the
-    // range — available before any fetch, e.g. for an HTTP Content-Length.
-    start, n, _, err := aesstream.CiphertextRange(int64(len(ciphertext)), chunkSize, off, length)
-    if err != nil {
-        return nil, err
-    }
+    // Len is the requested length clamped to the object; Size is the whole
+    // object's plaintext size. Both are known before any ciphertext is read.
+    w.Header().Set("Content-Length", strconv.FormatInt(r.Len(), 10))
+    w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+r.Len()-1, r.Size()))
+    w.WriteHeader(http.StatusPartialContent)
 
-    // Fetch exactly that span. Against a remote blob this is one range
-    // request for bytes [headerLen+start, headerLen+start+n), where
-    // headerLen = len(blob) - len(ciphertext).
-    span := bytes.NewReader(ciphertext[start : start+n])
-
-    // Decrypt and trim to exactly the requested range. For large ranges,
-    // aesstream.NewSpanReader streams instead of buffering.
-    return aesstream.OpenSpan(aesstream.Config{
-        Key:       cek,
-        BaseNonce: baseNonce,
-        AAD:       aad,
-        ChunkSize: chunkSize,
-    }, span, int64(len(ciphertext)), off, length)
+    _, err = io.Copy(w, r) // decrypts chunk by chunk, O(chunk size) memory
+    return err
 }
 ```
 
+Only the envelope header and the ciphertext chunks the range overlaps are read:
+one small `ReadAt` at offset 0 for the header, then one `ReadAt` per overlapping
+chunk as the result is read. Every chunk read is authenticated, so a tampered
+chunk fails rather than yielding corrupt plaintext.
+
+Nothing beyond the header is fetched until the first `Read`, so a caller backed
+by a remote store can prefetch the whole span in a single range request:
+
+```go
+r, err := fee.DecryptRange(blob, size, unwrapper, off, length)
+// ...
+spanOff, spanLen := r.CiphertextSpan() // blob-absolute; one range request
+```
+
 The span is chunk-aligned, so it over-fetches by at most the unused head of the
-first chunk and tail of the last (under 2 × chunk size total). For a local
-random-access source, wrap it with `io.NewSectionReader(src, start, n)` instead
-of a fetch.
+first chunk and tail of the last (under 2 × chunk size total).
+
+`fee.PlaintextSize` reports an object's decrypted size from the envelope header
+alone — no key material, no ciphertext — which is what a `HEAD` response or a
+suffix range (`bytes=-N`) needs. `fee.DecryptRangeWithCEK` is the external-CEK
+counterpart of `DecryptRange`. Callers holding raw ciphertext spans rather than a
+whole blob can use `aesstream.CiphertextRange` / `SpanReader` / `OpenSpan`
+directly.
 
 ## Wire format
 
