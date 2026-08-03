@@ -63,12 +63,20 @@ const TS_FIXTURES = [
   },
 ]
 
+// The files every fixture directory must contain. A directory missing any of
+// them is a partial write (an aborted generation) and gets rewritten.
+const FIXTURE_FILES = ['blob.bin', 'plaintext.bin', 'meta.json']
+
 async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> {
   const { name, description } = fixture
   const dir = join(TESTDATA, name)
-  if (existsSync(dir) && !process.env.FEE_VECTORS_REGEN) {
+  const complete = FIXTURE_FILES.every((f) => existsSync(join(dir, f)))
+  if (complete && !process.env.FEE_VECTORS_REGEN) {
     console.log(`skipped ${name}: already on disk (set FEE_VECTORS_REGEN=1 to rewrite it)`)
     return
+  }
+  if (existsSync(dir) && !complete) {
+    console.log(`regenerating ${name}: fixture on disk is incomplete`)
   }
 
   const cek = sha256(fixture.cekLabel)
@@ -110,10 +118,16 @@ async function verifyAll(): Promise<number> {
   for (const entry of readdirSync(TESTDATA, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const dir = join(TESTDATA, entry.name)
-    const metaPath = join(dir, 'meta.json')
-    if (!existsSync(metaPath)) continue
+    const present = FIXTURE_FILES.filter((f) => existsSync(join(dir, f)))
+    if (present.length === 0) continue
+    if (present.length < FIXTURE_FILES.length) {
+      const missing = FIXTURE_FILES.filter((f) => !present.includes(f))
+      console.error(`FAIL ${entry.name}: incomplete fixture, missing ${missing.join(', ')}`)
+      failures++
+      continue
+    }
 
-    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'))
     const blob = new Uint8Array(readFileSync(join(dir, 'blob.bin')))
     const expected = new Uint8Array(readFileSync(join(dir, 'plaintext.bin')))
     checked++
