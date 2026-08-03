@@ -60,7 +60,10 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   order-independent: both sides key the AAD off the on-wire raw protected bytes.
 - **Recipients** — `wrappedKey` is carried opaquely; the reference never unwraps
   it (decryption takes the CEK directly). The Go side does real
-  ECDH-ES+A256KW / A256KW wrap and unwrap.
+  ECDH-ES+A256KW / A256KW wrap and unwrap. Because no fixture here pins the
+  ECDH key derivation, `TestHKDFPublishedVector` in
+  [`ecdhkw/kdf_test.go`](../ecdhkw/kdf_test.go) pins it instead, against the
+  COSE-WG example `ecdh-wrap-examples/p256-wrap-128-01`.
 
 ## Regenerating
 

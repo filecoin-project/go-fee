@@ -44,7 +44,7 @@ func (e *Envelope) isEncrypt0() bool { return len(e.Recipients) == 0 }
 // ciphertext after the returned bytes. Encoding is RFC 8949 core deterministic,
 // so the same envelope always produces identical bytes.
 func (e *Envelope) Encode() ([]byte, error) {
-	prot, err := e.Headers.protectedBytes()
+	prot, err := e.Headers.ProtectedBytes()
 	if err != nil {
 		return nil, fmt.Errorf("cose: encoding protected header: %w", err)
 	}
@@ -67,7 +67,7 @@ func (e *Envelope) Encode() ([]byte, error) {
 		if r == nil {
 			return nil, fmt.Errorf("cose: recipient %d is nil", i)
 		}
-		rprot, err := r.Headers.protectedBytes()
+		rprot, err := r.Headers.ProtectedBytes()
 		if err != nil {
 			return nil, fmt.Errorf("cose: encoding recipient %d protected header: %w", i, err)
 		}
@@ -100,7 +100,7 @@ func (e *Envelope) Encode() ([]byte, error) {
 // Headers.Protected). external_aad is the caller's additional data; pass nil for
 // none, which encodes as an empty byte string.
 func (e *Envelope) EncStructure(externalAAD []byte) ([]byte, error) {
-	prot, err := e.Headers.protectedBytes()
+	prot, err := e.Headers.ProtectedBytes()
 	if err != nil {
 		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
 	}
@@ -117,7 +117,7 @@ func (e *Envelope) EncStructure(externalAAD []byte) ([]byte, error) {
 // Headers.Protected otherwise. The result is empty when the protected header is
 // empty.
 func (e *Envelope) ProtectedBytes() ([]byte, error) {
-	return e.Headers.protectedBytes()
+	return e.Headers.ProtectedBytes()
 }
 
 // encStructureBytes builds the CBOR-encoded COSE Enc_structure (RFC 9052 §5.3)
@@ -136,12 +136,15 @@ func encStructureBytes(context string, protected, externalAAD []byte) ([]byte, e
 	return out, nil
 }
 
-// protectedBytes returns the protected header byte-string content for this
+// ProtectedBytes returns the protected header byte-string content for this
 // Headers value: the on-wire RawProtected when present (set by Decode),
 // otherwise a fresh deterministic serialization of Protected. An empty protected
 // header serializes to an empty (zero-length) byte string, per COSE's
 // empty_or_serialized_map rule, rather than to an encoded empty map.
-func (h Headers) protectedBytes() ([]byte, error) {
+//
+// Recipient headers need this as well as body headers: a key-agreement recipient
+// binds its own protected bytes into the KDF context (RFC 9053 §5.2).
+func (h Headers) ProtectedBytes() ([]byte, error) {
 	if h.RawProtected != nil {
 		return h.RawProtected, nil
 	}

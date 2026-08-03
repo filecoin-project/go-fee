@@ -55,10 +55,17 @@ func (u *ecdhESUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The protected header is an input to the key derivation (RFC 9053 §5.2), and
+	// ProtectedBytes hands back the bytes as they arrived on the wire, so a
+	// sender whose encoder differs from ours still unwraps.
+	protected, err := r.Headers.ProtectedBytes()
+	if err != nil {
+		return nil, fmt.Errorf("%w: ECDH-ES recipient protected header: %v", ErrMalformedEnvelope, err)
+	}
 	cek, err := ecdhkw.Unwrap(u.priv, &ecdhkw.Wrapped{
 		EphemeralPublicKey: ephPub,
 		WrappedCEK:         r.Ciphertext,
-	})
+	}, protected)
 	if err != nil {
 		return nil, fmt.Errorf("fee: ECDH-ES+A256KW unwrap: %w", err)
 	}

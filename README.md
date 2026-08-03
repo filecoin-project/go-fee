@@ -346,6 +346,12 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   are authenticated into the ciphertext.
 - **Chunk count** (label −65791) — advisory metadata for range/seek consumers,
   emitted only when the plaintext length is known; not required to decrypt.
+- **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
+  shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
+  as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
+  `keyDataLength` 256, and the recipient's serialized protected header
+  `h'a101381e'`. JOSE derives ECDH-ES differently (RFC 7518 §4.6 uses the NIST
+  SP 800-56A single-step KDF); a KEK derived that way will not unwrap.
 
 ## Security notes
 
@@ -374,7 +380,8 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   [RFC 9053](https://www.rfc-editor.org/rfc/rfc9053) COSE algorithms,
   [RFC 9596](https://www.rfc-editor.org/rfc/rfc9596) COSE `typ` header,
   [RFC 8949](https://www.rfc-editor.org/rfc/rfc8949) CBOR,
-  [RFC 3394](https://www.rfc-editor.org/rfc/rfc3394) AES Key Wrap
+  [RFC 3394](https://www.rfc-editor.org/rfc/rfc3394) AES Key Wrap,
+  [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869) HKDF
 - [Online Authenticated-Encryption and its Nonce-Reuse Misuse-Resistance](https://eprint.iacr.org/2015/189)
   — the STREAM construction
 

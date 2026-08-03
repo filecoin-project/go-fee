@@ -2,6 +2,7 @@ package ecdhkw
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
@@ -41,53 +42,101 @@ func TestKDFContextProtected(t *testing.T) {
 	require.Equal(t, want, got, "kdfContext(protected) mismatch")
 }
 
-// TestConcatKDFSingleBlock checks the one-round case (the A256KW case: 32-byte
-// output from SHA-256) against an independent one-shot hash of
-// counter(1) || z || otherInfo.
-func TestConcatKDFSingleBlock(t *testing.T) {
-	z := bytes.Repeat([]byte{0xAB}, 32)
-	other := []byte("other-info")
+// TestHKDFPublishedVector pins the key derivation to a published, external
+// answer: the COSE-WG example ecdh-wrap-examples/p256-wrap-128-01, which
+// records the ECDH shared secret, the COSE_KDF_Context, and the resulting KEK.
+// Reproducing its KEK is what makes this package's derivation the one an
+// RFC 9053 implementation computes; every other test in the package checks the
+// code against itself.
+//
+// The example is ECDH-ES+A128KW over P-256, so its context carries a different
+// AlgorithmID (-3), key length (128), and protected header than FEE uses. The
+// curve and the wrap algorithm do not enter the derivation — only the shared
+// secret, the context, and the output length do — so the vector still pins the
+// construction.
+func TestHKDFPublishedVector(t *testing.T) {
+	z := mustDecode(t, "ee45f7c389fdb89923ca67c0e0cd29802dec8f514eb818054beedd5dafa78048")
+	// [ -3, [null,null,null], [null,null,null], [128, h'a101381c'] ]
+	context := mustDecode(t, "842283f6f6f683f6f6f682188044a101381c")
 
-	got := concatKDF(z, other, 32)
-
-	h := sha256.New()
-	h.Write([]byte{0x00, 0x00, 0x00, 0x01})
-	h.Write(z)
-	h.Write(other)
-	want := h.Sum(nil)
-
-	require.Equal(t, want, got, "concatKDF single block mismatch")
+	got, err := hkdfKEK(z, context, 16)
+	require.NoError(t, err, "hkdfKEK")
+	require.Equal(t, "7c60cb35a78b24dcf40a394395e9e8cd", hex.EncodeToString(got), "KEK mismatch")
 }
 
-// TestConcatKDFMultiBlock checks the multi-round case: two SHA-256 blocks
-// (counter 1 then counter 2), concatenated and truncated to the requested
-// length.
-func TestConcatKDFMultiBlock(t *testing.T) {
-	z := bytes.Repeat([]byte{0x07}, 32)
-	other := []byte("ctx")
+// TestHKDFExtractExpand checks the derivation against an independent spelling
+// of RFC 5869: HMAC-SHA-256 extract with an all-zero salt, then one expand
+// round of HMAC(PRK, info || 0x01). One round covers the 32-byte A256KW case
+// exactly, since SHA-256 emits 32 bytes.
+func TestHKDFExtractExpand(t *testing.T) {
+	z := bytes.Repeat([]byte{0xAB}, 32)
+	info := []byte("other-info")
 
-	got := concatKDF(z, other, 48)
+	got, err := hkdfKEK(z, info, 32)
+	require.NoError(t, err, "hkdfKEK")
+
+	extract := hmac.New(sha256.New, make([]byte, sha256.Size))
+	extract.Write(z)
+	prk := extract.Sum(nil)
+
+	expand := hmac.New(sha256.New, prk)
+	expand.Write(info)
+	expand.Write([]byte{0x01})
+	want := expand.Sum(nil)
+
+	require.Equal(t, want, got, "hkdfKEK single block mismatch")
+}
+
+// TestHKDFMultiBlock checks an output longer than one hash block: the second
+// expand round feeds the previous block back in, per RFC 5869 §2.3.
+func TestHKDFMultiBlock(t *testing.T) {
+	z := bytes.Repeat([]byte{0x07}, 32)
+	info := []byte("ctx")
+
+	got, err := hkdfKEK(z, info, 48)
+	require.NoError(t, err, "hkdfKEK")
 	require.Len(t, got, 48)
 
-	block := func(counter byte) []byte {
-		h := sha256.New()
-		h.Write([]byte{0x00, 0x00, 0x00, counter})
-		h.Write(z)
-		h.Write(other)
+	extract := hmac.New(sha256.New, make([]byte, sha256.Size))
+	extract.Write(z)
+	prk := extract.Sum(nil)
+
+	block := func(prev []byte, counter byte) []byte {
+		h := hmac.New(sha256.New, prk)
+		h.Write(prev)
+		h.Write(info)
+		h.Write([]byte{counter})
 		return h.Sum(nil)
 	}
-	want := append(block(1), block(2)...)[:48]
+	first := block(nil, 1)
+	want := append(bytes.Clone(first), block(first, 2)...)[:48]
 
-	require.Equal(t, want, got, "concatKDF multi block mismatch")
+	require.Equal(t, want, got, "hkdfKEK multi block mismatch")
 }
 
-// TestConcatKDFContextSensitivity confirms the derived key depends on the
-// context bytes — derivations under different contexts must not collide.
-func TestConcatKDFContextSensitivity(t *testing.T) {
+// TestHKDFContextSensitivity confirms the derived key depends on the context
+// bytes — derivations under different contexts must not collide.
+func TestHKDFContextSensitivity(t *testing.T) {
 	z := bytes.Repeat([]byte{0x42}, 32)
-	a := concatKDF(z, kdfContext(algA256KW, 256, nil), 32)
-	b := concatKDF(z, kdfContext(algA256KW, 128, nil), 32)
+	a, err := hkdfKEK(z, kdfContext(algA256KW, 256, nil), 32)
+	require.NoError(t, err, "hkdfKEK(256)")
+	b, err := hkdfKEK(z, kdfContext(algA256KW, 128, nil), 32)
+	require.NoError(t, err, "hkdfKEK(128)")
 	require.NotEqual(t, a, b, "derivations under different keyDataLength contexts collided")
+}
+
+// TestHKDFProtectedSensitivity confirms the recipient's protected header is
+// bound into the derivation: the same secret under an empty and a non-empty
+// protected header must give different keys. Without this binding an attacker
+// could rewrite the recipient's algorithm header and the unwrap would still
+// succeed.
+func TestHKDFProtectedSensitivity(t *testing.T) {
+	z := bytes.Repeat([]byte{0x42}, 32)
+	empty, err := hkdfKEK(z, kdfContext(algA256KW, 256, nil), 32)
+	require.NoError(t, err, "hkdfKEK(empty protected)")
+	set, err := hkdfKEK(z, kdfContext(algA256KW, 256, []byte{0xa1, 0x01, 0x38, 0x1e}), 32)
+	require.NoError(t, err, "hkdfKEK(protected)")
+	require.NotEqual(t, empty, set, "derivations under different protected headers collided")
 }
 
 // TestCBORHeadEncoding pins the shortest-form (canonical) CBOR head encoding
