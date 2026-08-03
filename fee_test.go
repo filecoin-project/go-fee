@@ -181,7 +181,8 @@ func TestRoundTripMixedRecipients(t *testing.T) {
 func encryptAndRecoverCEK(t *testing.T, key *ecdh.PrivateKey, plaintext []byte) (blob, cek, baseNonce []byte) {
 	t.Helper()
 
-	blob, err := encrypt(t, plaintext,
+	var err error
+	blob, err = encrypt(t, plaintext,
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 	)
 	require.NoError(t, err)
@@ -189,7 +190,8 @@ func encryptAndRecoverCEK(t *testing.T, key *ecdh.PrivateKey, plaintext []byte) 
 	env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 	require.NoError(t, err)
 
-	baseNonce, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+	var ok bool
+	baseNonce, ok = env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
 	require.True(t, ok, "base nonce present in the unprotected header")
 
 	require.Len(t, env.Recipients, 1)
