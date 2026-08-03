@@ -5,11 +5,14 @@
 //
 //   bun driver.ts [generate|verify|all]   (default: all)
 //
-// generate — encrypt a multi-chunk file with foc-encryption and write the
-//            `multi-chunk-ts` fixture (AC2: TS seals, Go decrypts).
+// generate — encrypt with foc-encryption and write the TS-produced fixtures
+//            (`multi-chunk-ts`, `empty-file-ts`: TS seals, Go decrypts). A
+//            fixture that already exists on disk is left alone unless
+//            FEE_VECTORS_REGEN=1 is set: the reference draws a random base nonce
+//            per encrypt, so regenerating rewrites a committed blob.
 // verify   — decrypt every committed fixture with foc-encryption and check the
-//            recovered plaintext (AC1/AC3: TS decrypts the Go-sealed blobs, and
-//            the reference parses their recipient descriptors). Exits non-zero on
+//            recovered plaintext (TS decrypts the Go-sealed blobs, and the
+//            reference parses their recipient descriptors). Exits non-zero on
 //            any mismatch.
 import { CoseAlgorithm, decrypt, encrypt, parseEnvelope } from './vendor/foc-encryption/src/index.ts'
 import { createHash } from 'node:crypto'
@@ -30,15 +33,46 @@ function sha256(label: string, n = 32): Uint8Array {
 const toHex = (u: Uint8Array): string => Buffer.from(u).toString('hex')
 const fromHex = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, 'hex'))
 
-async function generateMultiChunkTS(): Promise<void> {
-  const name = 'multi-chunk-ts'
-  const cek = sha256('fil-473-fee-cek-ts-v1')
-
-  // Deterministic ~15 KiB plaintext so the STREAM spans several 4 KiB chunks.
-  const unit = new TextEncoder().encode('multi-chunk-ts/FIL-473 ')
+// repeatTo returns label repeated until it reaches at least n bytes, the
+// deterministic filler for a multi-chunk plaintext.
+function repeatTo(label: string, n: number): Uint8Array {
+  const unit = new TextEncoder().encode(label)
   const bytes: number[] = []
-  while (bytes.length < 15000) for (const b of unit) bytes.push(b)
-  const plaintext = new Uint8Array(bytes)
+  while (bytes.length < n) for (const b of unit) bytes.push(b)
+  return new Uint8Array(bytes)
+}
+
+// The TS-produced fixtures. Each carries its own CEK label: no two fixtures may
+// share a CEK, since several are single-chunk and a shared CEK would give them
+// identical chunk-0 nonces (baseNonce ‖ 0 ‖ lastFlag) over different plaintexts.
+// The Go side documents the same rule on testCEK (../helpers_test.go).
+const TS_FIXTURES = [
+  {
+    name: 'multi-chunk-ts',
+    cekLabel: 'fil-473-fee-cek-ts-v1',
+    description: 'AC2: multi-chunk file encrypted in foc-encryption (TS); decrypts in Go.',
+    // ~15 KiB, so the STREAM spans several 4 KiB chunks.
+    plaintext: () => repeatTo('multi-chunk-ts/FIL-473 ', 15000),
+  },
+  {
+    name: 'empty-file-ts',
+    cekLabel: 'fee-cek-ts-empty-v1',
+    description:
+      'Empty plaintext encrypted in foc-encryption (TS) (one empty final chunk, tag-only body); decrypts in Go.',
+    plaintext: () => new Uint8Array(0),
+  },
+]
+
+async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> {
+  const { name, description } = fixture
+  const dir = join(TESTDATA, name)
+  if (existsSync(dir) && !process.env.FEE_VECTORS_REGEN) {
+    console.log(`skipped ${name}: already on disk (set FEE_VECTORS_REGEN=1 to rewrite it)`)
+    return
+  }
+
+  const cek = sha256(fixture.cekLabel)
+  const plaintext = fixture.plaintext()
 
   const blob = await encrypt(plaintext, cek, {
     algorithm: CoseAlgorithm.CHUNKED_AES_256_GCM_STREAM,
@@ -46,7 +80,6 @@ async function generateMultiChunkTS(): Promise<void> {
   })
   const meta = parseEnvelope(blob)
 
-  const dir = join(TESTDATA, name)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'blob.bin'), blob)
   writeFileSync(join(dir, 'plaintext.bin'), plaintext)
@@ -56,7 +89,7 @@ async function generateMultiChunkTS(): Promise<void> {
       {
         name,
         producer: 'ts',
-        description: 'AC2: multi-chunk file encrypted in foc-encryption (TS); decrypts in Go.',
+        description,
         tag: 16,
         algorithm: CoseAlgorithm.CHUNKED_AES_256_GCM_STREAM,
         typ: FEE_TYP,
@@ -102,7 +135,7 @@ async function verifyAll(): Promise<number> {
 }
 
 const mode = process.argv[2] ?? 'all'
-if (mode === 'generate' || mode === 'all') await generateMultiChunkTS()
+if (mode === 'generate' || mode === 'all') for (const f of TS_FIXTURES) await generateTS(f)
 let failures = 0
 if (mode === 'verify' || mode === 'all') failures = await verifyAll()
 if (failures > 0) {
