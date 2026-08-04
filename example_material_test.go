@@ -69,14 +69,14 @@ func ExampleDecryptRangeWithMaterial() {
 	// the blob's exact size.
 	row := struct {
 		material fee.BodyMaterial
-		size     int64
+		blobSize int64
 	}{material, int64(len(blob))}
 
 	// Serving a range later. Nothing here decodes the envelope — the reader is
 	// built from the stored row, so the only bytes fetched are ciphertext.
 	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.material.HeaderLen}
 	const off, length = 4, 15
-	r, err := fee.DecryptRangeWithMaterial(src, row.size, row.material, cek, off, length)
+	r, err := fee.DecryptRangeWithMaterial(src, row.blobSize, row.material, cek, off, length)
 	if err != nil {
 		log.Fatal(err)
 	}

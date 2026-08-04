@@ -408,6 +408,15 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	}, material, nil
 }
 
+// chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
+// produces at the given chunk size. Empty input is one (empty) final chunk.
+func chunkCountFor(nPlain, chunkSize int64) int64 {
+	if nPlain <= 0 {
+		return 1
+	}
+	return (nPlain + chunkSize - 1) / chunkSize
+}
+
 // encryptReader is the wire blob [Encrypt] hands back: the encoded envelope
 // header, served from memory, followed by the ciphertext the background
 // encryption goroutine streams through the pipe.
@@ -422,15 +431,6 @@ type encryptReader struct {
 func (e *encryptReader) Read(p []byte) (int, error) { return e.body.Read(p) }
 
 func (e *encryptReader) Close() error { return e.pr.Close() }
-
-// chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
-// produces at the given chunk size. Empty input is one (empty) final chunk.
-func chunkCountFor(nPlain, chunkSize int64) int64 {
-	if nPlain <= 0 {
-		return 1
-	}
-	return (nPlain + chunkSize - 1) / chunkSize
-}
 
 // Decrypt recovers the plaintext from a FEE COSE_Encrypt (tag 96) envelope read
 // from src.
