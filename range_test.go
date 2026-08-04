@@ -80,7 +80,7 @@ func newRangeFixture(t *testing.T, n int, opts ...fee.EncryptOption) rangeFixtur
 // encrypt helper.
 func encryptWithCEK(t *testing.T, plaintext, cek []byte, recipients []fee.Recipient, opts ...fee.EncryptOption) ([]byte, error) {
 	t.Helper()
-	r, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, recipients, opts...)
+	r, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, recipients, opts...)
 	if err != nil {
 		return nil, err
 	}

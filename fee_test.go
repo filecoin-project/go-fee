@@ -88,7 +88,7 @@ func patternBytes(n int) []byte {
 // An Encrypt setup error (e.g. an invalid recipient) is returned directly.
 func encrypt(t *testing.T, plaintext []byte, recipients []fee.Recipient, opts ...fee.EncryptOption) ([]byte, error) {
 	t.Helper()
-	r, err := fee.Encrypt(bytes.NewReader(plaintext), recipients, opts...)
+	r, _, err := fee.Encrypt(bytes.NewReader(plaintext), recipients, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func TestExternalCEK(t *testing.T) {
 
 	// Seal under the caller's CEK; still carry an A256KW recipient so the CEK is
 	// recoverable in-envelope too.
-	enc, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
+	enc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
 		[]fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)},
 		fee.WithChunkSize(aesstream.MinChunkSize),
 	)
@@ -227,7 +227,7 @@ func TestExternalCEKNoRecipients(t *testing.T) {
 	cek := newCEK(t)
 	plaintext := patternBytes(2*aesstream.MinChunkSize + 3)
 
-	enc, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil,
+	enc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil,
 		fee.WithChunkSize(aesstream.MinChunkSize),
 	)
 	require.NoError(t, err)
@@ -259,7 +259,7 @@ func TestExternalCEKNoRecipients(t *testing.T) {
 // CEK that is not 32 bytes.
 func TestExternalCEKInvalidLength(t *testing.T) {
 	t.Run("encrypt", func(t *testing.T) {
-		_, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(10)), make([]byte, 16),
+		_, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(10)), make([]byte, 16),
 			[]fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))})
 		require.ErrorIs(t, err, fee.ErrInvalidCEK)
 	})
@@ -278,7 +278,7 @@ func TestStreamingRoundTrip(t *testing.T) {
 	key := newX25519Key(t)
 	plaintext := patternBytes(3*aesstream.MinChunkSize + 123)
 
-	enc, err := fee.Encrypt(
+	enc, _, err := fee.Encrypt(
 		bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize),
@@ -321,7 +321,7 @@ func TestEncryptReaderCloseReleases(t *testing.T) {
 	key := newX25519Key(t)
 	// Large enough that the encryption goroutine would block on the pipe if the
 	// reader were abandoned without Close.
-	enc, err := fee.Encrypt(
+	enc, _, err := fee.Encrypt(
 		bytes.NewReader(patternBytes(10*aesstream.MinChunkSize)),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize),
@@ -497,14 +497,14 @@ func TestDecryptWrongEnvelopeType(t *testing.T) {
 
 // TestEncryptNoRecipients confirms Encrypt rejects an empty recipient set.
 func TestEncryptNoRecipients(t *testing.T) {
-	_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), nil)
+	_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), nil)
 	require.ErrorIs(t, err, fee.ErrNoRecipients)
 }
 
 // TestEncryptNilRecipient confirms a nil entry in the recipient slice is an
 // error rather than a panic.
 func TestEncryptNilRecipient(t *testing.T) {
-	_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), []fee.Recipient{nil})
+	_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), []fee.Recipient{nil})
 	require.Error(t, err)
 }
 
@@ -513,7 +513,7 @@ func TestEncryptNilRecipient(t *testing.T) {
 // the sentinel the body cipher itself uses — not as a malformed envelope.
 func TestEncryptChunkSizeOutOfRange(t *testing.T) {
 	key := newX25519Key(t)
-	_, err := fee.Encrypt(
+	_, _, err := fee.Encrypt(
 		bytes.NewReader(patternBytes(10)),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize-1),
@@ -647,7 +647,7 @@ func TestContentLengthMismatch(t *testing.T) {
 	// withheld on the mismatch.
 	plaintext := patternBytes(2*aesstream.MinChunkSize + 7)
 
-	enc, err := fee.Encrypt(bytes.NewReader(plaintext),
+	enc, _, err := fee.Encrypt(bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize),
 		fee.WithContentLength(int64(len(plaintext)+1)), // declare one byte too many
@@ -720,22 +720,22 @@ func TestDecryptStreamsIncrementally(t *testing.T) {
 func TestEncryptInvalidRecipient(t *testing.T) {
 	key := newX25519Key(t)
 	t.Run("ECDH-ES nil public key", func(t *testing.T) {
-		_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
+		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, nil)})
 		require.Error(t, err)
 	})
 	t.Run("ECDH-ES empty kid", func(t *testing.T) {
-		_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
+		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewECDHESRecipient(nil, key.PublicKey())})
 		require.Error(t, err)
 	})
 	t.Run("A256KW empty kid", func(t *testing.T) {
-		_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
+		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewA256KWRecipient(nil, newKEK(t))})
 		require.Error(t, err)
 	})
 	t.Run("A256KW wrong KEK length", func(t *testing.T) {
-		_, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
+		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewA256KWRecipient(a256kwKID, make([]byte, 16))})
 		require.Error(t, err)
 	})

@@ -31,8 +31,8 @@ func (c *countingBlob) ReadAt(p []byte, off int64) (int, error) {
 // ExampleDecryptRangeWithMaterial stores an object once and then serves a byte
 // range of it without re-reading the envelope, the way a store that keeps
 // metadata beside its blobs would: the writer records what
-// [EncryptedBlob.Material] reports, and the reader rebuilds a decryptor from
-// those columns alone.
+// [EncryptWithCEK] reports, and the reader rebuilds a decryptor from those
+// columns alone.
 func ExampleDecryptRangeWithMaterial() {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -47,17 +47,15 @@ func ExampleDecryptRangeWithMaterial() {
 		log.Fatal(err)
 	}
 
+	// The material is complete before a byte is read, so a writer can record it
+	// while the upload is still streaming.
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
-	enc, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
+	enc, material, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
 		fee.WithContentLength(int64(len(plaintext))))
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// Complete before a byte is read, so a writer can record it while the upload
-	// is still streaming.
-	material := enc.Material()
 
 	blob, err := io.ReadAll(enc)
 	if err != nil {

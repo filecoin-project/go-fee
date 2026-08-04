@@ -90,7 +90,7 @@ func main() {
     kid := []byte("did:key:z6MkExample#key-1")
 
     // Encrypt. The returned reader streams envelope‖ciphertext.
-    r, err := fee.Encrypt(
+    r, _, err := fee.Encrypt(
         bytes.NewReader([]byte("hello, filecoin")),
         []fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
     )
@@ -127,7 +127,7 @@ never chooses it.
 
 ```go
 func encryptShared(data []byte, alicePub *ecdh.PublicKey, kek []byte) ([]byte, error) {
-    r, err := fee.Encrypt(bytes.NewReader(data), []fee.Recipient{
+    r, _, err := fee.Encrypt(bytes.NewReader(data), []fee.Recipient{
         // ECDH-ES+A256KW to Alice's X25519 public key.
         fee.NewECDHESRecipient([]byte("did:key:alice#key-1"), alicePub),
         // A256KW under a pre-shared 32-byte key-encryption key.
@@ -172,7 +172,7 @@ func encryptFile(src, dst string, recipients []fee.Recipient) error {
     // WithContentLength is optional: it records the chunk count in the
     // envelope (useful to range/seek consumers) and fails the stream if the
     // plaintext turns out to be a different length.
-    r, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
+    r, _, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
     if err != nil {
         return err
     }
@@ -227,7 +227,7 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
         return nil, err
     }
 
-    r, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, nil)
+    r, _, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, nil)
     if err != nil {
         return nil, err
     }
@@ -321,15 +321,14 @@ directly.
 
 The envelope is a fixed prefix of every stored object, so a store that keeps its
 own metadata beside the blob can record what a range decrypt needs from it and
-skip the header read as well. `fee.Encrypt` returns an `*fee.EncryptedBlob`, whose
-`Material()` reports those four values — envelope length, base nonce, chunk size,
-and the `Enc_structure` AAD — complete before any plaintext is read, so a writer
-can store them while the upload is still streaming:
+skip the header read as well. `fee.Encrypt` reports those four values alongside
+the reader: envelope length, base nonce, chunk size, and the `Enc_structure` AAD.
+They are complete before any plaintext is read, so a writer can store them while
+the upload is still streaming:
 
 ```go
-blob, err := fee.Encrypt(plaintext, recipients)
-// ...
-m := blob.Material() // persist alongside the blob's location and size
+// m goes alongside the blob's location and size.
+r, m, err := fee.Encrypt(plaintext, recipients)
 ```
 
 `fee.DecryptRangeWithMaterial(blob, blobSize, m, cek, off, length)` then serves a

@@ -22,7 +22,7 @@ func ExampleDecryptRange() {
 	kid := []byte("did:key:zExampleRecipient#key-1")
 
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
-	enc, err := fee.Encrypt(bytes.NewReader(plaintext),
+	enc, _, err := fee.Encrypt(bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
 		fee.WithContentLength(int64(len(plaintext))))
 	if err != nil {

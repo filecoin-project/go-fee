@@ -14,7 +14,7 @@ var ErrIncompleteMaterial = errors.New("fee: incomplete body material")
 
 // BodyMaterial is everything a range decrypt needs from a FEE envelope, so a
 // caller that cached it can serve a byte range without fetching or decoding the
-// envelope header at all. It is obtained from [EncryptedBlob.Material] at
+// envelope header at all. It is returned by [Encrypt] / [EncryptWithCEK] at
 // encryption time and consumed by [DecryptRangeWithMaterial].
 //
 // It exists for stores that keep their own metadata alongside the blob: the

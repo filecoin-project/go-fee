@@ -170,9 +170,9 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, leng
 }
 
 // DecryptRangeWithMaterial is [DecryptRangeWithCEK] for a caller that already
-// holds the envelope's parameters, from [EncryptedBlob.Material] at encryption
-// time. Unlike every other entry point here it reads no envelope at all: the
-// only bytes fetched from blob are the ciphertext chunks the range overlaps, so
+// holds the envelope's parameters, as [Encrypt] reports them at encryption time.
+// Unlike every other entry point here it reads no envelope at all: the only
+// bytes fetched from blob are the ciphertext chunks the range overlaps, so
 // a caller fronting a remote object store spends no round trip re-reading a
 // header it has already seen.
 //

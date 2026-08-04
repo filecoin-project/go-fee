@@ -54,11 +54,10 @@ func (r blobLocationRow) material() fee.BodyMaterial {
 // the store flow.
 func encryptWithMaterial(t *testing.T, plaintext, cek []byte, recipients []fee.Recipient, opts ...fee.EncryptOption) ([]byte, fee.BodyMaterial) {
 	t.Helper()
-	enc, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, recipients, opts...)
+	// The material arrives before a single byte is read, which is what lets a
+	// writer record the row while the upload is still streaming.
+	enc, mat, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, recipients, opts...)
 	require.NoError(t, err)
-	// Captured before a single byte is read, which is what lets a writer record
-	// the row while the upload is still streaming.
-	mat := enc.Material()
 	blob, err := io.ReadAll(enc)
 	require.NoError(t, err)
 	require.NoError(t, enc.Close())
@@ -172,22 +171,41 @@ func TestIngotWriteReadFlow(t *testing.T) {
 	}
 }
 
-// TestEncryptedBlobMaterialIsACopy pins that Material hands back an independent
-// value each call, so a caller that adjusts one — or a store that reuses the
-// buffers it read a row into — cannot reach back into the blob's own state.
-func TestEncryptedBlobMaterialIsACopy(t *testing.T) {
-	enc, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(64)), newCEK(t), nil,
+// TestEncryptMaterialDoesNotAliasTheStream pins that the material handed back
+// shares no backing array with the encryption still in flight: a caller that
+// adjusts its copy — or a store that reuses the buffers it read a row into —
+// cannot disturb the blob being produced.
+func TestEncryptMaterialDoesNotAliasTheStream(t *testing.T) {
+	cek := newCEK(t)
+	plaintext := patternBytes(2 * rangeChunk)
+
+	rc, mat, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil,
 		fee.WithChunkSize(rangeChunk))
 	require.NoError(t, err)
-	defer enc.Close()
+	defer rc.Close()
 
-	first := enc.Material()
-	first.AAD[0] ^= 0xff
-	first.BaseNonce[0] ^= 0xff
+	// Scribble on the caller's copy before a single byte is read, keeping the
+	// values a store would have persisted.
+	kept := fee.BodyMaterial{
+		HeaderLen: mat.HeaderLen,
+		BaseNonce: bytes.Clone(mat.BaseNonce),
+		ChunkSize: mat.ChunkSize,
+		AAD:       bytes.Clone(mat.AAD),
+	}
+	mat.BaseNonce[0] ^= 0xff
+	mat.AAD[0] ^= 0xff
 
-	second := enc.Material()
-	require.NotEqual(t, first.AAD, second.AAD)
-	require.NotEqual(t, first.BaseNonce, second.BaseNonce)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+
+	// The blob still decrypts under the pristine values, so the mutation never
+	// reached the cipher or the encoded header.
+	r, err := fee.DecryptRangeWithMaterial(bytes.NewReader(blob), int64(len(blob)),
+		kept, cek, 0, int64(len(plaintext)))
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
 }
 
 // TestDecryptRangeWithMaterialEncrypt0 pins that material is envelope-form
