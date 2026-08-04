@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"math"
@@ -107,6 +108,15 @@ func encryptWithCEK(t *testing.T, plaintext, cek []byte, recipients []fee.Recipi
 	}
 	defer r.Close()
 	return io.ReadAll(r)
+}
+
+// hexBytes decodes a hex literal, for the handful of tests that pin behaviour
+// against exact wire bytes rather than an encrypted fixture.
+func hexBytes(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	require.NoError(t, err)
+	return b
 }
 
 // decryptRange range-decrypts [off, off+length) from blob and returns the reader
@@ -697,6 +707,37 @@ func TestDecryptRangeMalformedBlob(t *testing.T) {
 		_, err := fee.DecryptRange(bytes.NewReader(f.blob), 20, f.unwrapper, 0, 10)
 		require.ErrorIs(t, err, cose.ErrMalformed)
 	})
+}
+
+// TestDecryptRangeMalformedBlobReadsOnce pins that a blob whose leading bytes
+// decode completely but are not a FEE envelope is rejected on the strength of the
+// first read. Only a prefix cut short mid-item can be answered by reading more, so
+// a wrong object id costs one 4 KiB read rather than a walk up to maxHeaderLen
+// against the origin.
+func TestDecryptRangeMalformedBlobReadsOnce(t *testing.T) {
+	f := newRangeFixture(t, rangeChunk)
+
+	// Each prefix is a complete CBOR item, so no larger read can change the
+	// verdict; the trailing zeroes stand in for a large stored object.
+	for name, tc := range map[string]struct {
+		prefix string
+		want   error
+	}{
+		// A bare integer: a whole item, but not a tag.
+		"not a cose tag": {"01", cose.ErrNotEncrypt},
+		// Tag 96 wrapping a 3-element array, where 4 are required.
+		"wrong array length": {"d8608340a0f6", cose.ErrMalformed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := make([]byte, 10<<20)
+			copy(blob, hexBytes(t, tc.prefix))
+
+			rec := newRecordingReaderAt(t, blob)
+			_, err := fee.DecryptRange(rec, int64(len(blob)), f.unwrapper, 0, 10)
+			require.ErrorIs(t, err, tc.want)
+			require.Len(t, rec.reads, 1, "a complete but invalid prefix must not be re-read")
+		})
+	}
 }
 
 // TestDecryptRangeLargeEnvelope exercises the header probe's growth path: with

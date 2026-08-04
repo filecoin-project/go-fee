@@ -316,10 +316,8 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		return nil, 0, fmt.Errorf("fee: negative blob size %d", blobSize)
 	}
 
-	probe := int64(headerProbeSize)
-	if blobSize < probe {
-		probe = blobSize
-	}
+	limit := min(blobSize, int64(maxHeaderLen))
+	probe := min(int64(headerProbeSize), limit)
 	for {
 		buf := make([]byte, probe)
 		n, rerr := blob.ReadAt(buf, 0)
@@ -334,11 +332,14 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		if derr == nil {
 			return env, int64(n - len(rest)), nil
 		}
-		// A type mismatch is decided only after a complete decode, so a longer
-		// prefix cannot change the answer.
-		if errors.Is(derr, cose.ErrUnexpectedType) || atEnd || probe >= blobSize || probe >= maxHeaderLen {
+		// Only a prefix that stopped mid-item is worth re-reading. Every other
+		// decode failure — not a COSE tag, wrong typ, a duplicate header label —
+		// was decided on complete bytes, so a longer prefix reaches the same
+		// verdict. Retrying those would turn one wrong object id into a walk up to
+		// maxHeaderLen against the store.
+		if !errors.Is(derr, io.ErrUnexpectedEOF) || atEnd || probe >= limit {
 			return nil, 0, fmt.Errorf("fee: decoding envelope: %w", derr)
 		}
-		probe = min(probe*2, min(blobSize, int64(maxHeaderLen)))
+		probe = min(probe*2, limit)
 	}
 }
