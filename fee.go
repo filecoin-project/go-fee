@@ -72,6 +72,12 @@
 // no key material. Callers that hold raw ciphertext spans rather than a blob can
 // use the underlying primitives in fee/aesstream directly.
 //
+// A store that keeps metadata beside its blobs can drop the header read too.
+// [EncryptedBlob.Material] reports the envelope parameters a range decrypt needs
+// as a [BodyMaterial]; persisting those and passing them to
+// [DecryptRangeWithMaterial] serves a range with no envelope round trip at all,
+// and [BodyMaterial.PlaintextSize] answers a HEAD from the same record.
+//
 // # Scope
 //
 // This package sequences the primitives and adds no cryptography of its own.

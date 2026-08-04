@@ -35,9 +35,11 @@ const (
 )
 
 // RangeReader streams the decrypted plaintext of one byte range of a FEE blob.
-// It is returned by [DecryptRange] and [DecryptRangeWithCEK], and reads
-// ciphertext lazily: nothing beyond the envelope header is fetched until Read is
-// called, and then only the chunks the range overlaps.
+// It is returned by [DecryptRange], [DecryptRangeWithCEK] and
+// [DecryptRangeWithMaterial], and reads ciphertext lazily: nothing beyond the
+// envelope header is fetched until Read is called (nothing at all on the cached
+// material path, which reads no envelope), and then only the chunks the range
+// overlaps.
 //
 // Any non-EOF error from Read means the plaintext emitted so far is incomplete
 // and must be discarded — a tampered or reordered chunk surfaces as
@@ -64,8 +66,9 @@ func (r *RangeReader) Read(p []byte) (int, error) { return r.sr.Read(p) }
 func (r *RangeReader) Len() int64 { return r.sr.Len() }
 
 // Size returns the total plaintext size of the whole object, derived from the
-// blob size and the envelope's chunk size. It is the total an HTTP consumer puts
-// after the slash in a Content-Range header.
+// blob size and the chunk size. It is the total an HTTP consumer puts after the
+// slash in a Content-Range header. [BodyMaterial.PlaintextSize] reports the same
+// number from cached material, without a reader.
 func (r *RangeReader) Size() int64 { return r.size }
 
 // CiphertextSpan returns the blob-absolute byte range [off, off+n) that Read will

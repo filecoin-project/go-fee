@@ -46,7 +46,7 @@ import (
 
 | Package | Purpose |
 |---|---|
-| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt` plus byte-range `DecryptRange`. Adds no cryptography of its own. |
+| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt`, byte-range `DecryptRange`, and the cacheable envelope parameters (`BodyMaterial`) that let a range read skip the header. Adds no cryptography of its own. |
 | [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
 | [`cose`](./cose) | Just enough of COSE (RFC 9052): `COSE_Encrypt` (tag 96) / `COSE_Encrypt0` (tag 16) with a detached payload, and the `Enc_structure` AAD. |
 | [`ecdhkw`](./ecdhkw) | ECDH-ES+A256KW key wrap over X25519 (COSE algorithm −31). |
@@ -316,6 +316,38 @@ suffix range (`bytes=-N`) needs. `fee.DecryptRangeWithCEK` is the external-CEK
 counterpart of `DecryptRange`. Callers holding raw ciphertext spans rather than a
 whole blob can use `aesstream.CiphertextRange` / `SpanReader` / `OpenSpan`
 directly.
+
+### Caching the envelope parameters
+
+The envelope is a fixed prefix of every stored object, so a store that keeps its
+own metadata beside the blob can record what a range decrypt needs from it and
+skip the header read as well. `fee.Encrypt` returns an `*fee.EncryptedBlob`, whose
+`Material()` reports those four values — envelope length, base nonce, chunk size,
+and the `Enc_structure` AAD — complete before any plaintext is read, so a writer
+can store them while the upload is still streaming:
+
+```go
+blob, err := fee.Encrypt(plaintext, recipients)
+// ...
+m := blob.Material() // persist alongside the blob's location and size
+```
+
+`fee.DecryptRangeWithMaterial(blob, blobSize, m, cek, off, length)` then serves a
+range with no envelope round trip at all: the only bytes fetched are the
+ciphertext chunks the range overlaps. `m.PlaintextSize(blobSize)` answers a `HEAD`
+or resolves a suffix range from the stored record alone, reading nothing.
+
+Every field is non-secret — all four are already in the clear at the front of the
+blob — and the CEK is deliberately not among them. Store the AAD rather than the
+protected header it contains: the `Enc_structure`'s context string differs between
+a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the protected
+header alone would need a companion flag recording which form was written. A stale
+or corrupted record cannot serve wrong plaintext, since all four values are bound
+into every chunk's GCM tag or decide which bytes are read; it fails with
+`aesstream.ErrCorrupted` instead. The one check it gives up is `ErrSizeMismatch`:
+with no envelope to consult, nothing cross-checks `blobSize` against the declared
+chunk count, so a caller that stores the size should compare it with the store's
+own before trusting a range.
 
 ## Wire format
 
