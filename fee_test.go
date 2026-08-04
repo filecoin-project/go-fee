@@ -205,10 +205,13 @@ func encryptAndRecoverCEK(t *testing.T, key *ecdh.PrivateKey, plaintext []byte) 
 	ephPub, err := ecdh.X25519().NewPublicKey(x)
 	require.NoError(t, err)
 
+	protected, err := rcpt.Headers.ProtectedBytes()
+	require.NoError(t, err)
+
 	cek, err = ecdhkw.Unwrap(key, &ecdhkw.Wrapped{
 		EphemeralPublicKey: ephPub,
 		WrappedCEK:         rcpt.Ciphertext,
-	})
+	}, protected)
 	require.NoError(t, err, "ECDH-ES+A256KW unwrap")
 
 	return blob, cek, baseNonce
