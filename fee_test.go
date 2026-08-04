@@ -13,6 +13,7 @@ import (
 	"github.com/filecoin-project/go-fee/aeskw"
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/filecoin-project/go-fee/cose"
+	"github.com/filecoin-project/go-fee/ecdhkw"
 	"github.com/stretchr/testify/require"
 )
 
@@ -171,6 +172,73 @@ func TestRoundTripMixedRecipients(t *testing.T) {
 	})
 	t.Run("A256KW opens", func(t *testing.T) {
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewA256KWUnwrapper(a256kwKID, kek)))
+	})
+}
+
+// encryptAndRecoverCEK encrypts plaintext to key and returns the envelope blob,
+// the CEK actually used (unwrapped from the envelope's ECDH-ES recipient) and the
+// envelope's base nonce.
+func encryptAndRecoverCEK(t *testing.T, key *ecdh.PrivateKey, plaintext []byte) (blob, cek, baseNonce []byte) {
+	t.Helper()
+
+	var err error
+	blob, err = encrypt(t, plaintext,
+		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
+	)
+	require.NoError(t, err)
+
+	env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
+	require.NoError(t, err)
+
+	var ok bool
+	baseNonce, ok = env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+	require.True(t, ok, "base nonce present in the unprotected header")
+
+	require.Len(t, env.Recipients, 1)
+	rcpt := env.Recipients[0]
+	ephRaw, ok := rcpt.Headers.Unprotected.Get(cose.HeaderLabelEphemeralKey)
+	require.True(t, ok, "ECDH-ES recipient carries an ephemeral key")
+	eph, ok := ephRaw.(map[any]any)
+	require.True(t, ok, "ephemeral key is a self-describing COSE_Key map")
+	x, ok := eph[coseKeyX].([]byte)
+	require.True(t, ok, "ephemeral key x is a byte string")
+	ephPub, err := ecdh.X25519().NewPublicKey(x)
+	require.NoError(t, err)
+
+	cek, err = ecdhkw.Unwrap(key, &ecdhkw.Wrapped{
+		EphemeralPublicKey: ephPub,
+		WrappedCEK:         rcpt.Ciphertext,
+	})
+	require.NoError(t, err, "ECDH-ES+A256KW unwrap")
+
+	return blob, cek, baseNonce
+}
+
+// TestEncryptFreshCEKPerObject confirms Encrypt derives a fresh CEK and base
+// nonce for every call, so no (key, nonce) pair is ever reused across objects.
+// The CEKs are recovered by unwrapping the recipient entry: comparing
+// ciphertexts alone would also pass with a fixed CEK and a fresh base nonce.
+func TestEncryptFreshCEKPerObject(t *testing.T) {
+	key := newX25519Key(t)
+	plaintext := patternBytes(100)
+
+	blob1, cek1, nonce1 := encryptAndRecoverCEK(t, key, plaintext)
+	_, cek2, nonce2 := encryptAndRecoverCEK(t, key, plaintext)
+
+	t.Run("CEK differs across Encrypt calls", func(t *testing.T) {
+		require.NotEqual(t, cek1, cek2)
+	})
+
+	t.Run("base nonce differs across Encrypt calls", func(t *testing.T) {
+		require.NotEqual(t, nonce1, nonce2)
+	})
+
+	t.Run("unwrapped CEK opens the body", func(t *testing.T) {
+		dr, err := fee.DecryptWithCEK(bytes.NewReader(blob1), cek1)
+		require.NoError(t, err)
+		got, err := io.ReadAll(dr)
+		require.NoError(t, err)
+		require.Equal(t, plaintext, got)
 	})
 }
 
