@@ -28,10 +28,12 @@ to it and this repo matches it (see [Wire format](#wire-format)).
 | `empty-file-ts` | TS seals → Go decrypts | tag 16 |
 | `exact-multiple-go` | Go seals → TS decrypts (plaintext is exactly 3 chunks) | tag 16 |
 
-Three framing cases are covered in both directions: a single chunk, a final
-partial chunk (the multi-chunk fixtures end mid-chunk), and the empty file. An
-empty plaintext encodes as one empty final chunk, so its whole body is a bare
-16-byte tag; `TestVectors` asserts the ciphertext length for every fixture.
+Four framing cases are covered: a single chunk, a final partial chunk (the
+multi-chunk fixtures end mid-chunk), the empty file, and a full final chunk
+(`exact-multiple-go`, whose plaintext is exactly 3 chunks). The partial final
+chunk and the empty file run in both directions. An empty plaintext encodes as
+one empty final chunk, so its whole body is a bare 16-byte tag; `TestVectors`
+asserts the ciphertext length for every fixture.
 
 Each `testdata/<name>/` holds `blob.bin` (`envelope‖ciphertext`),
 `plaintext.bin`, and `meta.json`.
@@ -63,12 +65,13 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   `baseNonce[7] ‖ chunkIndex[4, big-endian] ‖ lastFlag[1]` (`0x01` on the final
   chunk), tag 16 bytes. Chunk count is `max(1, ceil(plaintextLen / chunkSize))`,
   so an empty plaintext still seals one (empty) final chunk.
-- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
-  with the remainder in the final chunk; empty input is one empty chunk. Both
-  implementations follow that rule, so `exact-multiple-go` declares 3 chunks
-  rather than 3 full chunks plus an empty one. A *decoder* also accepts a
-  trailing empty final chunk, so the declared count is authoritative and must
-  not be re-derived from the plaintext length.
+- **Chunk count on decode** — the formula above is the producer's rule, which
+  both implementations follow, so `exact-multiple-go` declares 3 chunks rather
+  than 3 full chunks plus an empty one. A decoder must not re-derive the count
+  that way: a stream ending in an empty final chunk holds one chunk more than
+  the formula gives for the same plaintext, and both forms decrypt identically.
+  The declared count is authoritative, and only the ciphertext length tells the
+  two forms apart.
 - **Body AAD** — `Enc_structure = [ context, protected, "" ]`, the **same** for
   every chunk. `context` follows the envelope structure per RFC 9052 §5.3:
   `"Encrypt"` for a tag-96 envelope, `"Encrypt0"` for tag-16. AAD interop is
