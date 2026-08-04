@@ -124,17 +124,21 @@ func verifyRecipients(t *testing.T, f fixture, cek []byte) {
 			require.Equal(t, cose.AlgECDHESA256KW, rm.Algorithm)
 			priv := mustX25519Priv(t, rm.TenantX25519PrivHex)
 			ephPub := ephemeralPub(t, r)
+			// The recipient's protected header is an input to the key derivation
+			// (RFC 9053 §5.2), taken from the wire as received.
+			protected, err := r.Headers.ProtectedBytes()
+			require.NoError(t, err, "recipient protected header")
 			unwrapped, err := ecdhkw.Unwrap(priv, &ecdhkw.Wrapped{
 				EphemeralPublicKey: ephPub,
 				WrappedCEK:         r.Ciphertext,
-			})
+			}, protected)
 			require.NoError(t, err, "ECDH-ES+A256KW unwrap")
 			require.Equal(t, cek, unwrapped, "unwrapped CEK matches shared CEK")
 
 			// Wrong key must fail rather than return garbage.
 			wrongPriv, err := ecdh.X25519().GenerateKey(zeroReader{})
 			require.NoError(t, err)
-			_, err = ecdhkw.Unwrap(wrongPriv, &ecdhkw.Wrapped{EphemeralPublicKey: ephPub, WrappedCEK: r.Ciphertext})
+			_, err = ecdhkw.Unwrap(wrongPriv, &ecdhkw.Wrapped{EphemeralPublicKey: ephPub, WrappedCEK: r.Ciphertext}, protected)
 			require.Error(t, err, "unwrap with wrong key must fail")
 
 		case "a256kw":
