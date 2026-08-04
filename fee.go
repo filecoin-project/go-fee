@@ -206,7 +206,11 @@ func WithContentLength(n int64) EncryptOption {
 // Encryption runs in a background goroutine that feeds the returned reader, so a
 // caller MUST either read it to EOF or Close it: Close aborts the goroutine. An
 // encryption failure surfaces as a non-EOF error from the reader's Read.
-func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, error) {
+//
+// The returned [EncryptedBlob] is an io.ReadCloser over the blob; its
+// [EncryptedBlob.Material] reports the envelope parameters a later range decrypt
+// needs, for a caller that wants to cache them rather than re-read the header.
+func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption) (*EncryptedBlob, error) {
 	if len(recipients) == 0 {
 		return nil, ErrNoRecipients
 	}
@@ -244,7 +248,11 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 //
 // The caller retains ownership of cek: it is copied into the body cipher (and
 // wrapped to any recipients) but neither retained nor wiped by this call.
-func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, error) {
+//
+// As with [Encrypt], the returned [EncryptedBlob] carries the envelope
+// parameters a later range decrypt needs; see [EncryptedBlob.Material]. They are
+// reported for a recipient-less COSE_Encrypt0 exactly as for a COSE_Encrypt.
+func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (*EncryptedBlob, error) {
 	if len(cek) != aesstream.KeySize {
 		return nil, fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
 	}
@@ -262,7 +270,7 @@ func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opt
 // as it returns — even though the returned reader has not been read and its
 // background encryption goroutine is still running. That goroutine works from
 // the writer's internalized key, never from the cek slice.
-func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, error) {
+func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (*EncryptedBlob, error) {
 	if plaintext == nil {
 		return nil, errors.New("fee: nil plaintext reader")
 	}
@@ -376,9 +384,20 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		_ = pw.CloseWithError(cerr)
 	}()
 
-	return &encryptReader{
-		body: io.MultiReader(bytes.NewReader(header), pr),
-		pr:   pr,
+	// Every value the material reports is already fixed above, before any
+	// plaintext is read, so it is complete the moment this returns — a caller can
+	// record it without waiting for (or even performing) the read.
+	return &EncryptedBlob{
+		encryptReader: encryptReader{
+			body: io.MultiReader(bytes.NewReader(header), pr),
+			pr:   pr,
+		},
+		material: BodyMaterial{
+			HeaderLen: int64(len(header)),
+			BaseNonce: baseNonce,
+			ChunkSize: cfg.chunkSize,
+			AAD:       aad,
+		},
 	}, nil
 }
 
@@ -391,10 +410,32 @@ func chunkCountFor(nPlain, chunkSize int64) int64 {
 	return (nPlain + chunkSize - 1) / chunkSize
 }
 
-// encryptReader is the io.ReadCloser returned by [Encrypt] / [EncryptWithCEK].
+// EncryptedBlob is the io.ReadCloser returned by [Encrypt] / [EncryptWithCEK]:
+// a stream over the wire blob (envelope||ciphertext), plus the envelope
+// parameters a later range decrypt needs.
+//
 // Read serves the envelope header and then the streamed ciphertext; Close aborts
 // the background encryption goroutine by closing the pipe, so it is safe to
 // abandon a partial read.
+type EncryptedBlob struct {
+	encryptReader
+	material BodyMaterial
+}
+
+// Material reports the envelope parameters that [DecryptRangeWithMaterial] needs
+// to decrypt a byte range of this blob without re-reading its header — for a
+// caller that stores blobs remotely and keeps metadata of its own alongside
+// them.
+//
+// The result is complete as soon as the blob is constructed: every value is
+// fixed before any plaintext is read, so it can be recorded without reading (or
+// even finishing) the stream. It describes a recipient-less COSE_Encrypt0 just
+// as it does a COSE_Encrypt.
+//
+// Each call returns an independent copy; mutating it does not affect the blob.
+func (b *EncryptedBlob) Material() BodyMaterial { return b.material.clone() }
+
+// encryptReader carries the streaming half of an [EncryptedBlob].
 type encryptReader struct {
 	body io.Reader      // io.MultiReader(header, pipe reader)
 	pr   *io.PipeReader // closing it stops the encryption goroutine
