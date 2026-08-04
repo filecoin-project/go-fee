@@ -115,16 +115,19 @@ func TestIngotWriteReadFlow(t *testing.T) {
 		// on the encrypt side cannot hide behind a self-consistent round trip.
 		env, rest, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		require.Equal(t, int64(len(blob)-len(rest)), mat.HeaderLen)
-
 		iv, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
 		require.True(t, ok)
-		require.Equal(t, iv, mat.BaseNonce)
-		require.Equal(t, rangeChunk, mat.ChunkSize)
-
 		aad, err := env.EncStructure(nil)
 		require.NoError(t, err)
-		require.Equal(t, aad, mat.AAD)
+
+		// One comparison over the whole value, so a field added to BodyMaterial
+		// cannot go unchecked here.
+		require.Equal(t, fee.BodyMaterial{
+			HeaderLen: int64(len(blob) - len(rest)),
+			BaseNonce: iv,
+			ChunkSize: rangeChunk,
+			AAD:       aad,
+		}, mat)
 	})
 
 	t.Run("plaintext size from the row alone", func(t *testing.T) {
@@ -156,12 +159,7 @@ func TestIngotWriteReadFlow(t *testing.T) {
 				cek, tc.off, tc.length)
 			require.NoError(t, err)
 
-			// Computed without off+length, which overflows for an open-ended range.
-			end := int64(size)
-			if tc.length < end-tc.off {
-				end = tc.off + tc.length
-			}
-			want := plaintext[tc.off:end]
+			want := plaintext[tc.off : tc.off+clampLen(size, tc.off, tc.length)]
 			require.Equal(t, int64(len(want)), r.Len(), "Len must be known before reading")
 			require.Equal(t, int64(size), r.Size())
 
@@ -207,7 +205,7 @@ func TestDecryptRangeWithMaterialEncrypt0(t *testing.T) {
 	// It really is the recipient-less form.
 	tag, err := cose.PeekTag(blob)
 	require.NoError(t, err)
-	require.Equal(t, uint64(16), tag)
+	require.Equal(t, cose.TagCOSEEncrypt0, tag)
 
 	recording := newRecordingReaderAt(t, blob)
 	r, err := fee.DecryptRangeWithMaterial(recording, int64(len(blob)), mat, cek, 10, 4000)
@@ -297,11 +295,11 @@ func TestDecryptRangeWithMaterialPoisoned(t *testing.T) {
 	for name, mutate := range map[string]func(m *fee.BodyMaterial){
 		"header length off by one": func(m *fee.BodyMaterial) { m.HeaderLen++ },
 		"wrong base nonce": func(m *fee.BodyMaterial) {
-			m.BaseNonce = append([]byte(nil), m.BaseNonce...)
+			m.BaseNonce = bytes.Clone(m.BaseNonce)
 			m.BaseNonce[0] ^= 0xff
 		},
 		"tampered aad": func(m *fee.BodyMaterial) {
-			m.AAD = append([]byte(nil), m.AAD...)
+			m.AAD = bytes.Clone(m.AAD)
 			m.AAD[len(m.AAD)-1] ^= 0xff
 		},
 		"wrong chunk size": func(m *fee.BodyMaterial) { m.ChunkSize = rangeChunk * 2 },

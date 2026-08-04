@@ -259,8 +259,8 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // parameters a later range decrypt needs; see [EncryptedBlob.Material]. They are
 // reported for a recipient-less COSE_Encrypt0 exactly as for a COSE_Encrypt.
 func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (*EncryptedBlob, error) {
-	if len(cek) != aesstream.KeySize {
-		return nil, fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+	if err := checkCEK(cek); err != nil {
+		return nil, err
 	}
 	return encryptStream(plaintext, cek, recipients, opts...)
 }
@@ -390,14 +390,9 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		_ = pw.CloseWithError(cerr)
 	}()
 
-	// Every value the material reports is already fixed above, before any
-	// plaintext is read, so it is complete the moment this returns — a caller can
-	// record it without waiting for (or even performing) the read.
 	return &EncryptedBlob{
-		encryptReader: encryptReader{
-			body: io.MultiReader(bytes.NewReader(header), pr),
-			pr:   pr,
-		},
+		body: io.MultiReader(bytes.NewReader(header), pr),
+		pr:   pr,
 		material: BodyMaterial{
 			HeaderLen: int64(len(header)),
 			BaseNonce: baseNonce,
@@ -424,9 +419,16 @@ func chunkCountFor(nPlain, chunkSize int64) int64 {
 // the background encryption goroutine by closing the pipe, so it is safe to
 // abandon a partial read.
 type EncryptedBlob struct {
-	encryptReader
+	body     io.Reader      // io.MultiReader(header, pipe reader)
+	pr       *io.PipeReader // closing it stops the encryption goroutine
 	material BodyMaterial
 }
+
+// Read implements io.Reader over the wire blob.
+func (b *EncryptedBlob) Read(p []byte) (int, error) { return b.body.Read(p) }
+
+// Close stops the background encryption goroutine.
+func (b *EncryptedBlob) Close() error { return b.pr.Close() }
 
 // Material reports the envelope parameters that [DecryptRangeWithMaterial] needs
 // to decrypt a byte range of this blob without re-reading its header — for a
@@ -440,16 +442,6 @@ type EncryptedBlob struct {
 //
 // Each call returns an independent copy; mutating it does not affect the blob.
 func (b *EncryptedBlob) Material() BodyMaterial { return b.material.clone() }
-
-// encryptReader carries the streaming half of an [EncryptedBlob].
-type encryptReader struct {
-	body io.Reader      // io.MultiReader(header, pipe reader)
-	pr   *io.PipeReader // closing it stops the encryption goroutine
-}
-
-func (e *encryptReader) Read(p []byte) (int, error) { return e.body.Read(p) }
-
-func (e *encryptReader) Close() error { return e.pr.Close() }
 
 // Decrypt recovers the plaintext from a FEE COSE_Encrypt (tag 96) envelope read
 // from src.
@@ -510,8 +502,8 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 	if src == nil {
 		return nil, errors.New("fee: nil envelope reader")
 	}
-	if len(cek) != aesstream.KeySize {
-		return nil, fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+	if err := checkCEK(cek); err != nil {
+		return nil, err
 	}
 	env, ciphertext, err := cose.DecodeReader(src, cose.WithExpectedType(EnvelopeType))
 	if err != nil {
@@ -618,6 +610,16 @@ func validateBody(env *cose.Envelope) (bodyParams, error) {
 	}
 
 	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize), aad: aad}, nil
+}
+
+// checkCEK reports whether a caller-provided content-encryption key is the right
+// length for the FEE body cipher. It is the one spelling of the check every
+// external-CEK entry point applies, so they all report ErrInvalidCEK the same way.
+func checkCEK(cek []byte) error {
+	if len(cek) != aesstream.KeySize {
+		return fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+	}
+	return nil
 }
 
 // matchRecipient returns the first recipient whose kid equals want. A recipient

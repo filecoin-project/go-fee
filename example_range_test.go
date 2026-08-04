@@ -48,10 +48,6 @@ func ExampleDecryptRange() {
 	// Both are known up front, so a handler can write its headers before
 	// decrypting a single chunk.
 	fmt.Printf("Content-Length: %d\n", r.Len())
-	if r.Len() == 0 {
-		fmt.Printf("Content-Range: bytes */%d\n", r.Size())
-		return
-	}
 	fmt.Printf("Content-Range: bytes %d-%d/%d\n", off, off+r.Len()-1, r.Size())
 	got, err := io.ReadAll(r)
 	if err != nil {

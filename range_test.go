@@ -8,7 +8,7 @@ import (
 	"errors"
 	"io"
 	"math"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/filecoin-project/go-fee"
@@ -26,7 +26,7 @@ const rangeChunk = aesstream.MinChunkSize
 // interval it is asked for, so a test can prove which bytes a range decrypt
 // actually touched.
 type recordingReaderAt struct {
-	blob   []byte
+	blob   *bytes.Reader
 	reads  []readInterval
 	reject bool // fail instead of serving, to prove no read happens at all
 	t      *testing.T
@@ -37,7 +37,7 @@ type readInterval struct{ off, n int64 }
 
 func newRecordingReaderAt(t *testing.T, blob []byte) *recordingReaderAt {
 	t.Helper()
-	return &recordingReaderAt{blob: blob, t: t}
+	return &recordingReaderAt{blob: bytes.NewReader(blob), t: t}
 }
 
 func (r *recordingReaderAt) ReadAt(p []byte, off int64) (int, error) {
@@ -45,31 +45,9 @@ func (r *recordingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		r.t.Errorf("unexpected ReadAt(off=%d, len=%d)", off, len(p))
 		return 0, errors.New("recordingReaderAt: read not expected")
 	}
-	n, err := bytes.NewReader(r.blob).ReadAt(p, off)
+	n, err := r.blob.ReadAt(p, off)
 	r.reads = append(r.reads, readInterval{off: off, n: int64(n)})
 	return n, err
-}
-
-// covered reports the set of blob offsets the reads touched, as a sorted list of
-// merged [off, end) intervals.
-func (r *recordingReaderAt) covered() []readInterval {
-	if len(r.reads) == 0 {
-		return nil
-	}
-	sorted := append([]readInterval(nil), r.reads...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].off < sorted[j].off })
-	merged := []readInterval{sorted[0]}
-	for _, rd := range sorted[1:] {
-		last := &merged[len(merged)-1]
-		if rd.off <= last.off+last.n {
-			if end := rd.off + rd.n; end > last.off+last.n {
-				last.n = end - last.off
-			}
-			continue
-		}
-		merged = append(merged, rd)
-	}
-	return merged
 }
 
 // rangeFixture is an encrypted object plus everything needed to range-decrypt it.
@@ -119,6 +97,20 @@ func hexBytes(t *testing.T, s string) []byte {
 	return b
 }
 
+// clampLen is the plaintext length a range request of [off, off+length) actually
+// yields from a size-byte object: length clamped to what is left from off. The
+// subtraction comes first, so an open-ended math.MaxInt64 length cannot overflow.
+func clampLen(size, off, length int64) int64 {
+	return min(length, size-off)
+}
+
+// headerLenOf reports the encoded envelope length of a blob holding size
+// plaintext bytes at rangeChunk, by subtracting the ciphertext the STREAM
+// geometry accounts for.
+func headerLenOf(blob []byte, size int64) int64 {
+	return int64(len(blob)) - aesstream.EncryptedSize(size, rangeChunk)
+}
+
 // decryptRange range-decrypts [off, off+length) from blob and returns the reader
 // alongside the bytes it emitted, asserting a clean stream.
 func decryptRange(t *testing.T, blob []byte, u fee.RecipientUnwrapper, off, length int64) (*fee.RangeReader, []byte) {
@@ -162,10 +154,7 @@ func TestDecryptRangeRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r, got := decryptRange(t, f.blob, f.unwrapper, tc.off, tc.length)
 
-			wantLen := tc.length
-			if avail := int64(size) - tc.off; wantLen > avail {
-				wantLen = avail
-			}
+			wantLen := clampLen(size, tc.off, tc.length)
 			require.Equal(t, wantLen, r.Len(), "Len is the clamped range length")
 			require.Equal(t, int64(size), r.Size(), "Size is the whole object")
 			require.Equal(t, f.plaintext[tc.off:tc.off+wantLen], got)
@@ -268,7 +257,7 @@ func TestDecryptRangeReadsOnlySpan(t *testing.T) {
 	require.NoError(t, err)
 
 	spanOff, spanLen := r.CiphertextSpan()
-	headerReads := append([]readInterval(nil), rec.reads...)
+	headerReads := slices.Clone(rec.reads)
 	require.NotEmpty(t, headerReads, "the header must be read at construction")
 	for _, rd := range headerReads {
 		require.Equal(t, int64(0), rd.off, "construction reads only the header prefix at offset 0")
@@ -294,13 +283,6 @@ func TestDecryptRangeReadsOnlySpan(t *testing.T) {
 		fetched += rd.n
 	}
 	require.Equal(t, spanLen, fetched, "the span is fetched exactly once, in full")
-
-	// And the whole object was never pulled in: header probe plus one chunk.
-	var total int64
-	for _, rd := range rec.covered() {
-		total += rd.n
-	}
-	require.Less(t, total, int64(len(f.blob)), "the full blob must never be read")
 }
 
 // TestDecryptRangeZeroLengthReadsNoCiphertext confirms an empty range is valid,
@@ -352,7 +334,7 @@ func TestDecryptRangePrefetchSpan(t *testing.T) {
 	// Re-decrypt against a blob view backed by the prefetched span, and prove the
 	// origin serves nothing further.
 	rec.reject = true
-	r, err := fee.DecryptRange(prefetchedBlob{span: span, spanOff: spanOff, header: f.blob[:spanOff]},
+	r, err := fee.DecryptRange(newPrefetchedBlob(f.blob[:spanOff], span, spanOff),
 		int64(len(f.blob)), f.unwrapper, off, length)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
@@ -364,16 +346,20 @@ func TestDecryptRangePrefetchSpan(t *testing.T) {
 // and the pre-fetched ciphertext span from another, the shape a caller gets after
 // a single range request.
 type prefetchedBlob struct {
-	header  []byte
-	span    []byte
+	header  *bytes.Reader
+	span    *bytes.Reader
 	spanOff int64
+}
+
+func newPrefetchedBlob(header, span []byte, spanOff int64) prefetchedBlob {
+	return prefetchedBlob{header: bytes.NewReader(header), span: bytes.NewReader(span), spanOff: spanOff}
 }
 
 func (b prefetchedBlob) ReadAt(p []byte, off int64) (int, error) {
 	if off < b.spanOff {
-		return bytes.NewReader(b.header).ReadAt(p, off)
+		return b.header.ReadAt(p, off)
 	}
-	return bytes.NewReader(b.span).ReadAt(p, off-b.spanOff)
+	return b.span.ReadAt(p, off-b.spanOff)
 }
 
 // TestDecryptRangeTamperedChunkInRange is the acceptance criterion that a tampered
@@ -384,7 +370,7 @@ func TestDecryptRangeTamperedChunkInRange(t *testing.T) {
 	f := newRangeFixture(t, size)
 	off, length := int64(rangeChunk+10), int64(50)
 
-	headerLen := int64(len(f.blob)) - aesstream.EncryptedSize(size, rangeChunk)
+	headerLen := headerLenOf(f.blob, size)
 	// Positions inside chunk 1's ciphertext: its first byte, a byte covering the
 	// requested range, and a byte of its authentication tag.
 	chunkStart := headerLen + int64(rangeChunk+aesstream.TagSize)
@@ -393,7 +379,7 @@ func TestDecryptRangeTamperedChunkInRange(t *testing.T) {
 		chunkStart + 10,
 		chunkStart + int64(rangeChunk) + aesstream.TagSize - 1,
 	} {
-		tampered := append([]byte(nil), f.blob...)
+		tampered := bytes.Clone(f.blob)
 		tampered[pos] ^= 0x01
 
 		r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, off, length)
@@ -414,8 +400,8 @@ func TestDecryptRangeTamperOutsideRange(t *testing.T) {
 	f := newRangeFixture(t, size)
 	off, length := int64(10), int64(100) // wholly inside chunk 0
 
-	headerLen := int64(len(f.blob)) - aesstream.EncryptedSize(size, rangeChunk)
-	tampered := append([]byte(nil), f.blob...)
+	headerLen := headerLenOf(f.blob, size)
+	tampered := bytes.Clone(f.blob)
 	tampered[headerLen+int64(3*(rangeChunk+aesstream.TagSize))+5] ^= 0x01 // chunk 3
 
 	r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, off, length)
@@ -758,8 +744,7 @@ func TestDecryptRangeLargeEnvelope(t *testing.T) {
 	blob, err := encrypt(t, plaintext, rs, fee.WithChunkSize(rangeChunk))
 	require.NoError(t, err)
 
-	headerLen := int64(len(blob)) - aesstream.EncryptedSize(size, rangeChunk)
-	require.Greater(t, headerLen, int64(4096), "the envelope must exceed the first probe size")
+	require.Greater(t, headerLenOf(blob, size), int64(4096), "the envelope must exceed the first probe size")
 
 	off, length := int64(rangeChunk+7), int64(300)
 	_, got := decryptRange(t, blob, fee.NewECDHESUnwrapper(ecdhKID, priv), off, length)

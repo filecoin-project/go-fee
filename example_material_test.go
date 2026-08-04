@@ -15,13 +15,13 @@ import (
 // countingBlob is an io.ReaderAt that reports how many bytes were served from
 // inside the envelope — the round trip a caching caller is trying to avoid.
 type countingBlob struct {
-	blob      []byte
+	blob      *bytes.Reader
 	headerLen int64
 	envelope  int64 // bytes served from below headerLen
 }
 
 func (c *countingBlob) ReadAt(p []byte, off int64) (int, error) {
-	n, err := bytes.NewReader(c.blob).ReadAt(p, off)
+	n, err := c.blob.ReadAt(p, off)
 	if off < c.headerLen {
 		c.envelope += min(int64(n), c.headerLen-off)
 	}
@@ -76,7 +76,7 @@ func ExampleDecryptRangeWithMaterial() {
 
 	// Serving a range later. Nothing here decodes the envelope — the reader is
 	// built from the stored row, so the only bytes fetched are ciphertext.
-	src := &countingBlob{blob: blob, headerLen: row.material.HeaderLen}
+	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.material.HeaderLen}
 	const off, length = 4, 15
 	r, err := fee.DecryptRangeWithMaterial(src, row.size, row.material, cek, off, length)
 	if err != nil {

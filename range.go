@@ -21,6 +21,10 @@ import (
 // come from the layer that supplied the size (a CID, a signed manifest).
 var ErrSizeMismatch = errors.New("fee: blob size disagrees with the envelope's declared chunk count")
 
+// errNilBlob is reported by every range entry point that would otherwise read
+// from a nil blob, whether or not it decodes an envelope first.
+var errNilBlob = errors.New("fee: nil blob reader")
+
 const (
 	// headerProbeSize is the first prefix length the envelope-header probe
 	// reads. A FEE envelope with a handful of recipients is a few hundred
@@ -155,8 +159,8 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, o
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.
 func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, length int64) (*RangeReader, error) {
-	if len(cek) != aesstream.KeySize {
-		return nil, fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+	if err := checkCEK(cek); err != nil {
+		return nil, err
 	}
 	env, headerLen, err := decodeHeaderAt(blob, blobSize)
 	if err != nil {
@@ -192,11 +196,11 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, leng
 // the body cipher but neither retained nor wiped. off and length behave exactly
 // as in [DecryptRange].
 func DecryptRangeWithMaterial(blob io.ReaderAt, blobSize int64, m BodyMaterial, cek []byte, off, length int64) (*RangeReader, error) {
-	if len(cek) != aesstream.KeySize {
-		return nil, fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+	if err := checkCEK(cek); err != nil {
+		return nil, err
 	}
 	if blob == nil {
-		return nil, errors.New("fee: nil blob reader")
+		return nil, errNilBlob
 	}
 	plainSize, err := m.PlaintextSize(blobSize) // validates m, and blobSize against it
 	if err != nil {
@@ -221,7 +225,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return plaintextSizeFor(env, blobSize, headerLen, body.chunkSize)
+	return envelopePlaintextSize(env, blobSize, headerLen, body.chunkSize)
 }
 
 // newRangeReader is the shared core of DecryptRange and DecryptRangeWithCEK:
@@ -239,7 +243,7 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 		return nil, err
 	}
 
-	plainSize, err := plaintextSizeFor(env, blobSize, headerLen, body.chunkSize)
+	plainSize, err := envelopePlaintextSize(env, blobSize, headerLen, body.chunkSize)
 	if err != nil {
 		return nil, err
 	}
@@ -276,11 +280,12 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 	return &RangeReader{sr: sr, size: plainSize, spanOff: headerLen + start, spanLen: n}, nil
 }
 
-// plaintextSizeFor is [plaintextSizeFrom] for a blob whose parameters came from
-// its envelope rather than from a caller's cache: it adds the cross-check of the
-// envelope's declared chunk count against the derived size, when one is present,
-// catching a blob size that describes a different object than the envelope does.
-func plaintextSizeFor(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
+// envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came
+// from its envelope rather than from a caller's cache: it adds the cross-check of
+// the envelope's declared chunk count against the derived size, when one is
+// present, catching a blob size that describes a different object than the
+// envelope does.
+func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
 	plainSize, err := plaintextSizeFrom(blobSize, headerLen, chunkSize)
 	if err != nil {
 		return 0, err
@@ -310,7 +315,7 @@ func plaintextSizeFor(env *cose.Envelope, blobSize, headerLen int64, chunkSize i
 // maxHeaderLen. Every realistic envelope decodes on the first read.
 func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, error) {
 	if blob == nil {
-		return nil, 0, errors.New("fee: nil blob reader")
+		return nil, 0, errNilBlob
 	}
 	if blobSize < 0 {
 		return nil, 0, fmt.Errorf("fee: negative blob size %d", blobSize)

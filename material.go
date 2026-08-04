@@ -104,7 +104,7 @@ func (m BodyMaterial) PlaintextSize(blobSize int64) (int64, error) {
 // plaintext bytes each.
 //
 // It is shared by [BodyMaterial.PlaintextSize] and the envelope-backed paths (via
-// plaintextSizeFor), so a blob size that cannot describe a FEE body is reported
+// envelopePlaintextSize), so a blob size that cannot describe a FEE body is reported
 // the same way whether the parameters came from a cache or from the envelope.
 func plaintextSizeFrom(blobSize, headerLen int64, chunkSize int) (int64, error) {
 	ciphertextSize := blobSize - headerLen
