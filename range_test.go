@@ -49,18 +49,6 @@ func (r *recordingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-// ciphertextBytesRead totals the bytes served from at or after headerEnd — the
-// ciphertext the decrypt actually fetched, excluding the header probe.
-func (r *recordingReaderAt) ciphertextBytesRead(headerEnd int64) int64 {
-	var total int64
-	for _, rd := range r.reads {
-		if rd.off >= headerEnd {
-			total += rd.n
-		}
-	}
-	return total
-}
-
 // covered reports the set of blob offsets the reads touched, as a sorted list of
 // merged [off, end) intervals.
 func (r *recordingReaderAt) covered() []readInterval {
