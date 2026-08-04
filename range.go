@@ -202,8 +202,7 @@ func DecryptRangeWithMaterial(blob io.ReaderAt, blobSize int64, m BodyMaterial, 
 	if err != nil {
 		return nil, err
 	}
-	body := bodyParams{baseNonce: m.BaseNonce, chunkSize: m.ChunkSize, aad: m.AAD}
-	return spanRangeReader(blob, blobSize, m.HeaderLen, body, plainSize, cek, off, length)
+	return spanRangeReader(blob, blobSize, m.HeaderLen, m.body(), plainSize, cek, off, length)
 }
 
 // PlaintextSize reports the total decrypted size of a FEE blob from its envelope
@@ -222,7 +221,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return plaintextSizeFor(env, blobSize-headerLen, body.chunkSize)
+	return plaintextSizeFor(env, blobSize, headerLen, body.chunkSize)
 }
 
 // newRangeReader is the shared core of DecryptRange and DecryptRangeWithCEK:
@@ -240,7 +239,7 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 		return nil, err
 	}
 
-	plainSize, err := plaintextSizeFor(env, blobSize-headerLen, body.chunkSize)
+	plainSize, err := plaintextSizeFor(env, blobSize, headerLen, body.chunkSize)
 	if err != nil {
 		return nil, err
 	}
@@ -268,12 +267,7 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 	// aesstream exactly the bytes it will ask for and nothing else.
 	sr, err := aesstream.NewSpanReader(
 		io.NewSectionReader(blob, headerLen+start, n),
-		aesstream.Config{
-			Key:       cek,
-			BaseNonce: body.baseNonce,
-			AAD:       body.aad,
-			ChunkSize: body.chunkSize,
-		},
+		body.streamConfig(cek),
 		ciphertextSize, off, length)
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
@@ -282,14 +276,14 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 	return &RangeReader{sr: sr, size: plainSize, spanOff: headerLen + start, spanLen: n}, nil
 }
 
-// plaintextSizeFor derives the object's total plaintext size from its ciphertext
-// length and chunk size, and cross-checks the envelope's declared chunk count
-// against it when one is present — catching a blob size that describes a
-// different object than the envelope does.
-func plaintextSizeFor(env *cose.Envelope, ciphertextSize int64, chunkSize int) (int64, error) {
-	plainSize, err := aesstream.DecryptedSize(ciphertextSize, chunkSize)
+// plaintextSizeFor is [plaintextSizeFrom] for a blob whose parameters came from
+// its envelope rather than from a caller's cache: it adds the cross-check of the
+// envelope's declared chunk count against the derived size, when one is present,
+// catching a blob size that describes a different object than the envelope does.
+func plaintextSizeFor(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
+	plainSize, err := plaintextSizeFrom(blobSize, headerLen, chunkSize)
 	if err != nil {
-		return 0, fmt.Errorf("fee: blob of %d ciphertext bytes: %w", ciphertextSize, err)
+		return 0, err
 	}
 	if !env.Headers.Unprotected.Has(labelChunkCount) {
 		return plainSize, nil

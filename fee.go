@@ -534,12 +534,7 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 	if err != nil {
 		return nil, err
 	}
-	r, err := aesstream.NewReader(ciphertext, aesstream.Config{
-		Key:       cek,
-		BaseNonce: body.baseNonce,
-		AAD:       body.aad,
-		ChunkSize: body.chunkSize,
-	})
+	r, err := aesstream.NewReader(ciphertext, body.streamConfig(cek))
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
@@ -549,10 +544,30 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 // bodyParams is the validated STREAM configuration a FEE envelope's body header
 // carries: everything fee/aesstream needs to decrypt the detached ciphertext
 // apart from the content-encryption key.
+//
+// [BodyMaterial] is the same parameters plus the envelope's encoded length —
+// where the ciphertext starts within a stored blob. That is what a caller caches
+// and what a range read needs; a whole-object read has neither the number (the
+// streaming decoder does not report it) nor a use for it, so the two shapes stay
+// distinct and [BodyMaterial.body] converts one way.
 type bodyParams struct {
 	baseNonce []byte
 	chunkSize int
 	aad       []byte
+}
+
+// streamConfig returns the fee/aesstream configuration for decrypting a body
+// with these parameters under cek. It is the only place FEE body parameters
+// become a stream configuration, so the whole-object reader ([openStream]) and
+// the range reader ([spanRangeReader]) cannot drift apart in how they configure
+// the cipher.
+func (b bodyParams) streamConfig(cek []byte) aesstream.Config {
+	return aesstream.Config{
+		Key:       cek,
+		BaseNonce: b.baseNonce,
+		AAD:       b.aad,
+		ChunkSize: b.chunkSize,
+	}
 }
 
 // validateBody checks a decoded envelope's FEE body headers — the algorithm is

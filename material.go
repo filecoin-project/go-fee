@@ -96,16 +96,34 @@ func (m BodyMaterial) PlaintextSize(blobSize int64) (int64, error) {
 	if err := m.Validate(); err != nil {
 		return 0, err
 	}
-	ciphertextSize := blobSize - m.HeaderLen
+	return plaintextSizeFrom(blobSize, m.HeaderLen, m.ChunkSize)
+}
+
+// plaintextSizeFrom derives the total plaintext size of a blobSize-byte blob
+// whose envelope occupies headerLen bytes and whose STREAM chunks carry chunkSize
+// plaintext bytes each.
+//
+// It is shared by [BodyMaterial.PlaintextSize] and the envelope-backed paths (via
+// plaintextSizeFor), so a blob size that cannot describe a FEE body is reported
+// the same way whether the parameters came from a cache or from the envelope.
+func plaintextSizeFrom(blobSize, headerLen int64, chunkSize int) (int64, error) {
+	ciphertextSize := blobSize - headerLen
 	if ciphertextSize < 0 {
 		return 0, fmt.Errorf("fee: blob size %d is shorter than its %d-byte envelope: %w",
-			blobSize, m.HeaderLen, aesstream.ErrCiphertextSize)
+			blobSize, headerLen, aesstream.ErrCiphertextSize)
 	}
-	n, err := aesstream.DecryptedSize(ciphertextSize, m.ChunkSize)
+	n, err := aesstream.DecryptedSize(ciphertextSize, chunkSize)
 	if err != nil {
 		return 0, fmt.Errorf("fee: blob of %d ciphertext bytes: %w", ciphertextSize, err)
 	}
 	return n, nil
+}
+
+// body returns the envelope body parameters m describes, for the range wiring it
+// shares with the envelope-backed paths. HeaderLen is not among them: it says
+// where the ciphertext starts, not how to decrypt it.
+func (m BodyMaterial) body() bodyParams {
+	return bodyParams{baseNonce: m.BaseNonce, chunkSize: m.ChunkSize, aad: m.AAD}
 }
 
 // clone returns a deep copy, so a BodyMaterial handed to a caller shares no
