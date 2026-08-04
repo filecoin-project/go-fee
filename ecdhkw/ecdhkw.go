@@ -6,11 +6,12 @@
 // identified by an X25519 public key (the sibling fee/aeskw package is the
 // other, wrapping directly under a symmetric KEK). A fresh
 // ephemeral X25519 key pair is generated for every Wrap; an ECDH against the
-// recipient's static public key yields a shared secret, the COSE Concat-KDF
-// (RFC 9053 §5.1, see kdf.go) turns that secret into a 256-bit key-encryption
-// key, and AES Key Wrap (RFC 3394, the sibling fee/aeskw package) wraps the CEK
-// under it. Unwrap reverses the process with the recipient's private key. Two
-// useful consequences fall out of the construction:
+// recipient's static public key yields a shared secret, HKDF-SHA-256 over the
+// COSE_KDF_Context (RFC 9053 §5.1 and §5.2, see kdf.go) turns that secret into
+// a 256-bit key-encryption key, and AES Key Wrap (RFC 3394, the sibling
+// fee/aeskw package) wraps the CEK under it. Unwrap reverses the process with
+// the recipient's private key. Two useful consequences fall out of the
+// construction:
 //
 //   - Recovery is self-checking. AES-KW carries an integrity check, so an
 //     unwrap with the wrong private key — or against a tampered wrapped key or
@@ -25,6 +26,30 @@
 // CEK as the recipient ciphertext, keyed by a kid) is the job of the
 // higher-level fee package. Keys are passed as crypto/ecdh values directly; any
 // custody or key-provider abstraction lives above this layer.
+//
+// # Migrating from v0.1.0
+//
+// v0.1.0 derived the KEK with the COSE Concat-KDF and took no protected header:
+// Wrap(recipientPub, cek) and Unwrap(recipientPriv, w). Both signatures now take
+// the serialized COSE_Recipient protected header as a trailing argument, and the
+// derivation is HKDF-SHA-256 as RFC 9053 §6.3.1 requires.
+//
+// Callers that build the recipient with the cose package pass the bytes that
+// package produces:
+//
+//	protected, err := cose.Headers{Protected: hdr}.ProtectedBytes()
+//	w, err := ecdhkw.Wrap(recipientPub, cek, protected)
+//
+// A recipient with an empty protected bucket takes a nil or zero-length slice,
+// which reproduces v0.1.0's context except for the KDF itself. On the unwrap
+// side, pass the recipient's protected bytes exactly as they arrived on the
+// wire; cose.Headers.ProtectedBytes returns those for a decoded envelope.
+//
+// Wraps written by v0.1.0 do not survive the change. The two derivations produce
+// different KEKs from the same ECDH secret, so Unwrap on an old wrap fails with
+// aeskw.ErrIntegrity, and nothing on the wire distinguishes the two: both use
+// alg -31. Envelopes encrypted to X25519 recipients under v0.1.0 have to be
+// decrypted with v0.1.0 and re-encrypted with this version.
 package ecdhkw
 
 import (
@@ -45,7 +70,7 @@ const AlgorithmECDHESA256KW = -31
 
 // algA256KW is the COSE algorithm identifier for AES-256 Key Wrap. It is the
 // algorithm the derived key feeds, so it is the AlgorithmID embedded in the
-// Concat-KDF context (RFC 9053 §5.2) that binds the KEK to its purpose.
+// COSE_KDF_Context (RFC 9053 §5.2) that binds the KEK to its purpose.
 const algA256KW = -5
 
 // kekLen is the length in bytes of the A256KW key-encryption key the KDF
@@ -76,7 +101,12 @@ type Wrapped struct {
 // recipientPub must be an X25519 key. cek must be a valid AES key — a multiple
 // of 8 bytes, at least 16 (so 16, 24, or 32 bytes). The cek slice is not
 // retained or modified.
-func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
+//
+// protected is the serialized protected header of the COSE_Recipient this wrap
+// will be encoded into, which RFC 9053 §5.2 binds into the key derivation; pass
+// a zero-length slice if that bucket is empty. Unwrap must receive the same
+// bytes, so the caller has to feed the encoder and the KDF from one value.
+func Wrap(recipientPub *ecdh.PublicKey, cek, protected []byte) (*Wrapped, error) {
 	if recipientPub == nil {
 		return nil, errors.New("ecdhkw nil recipient public key")
 	}
@@ -97,7 +127,7 @@ func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 		return nil, fmt.Errorf("ecdhkw generating ephemeral key: %w", err)
 	}
 
-	kek, err := deriveKEK(ephemeral, recipientPub)
+	kek, err := deriveKEK(ephemeral, recipientPub, protected)
 	if err != nil {
 		return nil, err
 	}
@@ -117,11 +147,15 @@ func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 // key-encryption key by ECDH between recipientPriv and the ephemeral public key
 // in w, then AES-KW-unwraps the CEK.
 //
+// protected is the serialized protected header of the COSE_Recipient the wrap
+// arrived in, exactly as received; see [Wrap]. Because it feeds the derivation,
+// a header rewritten in transit yields a different KEK and fails the unwrap.
+//
 // It returns an error if recipientPriv is the wrong key for this wrap, if the
-// ephemeral key or wrapped CEK was tampered with, or if either key is not
-// X25519. A wrong-key unwrap surfaces as aeskw.ErrIntegrity (wrapped), so
-// callers may match it with errors.Is.
-func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
+// ephemeral key, protected header, or wrapped CEK was tampered with, or if
+// either key is not X25519. A wrong-key unwrap surfaces as aeskw.ErrIntegrity
+// (wrapped), so callers may match it with errors.Is.
+func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped, protected []byte) ([]byte, error) {
 	if recipientPriv == nil {
 		return nil, errors.New("ecdhkw nil recipient private key")
 	}
@@ -138,7 +172,7 @@ func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
 		return nil, errors.New("ecdhkw ephemeral public key is not X25519")
 	}
 
-	kek, err := deriveKEK(recipientPriv, w.EphemeralPublicKey)
+	kek, err := deriveKEK(recipientPriv, w.EphemeralPublicKey, protected)
 	if err != nil {
 		return nil, err
 	}
@@ -152,22 +186,26 @@ func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
 }
 
 // deriveKEK performs the ECDH-ES key derivation shared by Wrap and Unwrap: an
-// X25519 ECDH between local and remote, then the COSE Concat-KDF over the
-// shared secret to produce the A256KW key-encryption key. ECDH symmetry is what
-// makes the two paths — (ephemeral private, recipient public) on wrap and
-// (recipient private, ephemeral public) on unwrap — derive the same KEK.
+// X25519 ECDH between local and remote, then HKDF-SHA-256 over the shared
+// secret to produce the A256KW key-encryption key. ECDH symmetry is what makes
+// the two paths — (ephemeral private, recipient public) on wrap and (recipient
+// private, ephemeral public) on unwrap — derive the same KEK.
 //
 // crypto/ecdh's X25519 ECDH returns an error for a low-order ephemeral point
 // (one that would force the shared secret to all-zeros), which propagates here.
-func deriveKEK(local *ecdh.PrivateKey, remote *ecdh.PublicKey) ([]byte, error) {
+func deriveKEK(local *ecdh.PrivateKey, remote *ecdh.PublicKey, protected []byte) ([]byte, error) {
 	z, err := local.ECDH(remote)
 	if err != nil {
 		return nil, fmt.Errorf("ecdhkw ECDH: %w", err)
 	}
 	defer zero(z)
 
-	context := kdfContext(algA256KW, kekLen*8, nil)
-	return concatKDF(z, context, kekLen), nil
+	context := kdfContext(algA256KW, kekLen*8, protected)
+	kek, err := hkdfKEK(z, context, kekLen)
+	if err != nil {
+		return nil, fmt.Errorf("ecdhkw deriving KEK: %w", err)
+	}
+	return kek, nil
 }
 
 // zero overwrites b, a best-effort wipe of derived key material (the KEK and

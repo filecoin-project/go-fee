@@ -24,7 +24,14 @@ to it and this repo matches it (see [Wire format](#wire-format)).
 | `multi-chunk-ts` | TS seals → Go decrypts | tag 16 (COSE_Encrypt0) |
 | `multi-recipient-go` | Go seals → TS parses recipients + decrypts body | tag 96 (COSE_Encrypt) |
 | `multi-chunk-go` | Go seals → TS decrypts (extra multi-chunk coverage) | tag 16 |
+| `empty-file-go` | Go seals → TS decrypts | tag 16 |
+| `empty-file-ts` | TS seals → Go decrypts | tag 16 |
 | `exact-multiple-go` | Go seals → TS decrypts (plaintext is exactly 3 chunks) | tag 16 |
+
+Three framing cases are covered in both directions: a single chunk, a final
+partial chunk (the multi-chunk fixtures end mid-chunk), and the empty file. An
+empty plaintext encodes as one empty final chunk, so its whole body is a bare
+16-byte tag; `TestVectors` asserts the ciphertext length for every fixture.
 
 Each `testdata/<name>/` holds `blob.bin` (`envelope‖ciphertext`),
 `plaintext.bin`, and `meta.json`.
@@ -54,7 +61,8 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 
 - **Body cipher** — chunked AES-256-GCM-STREAM, alg `-65793`. Per-chunk nonce is
   `baseNonce[7] ‖ chunkIndex[4, big-endian] ‖ lastFlag[1]` (`0x01` on the final
-  chunk), tag 16 bytes.
+  chunk), tag 16 bytes. Chunk count is `max(1, ceil(plaintextLen / chunkSize))`,
+  so an empty plaintext still seals one (empty) final chunk.
 - **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
   with the remainder in the final chunk; empty input is one empty chunk. Both
   implementations follow that rule, so `exact-multiple-go` declares 3 chunks
@@ -67,7 +75,10 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   order-independent: both sides key the AAD off the on-wire raw protected bytes.
 - **Recipients** — `wrappedKey` is carried opaquely; the reference never unwraps
   it (decryption takes the CEK directly). The Go side does real
-  ECDH-ES+A256KW / A256KW wrap and unwrap.
+  ECDH-ES+A256KW / A256KW wrap and unwrap. Because no fixture here pins the
+  ECDH key derivation, `TestHKDFPublishedVector` in
+  [`ecdhkw/kdf_test.go`](../ecdhkw/kdf_test.go) pins it instead, against the
+  COSE-WG example `ecdh-wrap-examples/p256-wrap-128-01`.
 
 ## Regenerating
 
@@ -75,13 +86,17 @@ Fixtures are checked in; tests are deterministic (they only read fixed files and
 run deterministic decrypt/unwrap). To recreate them:
 
 ```bash
-# Go-produced fixtures (single-chunk-go, multi-chunk-go, multi-recipient-go):
+# Go-produced fixtures (single-chunk-go, multi-chunk-go, empty-file-go,
+# multi-recipient-go):
 FEE_VECTORS_REGEN=1 go test ./vectors -run TestGenerate -v
 
-# TS-produced fixture (multi-chunk-ts) + verify every fixture decrypts under the
-# real, pinned foc-encryption:
+# Missing TS-produced fixtures (multi-chunk-ts, empty-file-ts) + verify every
+# fixture decrypts under the real, pinned foc-encryption:
 ./vectors/pull-foc-encryption.sh
 ```
+
+The driver writes a TS-produced fixture only when its directory is absent; set
+`FEE_VECTORS_REGEN=1` to rewrite one that is already committed.
 
 `pull-foc-encryption.sh` vendors the pinned reference into `ts/vendor/`
 (gitignored — never committed): `git clone` + `git fetch refs/heads/master`,
@@ -89,8 +104,9 @@ checking out the pinned SHA, and falling back to fetching the pinned source file
 from `raw.githubusercontent.com` where `git` is unavailable. It requires
 [`bun`](https://bun.sh) to run the TypeScript.
 
-The base nonces (Go's fixed, the reference's random) mean a regenerated blob may
-differ byte-for-byte from the committed one while remaining a valid vector; the
+The base nonces (Go's fixed, the reference's random) and the fresh ECDH-ES
+ephemeral key in `multi-recipient-go` mean a regenerated blob may differ
+byte-for-byte from the committed one while remaining a valid vector; the
 committed files are the fixed reference.
 
 ## Test key material

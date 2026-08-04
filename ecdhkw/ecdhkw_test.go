@@ -12,6 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testProtected is the serialized COSE_Recipient protected header FEE emits for
+// an ECDH-ES+A256KW recipient: the map {1: -31}. It is an input to the key
+// derivation (RFC 9053 §5.2), so wrap and unwrap must be given the same bytes.
+var testProtected = []byte{0xa1, 0x01, 0x38, 0x1e}
+
 func newRecipient(t *testing.T) *ecdh.PrivateKey {
 	t.Helper()
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
@@ -36,12 +41,12 @@ func TestWrapUnwrapRoundTrip(t *testing.T) {
 		_, err := rand.Read(cek)
 		require.NoError(t, err, "rand cek")
 
-		w, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+		w, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 		require.NoErrorf(t, err, "Wrap(%d-byte CEK)", size)
 		require.Equal(t, ecdh.X25519(), w.EphemeralPublicKey.Curve(), "ephemeral key is not X25519")
 		require.Lenf(t, w.WrappedCEK, size+8, "wrapped CEK length")
 
-		got, err := ecdhkw.Unwrap(recipient, w)
+		got, err := ecdhkw.Unwrap(recipient, w, testProtected)
 		require.NoErrorf(t, err, "Unwrap(%d-byte CEK)", size)
 		require.Equalf(t, cek, got, "round-trip mismatch for %d-byte CEK", size)
 	}
@@ -55,10 +60,10 @@ func TestUnwrapWrongPrivateKey(t *testing.T) {
 	wrongKey := newRecipient(t)
 	cek := bytes.Repeat([]byte{0x5A}, 32)
 
-	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 	require.NoError(t, err, "Wrap")
 
-	got, err := ecdhkw.Unwrap(wrongKey, w)
+	got, err := ecdhkw.Unwrap(wrongKey, w, testProtected)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap with wrong key should wrap aeskw.ErrIntegrity")
 	require.Nil(t, got)
 }
@@ -71,9 +76,9 @@ func TestWrapFreshEphemeralPerCall(t *testing.T) {
 	recipient := newRecipient(t)
 	cek := bytes.Repeat([]byte{0xC3}, 32)
 
-	first, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+	first, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 	require.NoError(t, err, "first Wrap")
-	second, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+	second, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 	require.NoError(t, err, "second Wrap")
 
 	require.NotEqual(t, first.EphemeralPublicKey.Bytes(), second.EphemeralPublicKey.Bytes(),
@@ -83,7 +88,7 @@ func TestWrapFreshEphemeralPerCall(t *testing.T) {
 
 	// Both independently recover the same plaintext CEK.
 	for i, w := range []*ecdhkw.Wrapped{first, second} {
-		got, err := ecdhkw.Unwrap(recipient, w)
+		got, err := ecdhkw.Unwrap(recipient, w, testProtected)
 		require.NoErrorf(t, err, "Unwrap copy %d", i)
 		require.Equalf(t, cek, got, "Unwrap copy %d mismatch", i)
 	}
@@ -95,14 +100,29 @@ func TestUnwrapTamperedEphemeral(t *testing.T) {
 	recipient := newRecipient(t)
 	cek := bytes.Repeat([]byte{0x11}, 32)
 
-	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 	require.NoError(t, err, "Wrap")
 	other, err := ecdh.X25519().GenerateKey(rand.Reader)
 	require.NoError(t, err, "generate other key")
 	w.EphemeralPublicKey = other.PublicKey()
 
-	_, err = ecdhkw.Unwrap(recipient, w)
+	_, err = ecdhkw.Unwrap(recipient, w, testProtected)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap with swapped ephemeral key")
+}
+
+// A wrap is bound to the recipient's protected header: unwrapping with header
+// bytes other than the ones the wrap was made under fails. This is what stops an
+// attacker from rewriting the recipient's algorithm header in transit.
+func TestUnwrapDifferentProtectedHeader(t *testing.T) {
+	recipient := newRecipient(t)
+	cek := bytes.Repeat([]byte{0x33}, 32)
+
+	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
+	require.NoError(t, err, "Wrap")
+
+	// {1: -29} — ECDH-ES+A128KW rather than the -31 the wrap was made under.
+	_, err = ecdhkw.Unwrap(recipient, w, []byte{0xa1, 0x01, 0x38, 0x1c})
+	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap under a different protected header")
 }
 
 // A low-order ephemeral point would force the ECDH shared secret into a small
@@ -115,7 +135,7 @@ func TestUnwrapLowOrderEphemeral(t *testing.T) {
 	lowOrder, err := ecdh.X25519().NewPublicKey(make([]byte, 32))
 	require.NoError(t, err, "construct low-order point")
 	w := &ecdhkw.Wrapped{EphemeralPublicKey: lowOrder, WrappedCEK: make([]byte, 40)}
-	_, err = ecdhkw.Unwrap(recipient, w)
+	_, err = ecdhkw.Unwrap(recipient, w, testProtected)
 	require.Error(t, err, "Unwrap with low-order ephemeral point should fail")
 }
 
@@ -124,7 +144,7 @@ func TestUnwrapTamperedCEK(t *testing.T) {
 	recipient := newRecipient(t)
 	cek := bytes.Repeat([]byte{0x22}, 32)
 
-	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek)
+	w, err := ecdhkw.Wrap(recipient.PublicKey(), cek, testProtected)
 	require.NoError(t, err, "Wrap")
 	for i := range w.WrappedCEK {
 		tampered := &ecdhkw.Wrapped{
@@ -132,7 +152,7 @@ func TestUnwrapTamperedCEK(t *testing.T) {
 			WrappedCEK:         bytes.Clone(w.WrappedCEK),
 		}
 		tampered.WrappedCEK[i] ^= 0x01
-		_, err = ecdhkw.Unwrap(recipient, tampered)
+		_, err = ecdhkw.Unwrap(recipient, tampered, testProtected)
 		require.ErrorIsf(t, err, aeskw.ErrIntegrity, "tampering wrapped byte %d not detected", i)
 	}
 }
@@ -155,7 +175,7 @@ func TestWrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ecdhkw.Wrap(tc.pub, tc.cek)
+			_, err := ecdhkw.Wrap(tc.pub, tc.cek, testProtected)
 			require.Error(t, err)
 		})
 	}
@@ -165,24 +185,24 @@ func TestUnwrapInputValidation(t *testing.T) {
 	recipient := newRecipient(t)
 	p256, err := ecdh.P256().GenerateKey(rand.Reader)
 	require.NoError(t, err, "generate P256 key")
-	valid, err := ecdhkw.Wrap(recipient.PublicKey(), make([]byte, 32))
+	valid, err := ecdhkw.Wrap(recipient.PublicKey(), make([]byte, 32), testProtected)
 	require.NoError(t, err, "Wrap")
 
 	t.Run("nil private key", func(t *testing.T) {
-		_, err := ecdhkw.Unwrap(nil, valid)
+		_, err := ecdhkw.Unwrap(nil, valid, testProtected)
 		require.Error(t, err)
 	})
 	t.Run("nil wrapped", func(t *testing.T) {
-		_, err := ecdhkw.Unwrap(recipient, nil)
+		_, err := ecdhkw.Unwrap(recipient, nil, testProtected)
 		require.Error(t, err)
 	})
 	t.Run("nil ephemeral key", func(t *testing.T) {
-		_, err := ecdhkw.Unwrap(recipient, &ecdhkw.Wrapped{WrappedCEK: valid.WrappedCEK})
+		_, err := ecdhkw.Unwrap(recipient, &ecdhkw.Wrapped{WrappedCEK: valid.WrappedCEK}, testProtected)
 		require.Error(t, err)
 	})
 	t.Run("ephemeral wrong curve", func(t *testing.T) {
 		w := &ecdhkw.Wrapped{EphemeralPublicKey: p256.PublicKey(), WrappedCEK: valid.WrappedCEK}
-		_, err := ecdhkw.Unwrap(recipient, w)
+		_, err := ecdhkw.Unwrap(recipient, w, testProtected)
 		require.Error(t, err)
 	})
 }
@@ -194,15 +214,19 @@ func TestUnwrapInputValidation(t *testing.T) {
 // nondeterministic (a fresh ephemeral key per wrap), so the shared anchor is
 // the decrypt direction — which any conforming implementation must reproduce
 // without an injection seam. It exercises the full path end to end: X25519
-// ECDH, the COSE Concat-KDF context (kdf.go), and AES-KW unwrap.
+// ECDH, HKDF-SHA-256 over the COSE_KDF_Context (kdf.go), and AES-KW unwrap.
 //
-// All values use the standard RFC 9053 §5.2 context (AlgorithmID = A256KW,
-// keyDataLength = 256, empty PartyU/PartyV/protected) documented in kdf.go.
+// The wrapped bytes were produced by an independent implementation (Python
+// cryptography: X25519 exchange, HKDF-SHA-256, AES key wrap), not by this
+// package, so the vector checks the Go code against something other than
+// itself. The context is the RFC 9053 §5.2 structure documented in kdf.go:
+// AlgorithmID = A256KW, keyDataLength = 256, empty PartyU/PartyV, and the
+// recipient protected header {1: -31} that FEE puts on the wire.
 func TestKnownAnswerVector(t *testing.T) {
 	const (
 		recipientPrivHex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 		ephemeralPubHex  = "605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23c"
-		wrappedCEKHex    = "1433cdb050fc4ab1ccb616c395a81908c001fcfa7fb865366a3ef8db0af45c7c4305ae7de7080007"
+		wrappedCEKHex    = "97d1e9c712912ea98727d000a9ba2f9f6a8bbb07c18696bfa6d5b7f8f2cf59177883691e7dd2e8d9"
 		cekHex           = "00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f"
 
 		// Derived from recipientPrivHex; recorded so a cross-impl test starts
@@ -218,7 +242,7 @@ func TestKnownAnswerVector(t *testing.T) {
 	require.NoError(t, err, "ephemeral public key")
 
 	w := &ecdhkw.Wrapped{EphemeralPublicKey: ephemeralPub, WrappedCEK: mustDecode(t, wrappedCEKHex)}
-	got, err := ecdhkw.Unwrap(priv, w)
+	got, err := ecdhkw.Unwrap(priv, w, testProtected)
 	require.NoError(t, err, "unwrap")
 	require.Equal(t, cekHex, hex.EncodeToString(got), "unwrapped CEK")
 }

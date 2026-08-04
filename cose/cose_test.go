@@ -297,3 +297,26 @@ func TestEncStructure(t *testing.T) {
 		require.Equal(t, want, got)
 	})
 }
+
+// TestProtectedBytesIsolated pins ProtectedBytes against aliasing: the caller
+// gets a copy, so writing to the result cannot rewrite the decoded envelope's
+// protected header and with it the AAD and the recipient KDF context.
+func TestProtectedBytesIsolated(t *testing.T) {
+	encoded, err := sampleEnvelope().Encode()
+	require.NoError(t, err)
+	decoded, _, err := Decode(encoded)
+	require.NoError(t, err)
+
+	first, err := decoded.ProtectedBytes()
+	require.NoError(t, err)
+	require.NotEmpty(t, first, "sample envelope has a non-empty protected header")
+	want := bytes.Clone(first)
+
+	for i := range first {
+		first[i] ^= 0xFF
+	}
+
+	second, err := decoded.ProtectedBytes()
+	require.NoError(t, err)
+	require.Equal(t, want, second, "mutating the returned slice changed the protected header")
+}
