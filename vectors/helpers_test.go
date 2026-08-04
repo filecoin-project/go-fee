@@ -148,13 +148,18 @@ func ecdhESRecipient(cek []byte) (*cose.Recipient, error) {
 	if err != nil {
 		return nil, err
 	}
-	w, err := ecdhkw.Wrap(priv.PublicKey(), cek)
+	protected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+	protectedBytes, err := cose.Headers{Protected: protected}.ProtectedBytes()
+	if err != nil {
+		return nil, err
+	}
+	w, err := ecdhkw.Wrap(priv.PublicKey(), cek, protectedBytes)
 	if err != nil {
 		return nil, err
 	}
 	return &cose.Recipient{
 		Headers: cose.Headers{
-			Protected: cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW),
+			Protected: protected,
 			Unprotected: cose.Header{}.
 				Set(cose.HeaderLabelKID, priv.PublicKey().Bytes()).
 				Set(cose.HeaderLabelEphemeralKey, map[any]any{

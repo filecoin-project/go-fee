@@ -83,7 +83,15 @@ func (r *ecdhESRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
-	wrapped, err := ecdhkw.Wrap(r.pub, cek)
+	// The protected header is built before the wrap because it feeds it: RFC 9053
+	// §5.2 binds the recipient's serialized protected bytes into the KDF context.
+	// Encoding and derivation take the same header value so they cannot drift.
+	protected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+	protectedBytes, err := cose.Headers{Protected: protected}.ProtectedBytes()
+	if err != nil {
+		return nil, fmt.Errorf("fee: serializing ECDH-ES recipient protected header: %w", err)
+	}
+	wrapped, err := ecdhkw.Wrap(r.pub, cek, protectedBytes)
 	if err != nil {
 		return nil, fmt.Errorf("fee: ECDH-ES+A256KW wrap: %w", err)
 	}
@@ -92,8 +100,7 @@ func (r *ecdhESRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 	// the curve from the key rather than out of band.
 	return &cose.Recipient{
 		Headers: cose.Headers{
-			Protected: cose.Header{}.
-				Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW),
+			Protected: protected,
 			Unprotected: cose.Header{}.
 				Set(cose.HeaderLabelKID, r.kid).
 				Set(cose.HeaderLabelEphemeralKey, map[any]any{

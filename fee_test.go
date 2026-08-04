@@ -666,6 +666,27 @@ func TestEnvelopeWireConventions(t *testing.T) {
 	require.NotEmpty(t, ciphertext)
 }
 
+// TestECDHRecipientProtectedBytes pins the recipient protected header an
+// ECDH-ES+A256KW recipient puts on the wire. Those bytes are an input to the
+// key derivation (RFC 9053 §5.2), so a change here changes every derived KEK
+// and breaks unwrapping by any other implementation — including an earlier
+// build of this one. The value is the canonical encoding of {1: -31}.
+func TestECDHRecipientProtectedBytes(t *testing.T) {
+	key := newX25519Key(t)
+
+	blob, err := encrypt(t, patternBytes(64),
+		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+
+	env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
+	require.NoError(t, err)
+	require.Len(t, env.Recipients, 1)
+
+	got, err := env.Recipients[0].Headers.ProtectedBytes()
+	require.NoError(t, err, "recipient ProtectedBytes")
+	require.Equal(t, []byte{0xa1, 0x01, 0x38, 0x1e}, got, "recipient protected header")
+}
+
 // TestContentLengthChunkCount confirms the chunk count is written to the
 // unprotected header only when the plaintext length is declared, matching the
 // reference's advisory chunkCount, and that the envelope decrypts either way.

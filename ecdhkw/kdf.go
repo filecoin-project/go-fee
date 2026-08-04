@@ -1,6 +1,7 @@
 package ecdhkw
 
 import (
+	"crypto/hkdf"
 	"crypto/sha256"
 )
 
@@ -9,44 +10,34 @@ import (
 // involved, both pinned here so the byte layout is unambiguous for the
 // cross-implementation test vectors (foc-encryption / FIL-473):
 //
-//  1. concatKDF — the SHA-256 single-step KDF of NIST SP 800-56A §5.8.1, which
-//     RFC 9053 §5.1 adopts for COSE ECDH key agreement.
+//  1. hkdfKEK — HKDF-SHA-256 (RFC 5869), which RFC 9053 §5.1 specifies for COSE
+//     key derivation and §6.3.1 mandates for every ECDH algorithm, alg -31
+//     among them.
 //  2. kdfContext — the COSE_KDF_Context structure of RFC 9053 §5.2, CBOR-encoded
-//     and fed to the KDF as the "other info" that binds the derived key to its
-//     algorithm and length.
+//     and passed to HKDF as the info parameter that binds the derived key to its
+//     algorithm, length, and header.
 //
 // The CBOR is hand-written rather than pulled from a codec: the structure is a
 // fixed four-element array of small integers and two short byte strings, so a
 // dozen lines of deterministic, shortest-form encoding is clearer and lighter
 // than a dependency, and it leaves no room for a codec to pick a non-canonical
 // encoding that would diverge from another implementation.
-
-// concatKDF derives keyLen bytes from the shared secret z and the COSE_KDF
-// context otherInfo, using the SHA-256 single-step KDF (NIST SP 800-56A
-// §5.8.1): the concatenation of a big-endian 32-bit counter, z, and otherInfo
-// is hashed once per output block, and the blocks are concatenated and
-// truncated to keyLen.
 //
-// For A256KW the output is 32 bytes and SHA-256 produces 32, so exactly one
-// round runs; the loop is written generally so the derivation is correct for
-// any output length.
-func concatKDF(z, otherInfo []byte, keyLen int) []byte {
-	out := make([]byte, 0, ((keyLen+sha256.Size-1)/sha256.Size)*sha256.Size)
-	h := sha256.New()
-	var counter [4]byte
-	for i := uint32(1); len(out) < keyLen; i++ {
-		counter[0] = byte(i >> 24)
-		counter[1] = byte(i >> 16)
-		counter[2] = byte(i >> 8)
-		counter[3] = byte(i)
+// Note for anyone comparing against JOSE: RFC 7518 §4.6 derives its ECDH-ES key
+// with the NIST SP 800-56A §5.8.1 single-step KDF, a different construction.
+// COSE does not use it, and a KEK derived that way will not unwrap here.
 
-		h.Reset()
-		h.Write(counter[:])
-		h.Write(z)
-		h.Write(otherInfo)
-		out = h.Sum(out)
-	}
-	return out[:keyLen]
+// hkdfKEK derives keyLen bytes of key-encryption key from the ECDH shared
+// secret z and the CBOR COSE_KDF_Context, using HKDF-SHA-256 (RFC 5869) as
+// RFC 9053 §5.1 requires: z is the input keying material and context is the
+// info parameter.
+//
+// The salt is empty. RFC 9053 §6.3.1 provides a salt header parameter only for
+// static-static ECDH, where the sender needs to inject uniqueness by hand; the
+// ephemeral-static scheme here gets that from its fresh ephemeral key, so no
+// salt travels in the envelope and HKDF-Extract runs with the all-zero default.
+func hkdfKEK(z, context []byte, keyLen int) ([]byte, error) {
+	return hkdf.Key(sha256.New, z, nil, string(context), keyLen)
 }
 
 // kdfContext builds the CBOR-encoded COSE_KDF_Context (RFC 9053 §5.2) for a
@@ -59,9 +50,10 @@ func concatKDF(z, otherInfo []byte, keyLen int) []byte {
 // carries the derived-key length in bits plus the protected-header byte string.
 // The optional SuppPrivInfo trailer is omitted.
 //
-// The wrap layer has no COSE protected header of its own, so callers pass a
-// zero-length protected slice; algID is the COSE identifier of the algorithm
-// the derived key feeds (A256KW), which binds the key to its purpose.
+// protected is the serialized protected header of the COSE_Recipient that
+// carries the wrap — for FEE, the encoding of {1: -31} — or a zero-length slice
+// if that bucket is empty. algID is the COSE identifier of the algorithm the
+// derived key feeds (A256KW), which binds the key to its purpose.
 func kdfContext(algID int64, keyDataLenBits uint64, protected []byte) []byte {
 	var b []byte
 	b = cborHead(b, cborArray, 4) // [algID, PartyU, PartyV, SuppPubInfo]
