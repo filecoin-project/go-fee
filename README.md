@@ -279,6 +279,11 @@ func serveRange(w http.ResponseWriter, f *os.File, size int64, u fee.RecipientUn
 
     // Len is the requested length clamped to the object; Size is the whole
     // object's plaintext size. Both are known before any ciphertext is read.
+    if r.Len() == 0 {
+        w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", r.Size()))
+        w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+        return nil
+    }
     w.Header().Set("Content-Length", strconv.FormatInt(r.Len(), 10))
     w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+r.Len()-1, r.Size()))
     w.WriteHeader(http.StatusPartialContent)
