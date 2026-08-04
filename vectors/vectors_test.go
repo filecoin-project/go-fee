@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/filecoin-project/go-fee/aeskw"
+	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/filecoin-project/go-fee/cose"
 	"github.com/filecoin-project/go-fee/ecdhkw"
 	"github.com/stretchr/testify/require"
@@ -21,10 +22,17 @@ import (
 //	multi-chunk-ts    AC2: the TS reference seals a multi-chunk file; Go decrypts it.
 //	multi-recipient-go AC3: Go seals a multi-recipient envelope; the TS reference
 //	                   parses each recipient and decrypts the body from the CEK.
+//	empty-file-go     Go seals an empty file; the TS reference decrypts it.
+//	empty-file-ts     the TS reference seals an empty file; Go decrypts it.
+//
+// The empty file is its own framing case in both directions: it encodes as one
+// empty final chunk, so the whole body is a bare 16-byte tag.
 var coreVectors = map[string]string{
 	"single-chunk-go":    "go",
 	"multi-chunk-ts":     "ts",
 	"multi-recipient-go": "go",
+	"empty-file-go":      "go",
+	"empty-file-ts":      "ts",
 }
 
 // TestVectors verifies that this Go implementation decrypts every committed
@@ -58,6 +66,14 @@ func TestVectors(t *testing.T) {
 			got, err := decryptFEE(f.blob, cek)
 			require.NoError(t, err, "decrypt body")
 			require.Equal(t, f.plaintext, got, "recovered plaintext")
+
+			// Framing: one tag per chunk, and an empty plaintext still costs
+			// one (empty) chunk — the case a naive STREAM crib gets wrong.
+			p, err := decodeFEE(f.blob)
+			require.NoError(t, err)
+			require.Equal(t,
+				aesstream.EncryptedSize(int64(len(f.plaintext)), p.chunkSize),
+				int64(len(p.ciphertext)), "ciphertext framing")
 
 			// Determinism: a second decrypt yields the same bytes.
 			again, err := decryptFEE(f.blob, cek)
@@ -192,6 +208,12 @@ func TestGenerate(t *testing.T) {
 	genGoBody(t, "multi-chunk-go",
 		"Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in foc-encryption (TS).",
 		bytes.Repeat([]byte("multi-chunk-go/FIL-473 "), 700)) // ~15 KiB > chunk size
+
+	// An empty file sealed in Go (tag 16): one empty final chunk, so the body is
+	// a bare 16-byte tag. The framing edge case the reference must agree on.
+	genGoBody(t, "empty-file-go",
+		"Empty plaintext encrypted in Go (one empty final chunk, tag-only body); decrypts in foc-encryption (TS).",
+		[]byte{})
 
 	// AC3 — multi-recipient envelope sealed in Go (tag 96) with a real
 	// ECDH-ES+A256KW (X25519) recipient and a real A256KW recipient.

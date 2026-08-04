@@ -1,0 +1,11 @@
+{
+  "name": "empty-file-ts",
+  "producer": "ts",
+  "description": "Empty plaintext encrypted in foc-encryption (TS) (one empty final chunk, tag-only body); decrypts in Go.",
+  "tag": 16,
+  "algorithm": -65793,
+  "typ": "application/vnd.foc-envelope+cose",
+  "chunk_size": 4096,
+  "chunk_count": 1,
+  "cek_hex": "e02a112e62e624f4ac5f32ece6574158aea0a66317d2c2fccbd1b4f79d765218"
+}
