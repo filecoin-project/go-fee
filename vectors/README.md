@@ -24,6 +24,7 @@ to it and this repo matches it (see [Wire format](#wire-format)).
 | `multi-chunk-ts` | TS seals → Go decrypts | tag 16 (COSE_Encrypt0) |
 | `multi-recipient-go` | Go seals → TS parses recipients + decrypts body | tag 96 (COSE_Encrypt) |
 | `multi-chunk-go` | Go seals → TS decrypts (extra multi-chunk coverage) | tag 16 |
+| `exact-multiple-go` | Go seals → TS decrypts (plaintext is exactly 3 chunks) | tag 16 |
 
 Each `testdata/<name>/` holds `blob.bin` (`envelope‖ciphertext`),
 `plaintext.bin`, and `meta.json`.
@@ -54,6 +55,12 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 - **Body cipher** — chunked AES-256-GCM-STREAM, alg `-65793`. Per-chunk nonce is
   `baseNonce[7] ‖ chunkIndex[4, big-endian] ‖ lastFlag[1]` (`0x01` on the final
   chunk), tag 16 bytes.
+- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
+  with the remainder in the final chunk; empty input is one empty chunk. Both
+  implementations follow that rule, so `exact-multiple-go` declares 3 chunks
+  rather than 3 full chunks plus an empty one. A *decoder* also accepts a
+  trailing empty final chunk, so the declared count is authoritative and must
+  not be re-derived from the plaintext length.
 - **Body AAD** — `Enc_structure = [ context, protected, "" ]`, the **same** for
   every chunk. `context` follows the envelope structure per RFC 9052 §5.3:
   `"Encrypt"` for a tag-96 envelope, `"Encrypt0"` for tag-16. AAD interop is

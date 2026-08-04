@@ -9,7 +9,7 @@ import (
 	"github.com/filecoin-project/go-fee/cose"
 )
 
-// ErrSizeMismatch means the ciphertext length implied by the supplied blob size
+// ErrSizeMismatch means the number of chunks the supplied blob size accounts for
 // disagrees with the chunk count the envelope declares: the blob is truncated or
 // padded, or the size came from the wrong object.
 //
@@ -121,8 +121,11 @@ func (r *RangeReader) CiphertextSpan() (off, n int64) { return r.spanOff, r.span
 // are never read and so never checked, and — unlike whole-object [Decrypt] — a
 // range read cannot by itself detect that the stored object was truncated: an
 // understated blobSize describes a shorter object whose ranges decrypt cleanly.
-// The chunk-count check catches that when the envelope carries a chunk count, but
-// whole-object integrity is properly the job of the layer that supplied blobSize.
+// The chunk-count check catches an understatement of a whole chunk or more when
+// the envelope carries a count, but a size short by only part of the final chunk
+// accounts for the same number of chunks and so passes it, surfacing instead as
+// an authentication failure when that chunk is read. Whole-object integrity is
+// properly the job of the layer that supplied blobSize.
 func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, off, length int64) (*RangeReader, error) {
 	if unwrap == nil {
 		return nil, ErrNilUnwrapper
@@ -282,9 +285,16 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 
 // envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came
 // from its envelope rather than from a caller's cache: it adds the cross-check of
-// the envelope's declared chunk count against the derived size, when one is
-// present, catching a blob size that describes a different object than the
-// envelope does.
+// the envelope's declared chunk count against the chunks the ciphertext actually
+// holds, when a count is present, catching a blob size that describes a different
+// object than the envelope does.
+//
+// The comparison is against [aesstream.ChunkCount] rather than a count re-derived
+// from the plaintext size, because a plaintext that is an exact multiple of the
+// chunk size seals to either k chunks or k+1 (with an empty final chunk) and both
+// decrypt identically. Deriving from the plaintext size would recognize only the
+// first form and refuse the second, which the whole-object [Decrypt] path reads
+// without complaint.
 func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
 	plainSize, err := plaintextSizeFrom(blobSize, headerLen, chunkSize)
 	if err != nil {
@@ -297,8 +307,12 @@ func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkS
 	if !ok {
 		return 0, fmt.Errorf("%w: chunk-count header is present but not an integer", ErrMalformedEnvelope)
 	}
-	if want := chunkCountFor(plainSize, int64(chunkSize)); declared != want {
-		return 0, fmt.Errorf("%w: envelope declares %d chunks, the blob size implies %d",
+	want, err := aesstream.ChunkCount(blobSize-headerLen, chunkSize)
+	if err != nil {
+		return 0, fmt.Errorf("fee: blob of %d ciphertext bytes: %w", blobSize-headerLen, err)
+	}
+	if declared != want {
+		return 0, fmt.Errorf("%w: envelope declares %d chunks, the ciphertext holds %d",
 			ErrSizeMismatch, declared, want)
 	}
 	return plainSize, nil

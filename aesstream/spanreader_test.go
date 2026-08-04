@@ -497,3 +497,51 @@ func TestDecryptedSize_InvertsEncryptedSize(t *testing.T) {
 		require.Equalf(t, n, got, "DecryptedSize(EncryptedSize(%d))", n)
 	}
 }
+
+// TestChunkCount pins the exported chunk count over the boundary ciphertext
+// lengths, including the two encodings of an exact-multiple plaintext: the same
+// plaintext length is one chunk more when the stream ends with an empty final
+// chunk, which is why callers must not re-derive the count from a plaintext size.
+func TestChunkCount(t *testing.T) {
+	const cs = aesstream.MinChunkSize
+	enc := int64(cs) + aesstream.TagSize
+
+	cases := map[string]struct {
+		ciphertextLen int64
+		want          int64
+	}{
+		"empty stream (one tag-only chunk)": {aesstream.TagSize, 1},
+		"single partial chunk":              {aesstream.TagSize + 100, 1},
+		"single full chunk":                 {enc, 1},
+		"full + empty final":                {enc + aesstream.TagSize, 2},
+		"full + partial final":              {enc + aesstream.TagSize + 7, 2},
+		"two full chunks":                   {2 * enc, 2},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := aesstream.ChunkCount(c.ciphertextLen, cs)
+			require.NoError(t, err)
+			require.Equal(t, c.want, got)
+		})
+	}
+}
+
+// TestChunkCountInvalid confirms ChunkCount reports the same errors as the rest
+// of the geometry API for a length or chunk size that cannot describe a stream.
+func TestChunkCountInvalid(t *testing.T) {
+	t.Run("ciphertext too short to hold a tag", func(t *testing.T) {
+		_, err := aesstream.ChunkCount(aesstream.TagSize-1, aesstream.MinChunkSize)
+		require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
+	})
+
+	t.Run("chunk size out of range", func(t *testing.T) {
+		_, err := aesstream.ChunkCount(aesstream.TagSize, aesstream.MinChunkSize-1)
+		require.ErrorIs(t, err, aesstream.ErrChunkSize)
+	})
+
+	t.Run("zero chunk size selects the default", func(t *testing.T) {
+		got, err := aesstream.ChunkCount(aesstream.EncryptedSize(3*aesstream.DefaultChunkSize, 0), 0)
+		require.NoError(t, err)
+		require.Equal(t, int64(3), got)
+	})
+}

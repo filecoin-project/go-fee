@@ -410,6 +410,12 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 
 // chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
 // produces at the given chunk size. Empty input is one (empty) final chunk.
+//
+// This is the producer's rule, matching the reference implementation, and it is
+// only for writing the chunk-count header. It is not a decoder's rule: a stream
+// whose plaintext is an exact multiple of the chunk size may legitimately carry
+// one more chunk than this (an empty final chunk), so a count read off the wire
+// is checked against [aesstream.ChunkCount] instead.
 func chunkCountFor(nPlain, chunkSize int64) int64 {
 	if nPlain <= 0 {
 		return 1

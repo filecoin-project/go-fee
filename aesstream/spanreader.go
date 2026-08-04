@@ -102,6 +102,29 @@ func DecryptedSize(ciphertextLen int64, chunkSize int) (int64, error) {
 	return plaintextLen, err
 }
 
+// ChunkCount returns how many chunks a complete ciphertext of ciphertextLen
+// bytes contains at the given chunk size. A zero chunkSize selects
+// DefaultChunkSize; any other value must be in [MinChunkSize, MaxChunkSize]
+// (else ErrChunkSize), the same rule as Config.ChunkSize. It returns
+// ErrCiphertextSize if ciphertextLen is not a structurally valid stream length.
+//
+// The count is not derivable from the plaintext length, which is why this is
+// worth asking for: the final chunk may be full, partial, or empty, so a
+// plaintext of exactly k*chunkSize bytes is a valid stream of either k chunks
+// (the last one full) or k+1 (the last one empty). Both are read the same way
+// and yield the same plaintext, and only the ciphertext length tells them apart.
+// A caller checking a stream against a separately recorded chunk count should
+// compare against this rather than against ceil(plaintextLen/chunkSize), which
+// only describes the first form.
+func ChunkCount(ciphertextLen int64, chunkSize int) (int64, error) {
+	chunkSize, err := resolveChunkSize(chunkSize)
+	if err != nil {
+		return 0, err
+	}
+	numChunks, _, _, err := chunkLayout(ciphertextLen, chunkSize)
+	return numChunks, err
+}
+
 // CiphertextRange returns the single contiguous ciphertext byte range
 // [start, start+n) that must be read to serve the plaintext range
 // [off, off+length) of a stream whose complete ciphertext is

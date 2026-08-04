@@ -2,8 +2,11 @@ package fee_test
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -88,6 +91,61 @@ func encryptWithCEK(t *testing.T, plaintext, cek []byte, recipients []fee.Recipi
 	return io.ReadAll(r)
 }
 
+// sealTrailingEmptyFinalChunk builds a FEE blob whose ciphertext is k full
+// chunks followed by an empty final chunk, declared as k+1 — the second valid
+// encoding of a plaintext that is an exact multiple of the chunk size.
+//
+// aesstream.Writer never emits this form (it flushes a full buffer as the final
+// chunk, giving k), so the body is sealed chunk by chunk here, under the
+// documented per-chunk nonce and the envelope's own Enc_structure as AAD.
+func sealTrailingEmptyFinalChunk(t *testing.T, plaintext, cek, baseNonce []byte, chunkSize int) []byte {
+	t.Helper()
+	require.Zero(t, len(plaintext)%chunkSize, "plaintext must be an exact multiple of the chunk size")
+	chunks := len(plaintext)/chunkSize + 1 // the trailing empty chunk is the extra one
+
+	env := &cose.Envelope{Headers: cose.Headers{
+		Protected: cose.Header{}.
+			Set(cose.HeaderLabelAlg, algChunkedStream).
+			Set(cose.HeaderLabelType, fee.EnvelopeType),
+		Unprotected: cose.Header{}.
+			Set(cose.HeaderLabelIV, baseNonce).
+			Set(labelChunkSize, int64(chunkSize)).
+			Set(labelChunkCount, int64(chunks)),
+	}}
+	aad, err := env.EncStructure(nil)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	block, err := aes.NewCipher(cek)
+	require.NoError(t, err)
+	aead, err := cipher.NewGCM(block)
+	require.NoError(t, err)
+
+	blob := bytes.Clone(header)
+	for i := range chunks {
+		last := i == chunks-1
+		var chunk []byte
+		if !last {
+			chunk = plaintext[i*chunkSize : (i+1)*chunkSize]
+		}
+		blob = aead.Seal(blob, streamNonce(baseNonce, i, last), chunk, aad)
+	}
+	return blob
+}
+
+// streamNonce builds the per-chunk GCM nonce of the FEE body cipher:
+// baseNonce(7) || chunkIndex(4, big-endian) || lastFlag(1).
+func streamNonce(baseNonce []byte, index int, last bool) []byte {
+	nonce := make([]byte, 0, aesstream.NonceSize)
+	nonce = append(nonce, baseNonce...)
+	nonce = binary.BigEndian.AppendUint32(nonce, uint32(index))
+	if last {
+		return append(nonce, 0x01)
+	}
+	return append(nonce, 0x00)
+}
+
 // hexBytes decodes a hex literal, for the handful of tests that pin behaviour
 // against exact wire bytes rather than an encrypted fixture.
 func hexBytes(t *testing.T, s string) []byte {
@@ -126,10 +184,24 @@ func decryptRange(t *testing.T, blob []byte, u fee.RecipientUnwrapper, off, leng
 // envelope, unwrap material and a byte range returns exactly the requested
 // plaintext — across the interesting geometries of a multi-chunk object: whole
 // object, within one chunk, spanning a boundary, exactly one aligned chunk, into
-// the short final chunk, and single bytes at each end.
+// the final chunk, and single bytes at each end. It runs the whole set against
+// both object shapes, since the final chunk being full rather than short is the
+// corner the declared chunk count is ambiguous at.
 func TestDecryptRangeRoundTrip(t *testing.T) {
-	const size = 3*rangeChunk + rangeChunk/2 // 3.5 chunks
-	f := newRangeFixture(t, size)
+	t.Run("partial final chunk", func(t *testing.T) {
+		testRangeRoundTrip(t, 3*rangeChunk+rangeChunk/2)
+	})
+
+	// An exact multiple of the chunk size: the final chunk is full rather than
+	// short, the geometry corner the wire format's chunk count is ambiguous at.
+	t.Run("exact multiple of the chunk size", func(t *testing.T) {
+		testRangeRoundTrip(t, 4*rangeChunk)
+	})
+}
+
+func testRangeRoundTrip(t *testing.T, size int64) {
+	t.Helper()
+	f := newRangeFixture(t, int(size), fee.WithContentLength(size))
 
 	cases := []struct {
 		name        string
@@ -144,7 +216,7 @@ func TestDecryptRangeRoundTrip(t *testing.T) {
 		{"across two boundaries", rangeChunk - 10, 2*rangeChunk + 20},
 		{"exactly one aligned chunk", rangeChunk, rangeChunk},
 		{"aligned start, unaligned end", 2 * rangeChunk, rangeChunk + 5},
-		{"whole short final chunk", 3 * rangeChunk, rangeChunk / 2},
+		{"from the last chunk's start", 3 * rangeChunk, rangeChunk / 2},
 		{"into final chunk", 3*rangeChunk - 5, 100},
 		{"ends exactly on boundary", rangeChunk / 2, rangeChunk / 2},
 		{"length past end clamps", size - 10, 1000},
@@ -156,7 +228,7 @@ func TestDecryptRangeRoundTrip(t *testing.T) {
 
 			wantLen := clampLen(size, tc.off, tc.length)
 			require.Equal(t, wantLen, r.Len(), "Len is the clamped range length")
-			require.Equal(t, int64(size), r.Size(), "Size is the whole object")
+			require.Equal(t, size, r.Size(), "Size is the whole object")
 			require.Equal(t, f.plaintext[tc.off:tc.off+wantLen], got)
 		})
 	}
@@ -600,6 +672,50 @@ func TestDecryptRangeChunkCountMismatch(t *testing.T) {
 	t.Run("correct size still works", func(t *testing.T) {
 		_, got := decryptRange(t, f.blob, f.unwrapper, rangeChunk, 100)
 		require.Equal(t, f.plaintext[rangeChunk:rangeChunk+100], got)
+	})
+}
+
+// TestDecryptRangeTrailingEmptyFinalChunk pins that the range path accepts the
+// second valid encoding of an exact-multiple plaintext: k full chunks followed by
+// an empty final chunk, declared as k+1. aesstream reads that layout and so does
+// whole-object decryption, so the range entry points must agree rather than
+// refusing a blob the rest of the package accepts.
+func TestDecryptRangeTrailingEmptyFinalChunk(t *testing.T) {
+	const size = 3 * rangeChunk
+	cek, plaintext := newCEK(t), patternBytes(size)
+	baseNonce := bytes.Repeat([]byte{0xa5}, aesstream.BaseNonceSize)
+	blob := sealTrailingEmptyFinalChunk(t, plaintext, cek, baseNonce, rangeChunk)
+	blobSize := int64(len(blob))
+
+	// The premise: whole-object decryption already reads this blob.
+	whole, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.NoError(t, err)
+	got, err := io.ReadAll(whole)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+
+	t.Run("PlaintextSize agrees", func(t *testing.T) {
+		n, err := fee.PlaintextSize(bytes.NewReader(blob), blobSize)
+		require.NoError(t, err)
+		require.Equal(t, int64(size), n)
+	})
+
+	t.Run("range across the last full chunk", func(t *testing.T) {
+		off, length := int64(2*rangeChunk-10), int64(20)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, off, length)
+		require.NoError(t, err)
+		require.Equal(t, int64(size), r.Size())
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+		require.Equal(t, plaintext[off:off+length], got)
+	})
+
+	t.Run("whole object as one range", func(t *testing.T) {
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, 0, size)
+		require.NoError(t, err)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+		require.Equal(t, plaintext, got)
 	})
 }
 

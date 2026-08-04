@@ -370,6 +370,13 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 - **Body AAD** — the COSE `Enc_structure` over the protected header, identical
   for every chunk, so the algorithm, envelope type and any protected metadata
   are authenticated into the ciphertext.
+- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
+  with the remainder in the final chunk; empty input is one empty chunk. A
+  decoder also accepts a stream that ends with an empty final chunk, so a
+  plaintext of exactly `k × chunkSize` bytes is a valid stream of either `k`
+  chunks or `k+1`. Only the ciphertext length distinguishes them
+  (`aesstream.ChunkCount`), which is why a declared count must never be checked
+  against a count re-derived from the plaintext length.
 - **Chunk count** (label −65791) — advisory metadata for range/seek consumers,
   emitted only when the plaintext length is known; not required to decrypt.
 

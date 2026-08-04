@@ -189,6 +189,16 @@ func TestGenerate(t *testing.T) {
 		"Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in foc-encryption (TS).",
 		bytes.Repeat([]byte("multi-chunk-go/FIL-473 "), 700)) // ~15 KiB > chunk size
 
+	// A plaintext that is an exact multiple of the chunk size, where the final
+	// chunk is full rather than short. Both implementations declare ceil(len /
+	// chunkSize) chunks here, so the fixture pins that the boundary agrees
+	// on the wire: a producer that instead appended an empty final chunk would
+	// declare one more, and a decoder must not derive the count from the
+	// plaintext length.
+	genGoBody(t, "exact-multiple-go",
+		"Plaintext of exactly 3 chunks (full final chunk) encrypted in Go; decrypts in foc-encryption (TS).",
+		bytes.Repeat([]byte{0x5a}, 3*vectorChunkSize))
+
 	// AC3 — multi-recipient envelope sealed in Go (tag 96) with a real
 	// ECDH-ES+A256KW (X25519) recipient and a real A256KW recipient.
 	genGoMultiRecipient(t, "multi-recipient-go",
