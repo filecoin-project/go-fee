@@ -46,7 +46,7 @@ import (
 
 | Package | Purpose |
 |---|---|
-| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt`, byte-range `DecryptRange`, and the cacheable envelope parameters (`BodyMaterial`) that let a range read skip the header. Adds no cryptography of its own. |
+| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt`, byte-range `DecryptRange`, and the cacheable envelope parameters (`BodyDescriptor`) that let a range read skip the header. Adds no cryptography of its own. |
 | [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
 | [`cose`](./cose) | Just enough of COSE (RFC 9052): `COSE_Encrypt` (tag 96) / `COSE_Encrypt0` (tag 16) with a detached payload, and the `Enc_structure` AAD. |
 | [`ecdhkw`](./ecdhkw) | ECDH-ES+A256KW key wrap over X25519 (COSE algorithm −31). |
@@ -327,13 +327,13 @@ They are complete before any plaintext is read, so a writer can store them while
 the upload is still streaming:
 
 ```go
-// m goes alongside the blob's location and size.
-r, m, err := fee.Encrypt(plaintext, recipients)
+// d goes alongside the blob's location and size.
+r, d, err := fee.Encrypt(plaintext, recipients)
 ```
 
-`fee.DecryptRangeWithMaterial(blob, blobSize, m, cek, off, length)` then serves a
+`fee.DecryptRangeWithDescriptor(blob, blobSize, d, cek, off, length)` then serves a
 range with no envelope round trip at all: the only bytes fetched are the
-ciphertext chunks the range overlaps. `m.PlaintextSize(blobSize)` answers a `HEAD`
+ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a `HEAD`
 or resolves a suffix range from the stored record alone, reading nothing.
 
 Every field is non-secret — all four are already in the clear at the front of the

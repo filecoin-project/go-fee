@@ -74,9 +74,9 @@
 //
 // A store that keeps metadata beside its blobs can drop the header read too.
 // [Encrypt] reports the envelope parameters a range decrypt needs as a
-// [BodyMaterial]; persisting those and passing them to
-// [DecryptRangeWithMaterial] serves a range with no envelope round trip at all,
-// and [BodyMaterial.PlaintextSize] answers a HEAD from the same record.
+// [BodyDescriptor]; persisting those and passing them to
+// [DecryptRangeWithDescriptor] serves a range with no envelope round trip at all,
+// and [BodyDescriptor.PlaintextSize] answers a HEAD from the same record.
 //
 // # Scope
 //
@@ -215,16 +215,16 @@ func WithContentLength(n int64) EncryptOption {
 //
 // The second result is the envelope parameters a later range decrypt needs, for a
 // caller that wants to cache them rather than re-read the header; see
-// [BodyMaterial]. It is complete on return, before any plaintext is read, so a
+// [BodyDescriptor]. It is complete on return, before any plaintext is read, so a
 // writer can record it while the upload is still streaming. Callers with no use
 // for it discard it.
-func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyMaterial, error) {
+func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyDescriptor, error) {
 	if len(recipients) == 0 {
-		return nil, BodyMaterial{}, ErrNoRecipients
+		return nil, BodyDescriptor{}, ErrNoRecipients
 	}
 	cek := make([]byte, aesstream.KeySize)
 	if _, err := rand.Read(cek); err != nil {
-		return nil, BodyMaterial{}, fmt.Errorf("fee: generating content-encryption key: %w", err)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: generating content-encryption key: %w", err)
 	}
 	// encryptStream copies the CEK into the body cipher and wraps it to the
 	// recipients (synchronously, before it returns), so our generated copy can be
@@ -258,11 +258,11 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // wrapped to any recipients) but neither retained nor wiped by this call.
 //
 // As with [Encrypt], the second result carries the envelope parameters a later
-// range decrypt needs; see [BodyMaterial]. They are reported for a
+// range decrypt needs; see [BodyDescriptor]. They are reported for a
 // recipient-less COSE_Encrypt0 exactly as for a COSE_Encrypt.
-func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyMaterial, error) {
+func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyDescriptor, error) {
 	if err := checkCEK(cek); err != nil {
-		return nil, BodyMaterial{}, err
+		return nil, BodyDescriptor{}, err
 	}
 	return encryptStream(plaintext, cek, recipients, opts...)
 }
@@ -278,16 +278,16 @@ func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opt
 // as it returns — even though the returned reader has not been read and its
 // background encryption goroutine is still running. That goroutine works from
 // the writer's internalized key, never from the cek slice.
-func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyMaterial, error) {
+func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyDescriptor, error) {
 	if plaintext == nil {
-		return nil, BodyMaterial{}, errors.New("fee: nil plaintext reader")
+		return nil, BodyDescriptor{}, errors.New("fee: nil plaintext reader")
 	}
 	for i, r := range recipients {
 		if r == nil {
-			return nil, BodyMaterial{}, fmt.Errorf("fee: recipient %d is nil", i)
+			return nil, BodyDescriptor{}, fmt.Errorf("fee: recipient %d is nil", i)
 		}
 		if err := r.validate(); err != nil {
-			return nil, BodyMaterial{}, fmt.Errorf("fee: recipient %d: %w", i, err)
+			return nil, BodyDescriptor{}, fmt.Errorf("fee: recipient %d: %w", i, err)
 		}
 	}
 
@@ -303,12 +303,12 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		// path — no envelope exists yet — so it is not ErrMalformedEnvelope (a
 		// decode-side classification). Surface aesstream.ErrChunkSize, the same
 		// sentinel aesstream.NewWriter would return for this size.
-		return nil, BodyMaterial{}, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
 	}
 
 	baseNonce, err := aesstream.NewBaseNonce()
 	if err != nil {
-		return nil, BodyMaterial{}, fmt.Errorf("fee: generating base nonce: %w", err)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: generating base nonce: %w", err)
 	}
 
 	// The body header is fixed before encryption: the algorithm and envelope
@@ -336,7 +336,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	for i, r := range recipients {
 		entry, werr := r.wrap(cek)
 		if werr != nil {
-			return nil, BodyMaterial{}, werr
+			return nil, BodyDescriptor{}, werr
 		}
 		entries[i] = entry
 	}
@@ -349,11 +349,11 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	env := &cose.Envelope{Headers: headers, Recipients: entries}
 	aad, err := env.EncStructure(nil)
 	if err != nil {
-		return nil, BodyMaterial{}, fmt.Errorf("fee: building envelope AAD: %w", err)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: building envelope AAD: %w", err)
 	}
 	header, err := env.Encode()
 	if err != nil {
-		return nil, BodyMaterial{}, fmt.Errorf("fee: encoding envelope: %w", err)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: encoding envelope: %w", err)
 	}
 
 	// The body cipher streams into a pipe that the returned reader drains. Create
@@ -370,7 +370,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	if err != nil {
 		_ = pw.Close()
 		_ = pr.Close()
-		return nil, BodyMaterial{}, fmt.Errorf("fee: initializing body cipher: %w", err)
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
 
 	declaredLen := cfg.contentLength
@@ -392,11 +392,11 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		_ = pw.CloseWithError(cerr)
 	}()
 
-	// Every value the material reports is fixed above, before any plaintext is
+	// Every value the descriptor reports is fixed above, before any plaintext is
 	// read, so a caller can record it while the upload is still streaming. The
 	// clone keeps it independent of the buffers the cipher and the encoded header
 	// were built from.
-	material := BodyMaterial{
+	descriptor := BodyDescriptor{
 		HeaderLen: int64(len(header)),
 		BaseNonce: baseNonce,
 		ChunkSize: cfg.chunkSize,
@@ -405,7 +405,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	return &encryptReader{
 		body: io.MultiReader(bytes.NewReader(header), pr),
 		pr:   pr,
-	}, material, nil
+	}, descriptor, nil
 }
 
 // chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
@@ -532,11 +532,11 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 // carries: everything fee/aesstream needs to decrypt the detached ciphertext
 // apart from the content-encryption key.
 //
-// [BodyMaterial] is the same parameters plus the envelope's encoded length —
+// [BodyDescriptor] is the same parameters plus the envelope's encoded length —
 // where the ciphertext starts within a stored blob. That is what a caller caches
 // and what a range read needs; a whole-object read has neither the number (the
 // streaming decoder does not report it) nor a use for it, so the two shapes stay
-// distinct and [BodyMaterial.body] converts one way.
+// distinct and [BodyDescriptor.body] converts one way.
 type bodyParams struct {
 	baseNonce []byte
 	chunkSize int

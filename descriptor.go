@@ -8,14 +8,14 @@ import (
 	"github.com/filecoin-project/go-fee/aesstream"
 )
 
-// ErrIncompleteMaterial means a [BodyMaterial] is missing a field, or carries one
-// that cannot describe a FEE body — a value that could not decrypt anything.
-var ErrIncompleteMaterial = errors.New("fee: incomplete body material")
+// ErrIncompleteDescriptor means a [BodyDescriptor] is missing a field, or carries
+// one that cannot describe a FEE body — a value that could not decrypt anything.
+var ErrIncompleteDescriptor = errors.New("fee: incomplete body descriptor")
 
-// BodyMaterial is everything a range decrypt needs from a FEE envelope, so a
+// BodyDescriptor is everything a range decrypt needs from a FEE envelope, so a
 // caller that cached it can serve a byte range without fetching or decoding the
 // envelope header at all. It is returned by [Encrypt] / [EncryptWithCEK] at
-// encryption time and consumed by [DecryptRangeWithMaterial].
+// encryption time and consumed by [DecryptRangeWithDescriptor].
 //
 // It exists for stores that keep their own metadata alongside the blob: the
 // envelope is a fixed prefix of every stored object, so re-reading it on each
@@ -35,8 +35,8 @@ var ErrIncompleteMaterial = errors.New("fee: incomplete body material")
 // plausible-looking plaintext. The worst case is an unreadable object, not an
 // incorrect one.
 //
-// The zero value is not usable; see [BodyMaterial.Validate].
-type BodyMaterial struct {
+// The zero value is not usable; see [BodyDescriptor.Validate].
+type BodyDescriptor struct {
 	// HeaderLen is the encoded length of the envelope, and so the offset within
 	// the blob at which the detached ciphertext begins.
 	HeaderLen int64
@@ -53,7 +53,7 @@ type BodyMaterial struct {
 	// protected header because the Enc_structure's context string differs
 	// between a COSE_Encrypt and a recipient-less COSE_Encrypt0, a distinction
 	// this value has no other way to record. Caching the finished bytes keeps
-	// BodyMaterial identical for both envelope forms. The protected header
+	// BodyDescriptor identical for both envelope forms. The protected header
 	// remains recoverable from it: it is the structure's second element.
 	AAD []byte
 }
@@ -63,22 +63,22 @@ type BodyMaterial struct {
 // material — a partially populated record would produce a row that no later
 // range read could use.
 //
-// [DecryptRangeWithMaterial] calls it, so a bad value fails there with
-// [ErrIncompleteMaterial] rather than as an authentication error further down.
-func (m BodyMaterial) Validate() error {
+// [DecryptRangeWithDescriptor] calls it, so a bad value fails there with
+// [ErrIncompleteDescriptor] rather than as an authentication error further down.
+func (m BodyDescriptor) Validate() error {
 	if m.HeaderLen <= 0 {
-		return fmt.Errorf("%w: header length %d is not positive", ErrIncompleteMaterial, m.HeaderLen)
+		return fmt.Errorf("%w: header length %d is not positive", ErrIncompleteDescriptor, m.HeaderLen)
 	}
 	if len(m.BaseNonce) != aesstream.BaseNonceSize {
 		return fmt.Errorf("%w: base nonce is %d bytes, want %d",
-			ErrIncompleteMaterial, len(m.BaseNonce), aesstream.BaseNonceSize)
+			ErrIncompleteDescriptor, len(m.BaseNonce), aesstream.BaseNonceSize)
 	}
 	if m.ChunkSize < aesstream.MinChunkSize || m.ChunkSize > aesstream.MaxChunkSize {
 		return fmt.Errorf("%w: chunk size %d out of range [%d, %d]",
-			ErrIncompleteMaterial, m.ChunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
+			ErrIncompleteDescriptor, m.ChunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
 	}
 	if len(m.AAD) == 0 {
-		return fmt.Errorf("%w: missing AAD", ErrIncompleteMaterial)
+		return fmt.Errorf("%w: missing AAD", ErrIncompleteDescriptor)
 	}
 	return nil
 }
@@ -89,10 +89,10 @@ func (m BodyMaterial) Validate() error {
 // suffix range ("bytes=-N" is off = size-N) from cached metadata alone.
 //
 // blobSize is the whole stored object, envelope included, exactly as passed to
-// [DecryptRangeWithMaterial]. It reports [ErrIncompleteMaterial] for an unusable
+// [DecryptRangeWithDescriptor]. It reports [ErrIncompleteDescriptor] for an unusable
 // m, and [aesstream.ErrCiphertextSize] if blobSize cannot describe a FEE blob at
 // this header length and chunk size.
-func (m BodyMaterial) PlaintextSize(blobSize int64) (int64, error) {
+func (m BodyDescriptor) PlaintextSize(blobSize int64) (int64, error) {
 	if err := m.Validate(); err != nil {
 		return 0, err
 	}
@@ -103,7 +103,7 @@ func (m BodyMaterial) PlaintextSize(blobSize int64) (int64, error) {
 // whose envelope occupies headerLen bytes and whose STREAM chunks carry chunkSize
 // plaintext bytes each.
 //
-// It is shared by [BodyMaterial.PlaintextSize] and the envelope-backed paths (via
+// It is shared by [BodyDescriptor.PlaintextSize] and the envelope-backed paths (via
 // envelopePlaintextSize), so a blob size that cannot describe a FEE body is reported
 // the same way whether the parameters came from a cache or from the envelope.
 func plaintextSizeFrom(blobSize, headerLen int64, chunkSize int) (int64, error) {
@@ -122,14 +122,14 @@ func plaintextSizeFrom(blobSize, headerLen int64, chunkSize int) (int64, error) 
 // body returns the envelope body parameters m describes, for the range wiring it
 // shares with the envelope-backed paths. HeaderLen is not among them: it says
 // where the ciphertext starts, not how to decrypt it.
-func (m BodyMaterial) body() bodyParams {
+func (m BodyDescriptor) body() bodyParams {
 	return bodyParams{baseNonce: m.BaseNonce, chunkSize: m.ChunkSize, aad: m.AAD}
 }
 
-// clone returns a deep copy, so a BodyMaterial handed to a caller shares no
+// clone returns a deep copy, so a BodyDescriptor handed to a caller shares no
 // backing array with the envelope it came from (and one handed back to us cannot
 // be mutated underneath a live reader).
-func (m BodyMaterial) clone() BodyMaterial {
+func (m BodyDescriptor) clone() BodyDescriptor {
 	m.BaseNonce = bytes.Clone(m.BaseNonce)
 	m.AAD = bytes.Clone(m.AAD)
 	return m

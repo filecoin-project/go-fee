@@ -28,12 +28,12 @@ func (c *countingBlob) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-// ExampleDecryptRangeWithMaterial stores an object once and then serves a byte
+// ExampleDecryptRangeWithDescriptor stores an object once and then serves a byte
 // range of it without re-reading the envelope, the way a store that keeps
 // metadata beside its blobs would: the writer records what
 // [EncryptWithCEK] reports, and the reader rebuilds a decryptor from those
 // columns alone.
-func ExampleDecryptRangeWithMaterial() {
+func ExampleDecryptRangeWithDescriptor() {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
@@ -47,10 +47,10 @@ func ExampleDecryptRangeWithMaterial() {
 		log.Fatal(err)
 	}
 
-	// The material is complete before a byte is read, so a writer can record it
+	// The descriptor is complete before a byte is read, so a writer can record it
 	// while the upload is still streaming.
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
-	enc, material, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
+	enc, descriptor, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
 		fee.WithContentLength(int64(len(plaintext))))
 	if err != nil {
@@ -65,18 +65,18 @@ func ExampleDecryptRangeWithMaterial() {
 		log.Fatal(err)
 	}
 
-	// What a store persists alongside the blob's location: the material, plus
+	// What a store persists alongside the blob's location: the descriptor, plus
 	// the blob's exact size.
 	row := struct {
-		material fee.BodyMaterial
-		blobSize int64
-	}{material, int64(len(blob))}
+		descriptor fee.BodyDescriptor
+		blobSize   int64
+	}{descriptor, int64(len(blob))}
 
 	// Serving a range later. Nothing here decodes the envelope — the reader is
 	// built from the stored row, so the only bytes fetched are ciphertext.
-	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.material.HeaderLen}
+	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.descriptor.HeaderLen}
 	const off, length = 4, 15
-	r, err := fee.DecryptRangeWithMaterial(src, row.blobSize, row.material, cek, off, length)
+	r, err := fee.DecryptRangeWithDescriptor(src, row.blobSize, row.descriptor, cek, off, length)
 	if err != nil {
 		log.Fatal(err)
 	}
