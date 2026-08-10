@@ -518,11 +518,11 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 // lazily on later reads, which work from the internalized key, never the cek
 // slice.
 func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader, error) {
-	body, err := validateBody(env)
+	body, aad, err := buildBodyParamsWithAAD(env)
 	if err != nil {
 		return nil, err
 	}
-	r, err := aesstream.NewReader(ciphertext, body.streamConfig(cek))
+	r, err := aesstream.NewReader(ciphertext, body.streamConfig(cek, aad))
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
@@ -530,43 +530,44 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 }
 
 // bodyParams is the validated STREAM configuration a FEE envelope's body header
-// carries: everything fee/aesstream needs to decrypt the detached ciphertext
-// apart from the content-encryption key.
+// carries: everything fee/aesstream needs to size and locate the detached
+// ciphertext apart from the content-encryption key and Enc_structure AAD.
 //
-// [BodyDescriptor] is the same parameters plus the envelope's encoded length —
+// [buildBodyParamsWithAAD] rebuilds that AAD alongside the validated params, and
+// [BodyDescriptor] caches the same inputs plus the envelope's encoded length —
 // where the ciphertext starts within a stored blob. That is what a caller caches
 // and what a range read needs; a whole-object read has neither the number (the
-// streaming decoder does not report it) nor a use for it, so the two shapes stay
-// distinct and [BodyDescriptor.body] converts one way.
+// streaming decoder does not report it) nor a use for it, so the shapes stay
+// distinct and [BodyDescriptor.bodyParams] / [BodyDescriptor.aad] convert one
+// way.
 type bodyParams struct {
 	baseNonce []byte
 	chunkSize int
-	aad       []byte
 }
 
 // streamConfig returns the fee/aesstream configuration for decrypting a body
-// with these parameters under cek. It is the only place FEE body parameters
-// become a stream configuration, so the whole-object reader ([openStream]) and
-// the range reader ([spanRangeReader]) cannot drift apart in how they configure
-// the cipher.
-func (b bodyParams) streamConfig(cek []byte) aesstream.Config {
+// with these parameters under cek, authenticating aad as the envelope
+// Enc_structure. It is the only place FEE body parameters become a stream
+// configuration, so the whole-object reader ([openStream]) and the range reader
+// ([spanRangeReader]) cannot drift apart in how they configure the cipher.
+func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 	return aesstream.Config{
 		Key:       cek,
 		BaseNonce: b.baseNonce,
-		AAD:       b.aad,
+		AAD:       aad,
 		ChunkSize: b.chunkSize,
 	}
 }
 
-// validateBody checks a decoded envelope's FEE body headers — the algorithm is
-// the chunked AES-256-GCM-STREAM cipher, the base nonce (iv) is present, and the
-// self-describing chunk size is in range — and rebuilds the Enc_structure AAD
-// that the encoder bound into every chunk.
+// validateBodyParams checks a decoded envelope's FEE body headers — the
+// algorithm is the chunked AES-256-GCM-STREAM cipher, the base nonce (iv) is
+// present, and the self-describing chunk size is in range.
 //
-// It is shared by the whole-object path ([openStream]) and the range path
-// ([newRangeReader]), so both accept exactly the same envelopes and report the
-// same errors for a body header they cannot honour.
-func validateBody(env *cose.Envelope) (bodyParams, error) {
+// It is shared by the whole-object path's AAD-building resolution
+// ([buildBodyParamsWithAAD]) and the header-only sizing path ([PlaintextSize]),
+// so both accept exactly the same envelopes and report the same errors for a
+// body header they cannot honour.
+func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: body algorithm header missing or not an integer", ErrUnsupportedBodyAlg)
@@ -597,15 +598,26 @@ func validateBody(env *cose.Envelope) (bodyParams, error) {
 			ErrMalformedEnvelope, chunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
 	}
 
+	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize)}, nil
+}
+
+// buildBodyParamsWithAAD validates the body headers and rebuilds the
+// Enc_structure AAD that the encoder bound into every chunk.
+func buildBodyParamsWithAAD(env *cose.Envelope) (bodyParams, []byte, error) {
+	body, err := validateBodyParams(env)
+	if err != nil {
+		return bodyParams{}, nil, err
+	}
+
 	// The decrypt-side AAD is rebuilt from the decoded envelope, using the
 	// Enc_structure context that matches its tag — byte-identical to the value
 	// the encoder bound into every chunk.
 	aad, err := env.EncStructure(nil)
 	if err != nil {
-		return bodyParams{}, fmt.Errorf("fee: building envelope AAD: %w", err)
+		return bodyParams{}, nil, fmt.Errorf("fee: building envelope AAD: %w", err)
 	}
 
-	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize), aad: aad}, nil
+	return body, aad, nil
 }
 
 // checkCEK reports whether a caller-provided content-encryption key is the right

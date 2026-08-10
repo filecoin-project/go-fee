@@ -120,11 +120,16 @@ func plaintextSizeFrom(blobSize, headerLen int64, chunkSize int) (int64, error) 
 	return n, nil
 }
 
-// body returns the envelope body parameters m describes, for the range wiring it
-// shares with the envelope-backed paths. HeaderLen is not among them: it says
-// where the ciphertext starts, not how to decrypt it.
-func (m BodyDescriptor) body() bodyParams {
-	return bodyParams{baseNonce: m.BaseNonce, chunkSize: m.ChunkSize, aad: m.AAD}
+// bodyParams returns the envelope body parameters m describes, for the range
+// wiring it shares with the envelope-backed paths. HeaderLen is not among them:
+// it says where the ciphertext starts, not how to decrypt it.
+func (m BodyDescriptor) bodyParams() bodyParams {
+	return bodyParams{baseNonce: m.BaseNonce, chunkSize: m.ChunkSize}
+}
+
+// aad returns the cached Enc_structure bytes m carries for body decryption.
+func (m BodyDescriptor) aad() []byte {
+	return m.AAD
 }
 
 // clone returns a deep copy, so a BodyDescriptor handed to a caller shares no

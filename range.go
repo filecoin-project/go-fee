@@ -201,7 +201,7 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, leng
 		if err != nil {
 			return nil, err
 		}
-		return spanRangeReader(blob, blobSize, d.HeaderLen, d.body(), plainSize, cek, off, length)
+		return spanRangeReader(blob, blobSize, d.HeaderLen, d.bodyParams(), d.aad(), plainSize, cek, off, length)
 	}
 
 	env, headerLen, err := decodeHeaderAt(blob, blobSize)
@@ -223,7 +223,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	body, err := validateBody(env)
+	body, err := validateBodyParams(env)
 	if err != nil {
 		return 0, err
 	}
@@ -241,7 +241,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 // as soon as this returns — even though the reader decrypts lazily on later
 // reads, which work from the internalized key, never the cek slice.
 func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen int64, cek []byte, off, length int64) (*RangeReader, error) {
-	body, err := validateBody(env)
+	body, aad, err := buildBodyParamsWithAAD(env)
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +250,7 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 	if err != nil {
 		return nil, err
 	}
-	return spanRangeReader(blob, blobSize, headerLen, body, plainSize, cek, off, length)
+	return spanRangeReader(blob, blobSize, headerLen, body, aad, plainSize, cek, off, length)
 }
 
 // spanRangeReader is the geometry-and-wiring tail shared by the envelope-backed
@@ -259,10 +259,11 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 // parameters and the object's plaintext size, it resolves the ciphertext span
 // the range overlaps and hands exactly that span to the body cipher.
 //
-// The two paths differ only in how they arrive at body and plainSize — decoded
-// from the envelope, or supplied from a caller's cache — so keeping the wiring in
-// one place is what makes them accept the same ranges and fail the same way.
-func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParams, plainSize int64, cek []byte, off, length int64) (*RangeReader, error) {
+// The two paths differ only in how they arrive at body, aad and plainSize —
+// decoded from the envelope, or supplied from a caller's cache — so keeping the
+// wiring in one place is what makes them accept the same ranges and fail the
+// same way.
+func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParams, aad []byte, plainSize int64, cek []byte, off, length int64) (*RangeReader, error) {
 	ciphertextSize := blobSize - headerLen
 
 	start, n, plainLen, err := aesstream.CiphertextRange(ciphertextSize, body.chunkSize, off, length)
@@ -282,7 +283,7 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 	// aesstream exactly the bytes it will ask for and nothing else.
 	sr, err := aesstream.NewSpanReader(
 		io.NewSectionReader(blob, headerLen+start, n),
-		body.streamConfig(cek),
+		body.streamConfig(cek, aad),
 		ciphertextSize, off, length)
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
