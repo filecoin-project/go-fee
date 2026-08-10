@@ -364,23 +364,33 @@ func TestDecryptRangeZeroLengthReadsNoCiphertext(t *testing.T) {
 	const size = 4 * rangeChunk
 	f := newRangeFixture(t, size)
 
-	for _, off := range []int64{0, rangeChunk + 1, size} {
-		rec := newRecordingReaderAt(t, f.blob)
-		r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, off, 0)
-		require.NoError(t, err)
+	for _, tc := range []struct {
+		name        string
+		off, length int64
+	}{
+		{"length zero at start", 0, 0},
+		{"length zero in the middle", rangeChunk + 1, 0},
+		{"length zero at end", size, 0},
+		{"length clamps to zero at end", size, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newRecordingReaderAt(t, f.blob)
+			r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, tc.off, tc.length)
+			require.NoError(t, err)
 
-		_, spanLen := r.CiphertextSpan()
-		require.Zero(t, spanLen, "an empty range needs no ciphertext")
-		require.Zero(t, r.Len())
-		require.Equal(t, int64(size), r.Size())
+			_, spanLen := r.CiphertextSpan()
+			require.Zero(t, spanLen, "an empty range needs no ciphertext")
+			require.Zero(t, r.Len())
+			require.Equal(t, int64(size), r.Size())
 
-		got, err := io.ReadAll(r)
-		require.NoError(t, err)
-		require.Empty(t, got)
+			got, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Empty(t, got)
 
-		for _, rd := range rec.reads {
-			require.Equal(t, int64(0), rd.off, "only the header prefix is read")
-		}
+			for _, rd := range rec.reads {
+				require.Equal(t, int64(0), rd.off, "only the header prefix is read")
+			}
+		})
 	}
 }
 

@@ -264,10 +264,6 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	aead, err := newGCM(cfg.Key)
-	if err != nil {
-		return nil, err
-	}
 	chunkSize := cfg.effectiveChunkSize()
 
 	numChunks, lastCipherLen, plaintextLen, err := chunkLayout(ciphertextSize, chunkSize)
@@ -282,6 +278,26 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	effLen := length
 	if avail := plaintextLen - off; effLen > avail {
 		effLen = avail
+	}
+
+	if effLen == 0 {
+		r := &SpanReader{
+			src:           span,
+			chunkSize:     chunkSize,
+			encChunk:      int64(chunkSize) + TagSize,
+			numChunks:     numChunks,
+			lastCipherLen: lastCipherLen,
+			total:         0,
+			remaining:     0,
+			err:           io.EOF,
+		}
+		copy(r.base[:], cfg.BaseNonce)
+		return r, nil
+	}
+
+	aead, err := newGCM(cfg.Key)
+	if err != nil {
+		return nil, err
 	}
 
 	r := &SpanReader{
@@ -299,14 +315,9 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	}
 	copy(r.base[:], cfg.BaseNonce)
 
-	if effLen > 0 {
-		r.nextChunk = off / int64(chunkSize)
-		r.skipFirst = int(off - r.nextChunk*int64(chunkSize))
-		r.onFirst = true
-	} else {
-		// Nothing to emit: report EOF immediately and read no ciphertext.
-		r.err = io.EOF
-	}
+	r.nextChunk = off / int64(chunkSize)
+	r.skipFirst = int(off - r.nextChunk*int64(chunkSize))
+	r.onFirst = true
 	return r, nil
 }
 

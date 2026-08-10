@@ -54,6 +54,7 @@ const (
 // A RangeReader is not safe for concurrent use.
 type RangeReader struct {
 	sr   *aesstream.SpanReader
+	len  int64 // plaintext bytes this reader will emit
 	size int64 // total plaintext size of the whole object
 
 	spanOff int64 // blob-absolute offset of the ciphertext span Read consumes
@@ -61,13 +62,21 @@ type RangeReader struct {
 }
 
 // Read implements io.Reader, yielding the requested plaintext range.
-func (r *RangeReader) Read(p []byte) (int, error) { return r.sr.Read(p) }
+func (r *RangeReader) Read(p []byte) (int, error) {
+	if r.sr != nil {
+		return r.sr.Read(p)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return 0, io.EOF
+}
 
 // Len returns the number of plaintext bytes this reader will emit: the requested
 // length clamped to the bytes available from the offset. It is fixed at
 // construction, so an HTTP consumer can use it as the response Content-Length
 // before reading anything.
-func (r *RangeReader) Len() int64 { return r.sr.Len() }
+func (r *RangeReader) Len() int64 { return r.len }
 
 // Size returns the total plaintext size of the whole object, derived from the
 // blob size and the chunk size. It is the total an HTTP consumer puts after the
@@ -265,9 +274,17 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParams, plainSize int64, cek []byte, off, length int64) (*RangeReader, error) {
 	ciphertextSize := blobSize - headerLen
 
-	start, n, _, err := aesstream.CiphertextRange(ciphertextSize, body.chunkSize, off, length)
+	start, n, plainLen, err := aesstream.CiphertextRange(ciphertextSize, body.chunkSize, off, length)
 	if err != nil {
 		return nil, fmt.Errorf("fee: resolving ciphertext range: %w", err)
+	}
+	if n == 0 {
+		return &RangeReader{
+			len:     plainLen,
+			size:    plainSize,
+			spanOff: headerLen + start,
+			spanLen: n,
+		}, nil
 	}
 
 	// The span is chunk-aligned and contiguous, so the section reader hands
@@ -280,7 +297,7 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
 
-	return &RangeReader{sr: sr, size: plainSize, spanOff: headerLen + start, spanLen: n}, nil
+	return &RangeReader{sr: sr, len: plainLen, size: plainSize, spanOff: headerLen + start, spanLen: n}, nil
 }
 
 // envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came

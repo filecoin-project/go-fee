@@ -44,6 +44,13 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type rejectReader struct{ t *testing.T }
+
+func (r *rejectReader) Read(p []byte) (int, error) {
+	r.t.Fatalf("unexpected Read(len=%d)", len(p))
+	return 0, io.EOF
+}
+
 // drainTiny reads r to EOF one byte at a time, asserting a clean EOF.
 func drainTiny(t *testing.T, r io.Reader) []byte {
 	t.Helper()
@@ -429,15 +436,13 @@ func TestSpanReader(t *testing.T) {
 		ct := seal(t, cfg, pattern(100))
 		size := int64(len(ct))
 
-		cr := &countingReader{r: bytes.NewReader(nil)}
-		r, err := aesstream.NewSpanReader(cr, cfg, size, 5, 0)
+		r, err := aesstream.NewSpanReader(&rejectReader{t: t}, cfg, size, 100, 100)
 		require.NoError(t, err)
 		require.Zero(t, r.Len(), "Len")
 		require.Equal(t, cs, r.ChunkSize(), "ChunkSize")
 		n, err := r.Read(make([]byte, 8))
 		require.Zero(t, n)
 		require.ErrorIs(t, err, io.EOF)
-		require.Zero(t, cr.n, "no ciphertext read for an empty range")
 	})
 }
 
