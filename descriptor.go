@@ -15,7 +15,7 @@ var ErrIncompleteDescriptor = errors.New("fee: incomplete body descriptor")
 // BodyDescriptor is everything a range decrypt needs from a FEE envelope, so a
 // caller that cached it can serve a byte range without fetching or decoding the
 // envelope header at all. It is returned by [Encrypt] / [EncryptWithCEK] at
-// encryption time and consumed by [DecryptRangeWithDescriptor].
+// encryption time and consumed by [DecryptRangeWithCEK] as its desc argument.
 //
 // It exists for stores that keep their own metadata alongside the blob: the
 // envelope is a fixed prefix of every stored object, so re-reading it on each
@@ -63,8 +63,9 @@ type BodyDescriptor struct {
 // material — a partially populated record would produce a row that no later
 // range read could use.
 //
-// [DecryptRangeWithDescriptor] calls it, so a bad value fails there with
-// [ErrIncompleteDescriptor] rather than as an authentication error further down.
+// [DecryptRangeWithCEK] calls it when desc is non-nil, so a bad value fails
+// there with [ErrIncompleteDescriptor] rather than as an authentication error
+// further down.
 func (m BodyDescriptor) Validate() error {
 	if m.HeaderLen <= 0 {
 		return fmt.Errorf("%w: header length %d is not positive", ErrIncompleteDescriptor, m.HeaderLen)
@@ -89,9 +90,9 @@ func (m BodyDescriptor) Validate() error {
 // suffix range ("bytes=-N" is off = size-N) from cached metadata alone.
 //
 // blobSize is the whole stored object, envelope included, exactly as passed to
-// [DecryptRangeWithDescriptor]. It reports [ErrIncompleteDescriptor] for an unusable
-// m, and [aesstream.ErrCiphertextSize] if blobSize cannot describe a FEE blob at
-// this header length and chunk size.
+// [DecryptRangeWithCEK] when desc is non-nil. It reports [ErrIncompleteDescriptor]
+// for an unusable m, and [aesstream.ErrCiphertextSize] if blobSize cannot
+// describe a FEE blob at this header length and chunk size.
 func (m BodyDescriptor) PlaintextSize(blobSize int64) (int64, error) {
 	if err := m.Validate(); err != nil {
 		return 0, err

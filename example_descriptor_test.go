@@ -28,12 +28,12 @@ func (c *countingBlob) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-// ExampleDecryptRangeWithDescriptor stores an object once and then serves a byte
-// range of it without re-reading the envelope, the way a store that keeps
-// metadata beside its blobs would: the writer records what
+// ExampleDecryptRangeWithCEK_withBodyDescriptor stores an object once and then
+// serves a byte range of it without re-reading the envelope, the way a store
+// that keeps metadata beside its blobs would: the writer records what
 // [EncryptWithCEK] reports, and the reader rebuilds a decryptor from those
 // columns alone.
-func ExampleDecryptRangeWithDescriptor() {
+func ExampleDecryptRangeWithCEK_withBodyDescriptor() {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
@@ -76,7 +76,7 @@ func ExampleDecryptRangeWithDescriptor() {
 	// built from the stored row, so the only bytes fetched are ciphertext.
 	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.descriptor.HeaderLen}
 	const off, length = 4, 15
-	r, err := fee.DecryptRangeWithDescriptor(src, row.blobSize, row.descriptor, cek, off, length)
+	r, err := fee.DecryptRangeWithCEK(src, row.blobSize, cek, off, length, &row.descriptor)
 	if err != nil {
 		log.Fatal(err)
 	}

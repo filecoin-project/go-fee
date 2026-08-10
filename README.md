@@ -331,10 +331,11 @@ the upload is still streaming:
 r, d, err := fee.Encrypt(plaintext, recipients)
 ```
 
-`fee.DecryptRangeWithDescriptor(blob, blobSize, d, cek, off, length)` then serves a
+`fee.DecryptRangeWithCEK(blob, blobSize, cek, off, length, &d)` then serves a
 range with no envelope round trip at all: the only bytes fetched are the
-ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a `HEAD`
-or resolves a suffix range from the stored record alone, reading nothing.
+ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a
+`HEAD` or resolves a suffix range from the stored record alone, reading
+nothing.
 
 Every field is non-secret — all four are already in the clear at the front of the
 blob — and the CEK is deliberately not among them. Store the AAD rather than the

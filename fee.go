@@ -75,8 +75,9 @@
 // A store that keeps metadata beside its blobs can drop the header read too.
 // [Encrypt] reports the envelope parameters a range decrypt needs as a
 // [BodyDescriptor]; persisting those and passing them to
-// [DecryptRangeWithDescriptor] serves a range with no envelope round trip at all,
-// and [BodyDescriptor.PlaintextSize] answers a HEAD from the same record.
+// [DecryptRangeWithCEK] as its desc argument serves a range with no envelope
+// round trip at all, and [BodyDescriptor.PlaintextSize] answers a HEAD from
+// the same record.
 //
 // # Scope
 //

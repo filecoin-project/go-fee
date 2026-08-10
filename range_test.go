@@ -288,7 +288,7 @@ func TestDecryptRangeWithCEK(t *testing.T) {
 		}, fee.WithChunkSize(rangeChunk))
 		require.NoError(t, err)
 
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
@@ -302,7 +302,7 @@ func TestDecryptRangeWithCEK(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, cose.TagCOSEEncrypt0, tag)
 
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
@@ -566,7 +566,7 @@ func TestDecryptRangeInvalidArgs(t *testing.T) {
 	t.Run("nil blob", func(t *testing.T) {
 		_, err := fee.DecryptRange(nil, size, f.unwrapper, 0, 10)
 		require.Error(t, err)
-		_, err = fee.DecryptRangeWithCEK(nil, size, newCEK(t), 0, 10)
+		_, err = fee.DecryptRangeWithCEK(nil, size, newCEK(t), 0, 10, nil)
 		require.Error(t, err)
 	})
 
@@ -576,7 +576,7 @@ func TestDecryptRangeInvalidArgs(t *testing.T) {
 	})
 
 	t.Run("cek wrong length", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(f.blob), size, make([]byte, 16), 0, 10)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(f.blob), size, make([]byte, 16), 0, 10, nil)
 		require.ErrorIs(t, err, fee.ErrInvalidCEK)
 	})
 
@@ -712,7 +712,7 @@ func TestDecryptRangeTrailingEmptyFinalChunk(t *testing.T) {
 
 	t.Run("range across the last full chunk", func(t *testing.T) {
 		off, length := int64(2*rangeChunk-10), int64(20)
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, off, length)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, off, length, nil)
 		require.NoError(t, err)
 		require.Equal(t, int64(size), r.Size())
 		got, err := io.ReadAll(r)
@@ -721,7 +721,7 @@ func TestDecryptRangeTrailingEmptyFinalChunk(t *testing.T) {
 	})
 
 	t.Run("whole object as one range", func(t *testing.T) {
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, 0, size)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, 0, size, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)

@@ -154,8 +154,8 @@ func TestIngotWriteReadFlow(t *testing.T) {
 			defer clear(cek)
 
 			recording := newRecordingReaderAt(t, blob)
-			r, err := fee.DecryptRangeWithDescriptor(recording, row.size, row.descriptor(),
-				cek, tc.off, tc.length)
+			desc := row.descriptor()
+			r, err := fee.DecryptRangeWithCEK(recording, row.size, cek, tc.off, tc.length, &desc)
 			require.NoError(t, err)
 
 			want := plaintext[tc.off : tc.off+clampLen(size, tc.off, tc.length)]
@@ -200,20 +200,19 @@ func TestEncryptDescriptorDoesNotAliasTheStream(t *testing.T) {
 
 	// The blob still decrypts under the pristine values, so the mutation never
 	// reached the cipher or the encoded header.
-	r, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), int64(len(blob)),
-		kept, cek, 0, int64(len(plaintext)))
+	r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, int64(len(plaintext)), &kept)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
 	require.Equal(t, plaintext, got)
 }
 
-// TestDecryptRangeWithDescriptorEncrypt0 pins that the descriptor is
+// TestDecryptRangeWithCEKAndBodyDescriptorEncrypt0 pins that the descriptor is
 // envelope-form agnostic: a recipient-less COSE_Encrypt0 yields a usable
 // descriptor with no flag and no special case, which is what lets
-// BodyDescriptor cache the finished AAD
-// rather than a protected header plus a context discriminator.
-func TestDecryptRangeWithDescriptorEncrypt0(t *testing.T) {
+// BodyDescriptor cache the finished AAD rather than a protected header plus a
+// context discriminator.
+func TestDecryptRangeWithCEKAndBodyDescriptorEncrypt0(t *testing.T) {
 	const size = 2 * rangeChunk
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
@@ -227,7 +226,7 @@ func TestDecryptRangeWithDescriptorEncrypt0(t *testing.T) {
 	require.Equal(t, cose.TagCOSEEncrypt0, tag)
 
 	recording := newRecordingReaderAt(t, blob)
-	r, err := fee.DecryptRangeWithDescriptor(recording, int64(len(blob)), desc, cek, 10, 4000)
+	r, err := fee.DecryptRangeWithCEK(recording, int64(len(blob)), cek, 10, 4000, &desc)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
@@ -235,10 +234,11 @@ func TestDecryptRangeWithDescriptorEncrypt0(t *testing.T) {
 	requireNoEnvelopeRead(t, recording, desc.HeaderLen)
 }
 
-// TestDecryptRangeWithDescriptorMatchesEnvelopePath asserts the cached path and the
-// envelope path are interchangeable — same bytes out for the same request, so
-// caching is an optimisation and not a second behaviour to reason about.
-func TestDecryptRangeWithDescriptorMatchesEnvelopePath(t *testing.T) {
+// TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath asserts the cached
+// path and the envelope path are interchangeable — same bytes out for the same
+// request, so caching is an optimisation and not a second behaviour to reason
+// about.
+func TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath(t *testing.T) {
 	const size = 3*rangeChunk + 7
 	tenantKey := newX25519Key(t)
 	plaintext := patternBytes(size)
@@ -252,7 +252,7 @@ func TestDecryptRangeWithDescriptorMatchesEnvelopePath(t *testing.T) {
 	for _, off := range []int64{0, 1, rangeChunk - 1, rangeChunk, 2 * rangeChunk, size - 7} {
 		_, viaEnvelope := decryptRange(t, blob, unwrapper, off, 500)
 
-		r, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), int64(len(blob)), desc, cek, off, 500)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, 500, &desc)
 		require.NoError(t, err)
 		viaDescriptor, err := io.ReadAll(r)
 		require.NoError(t, err)
@@ -292,19 +292,20 @@ func TestBodyDescriptorValidate(t *testing.T) {
 
 			// The range entry point rejects it up front for the same reason,
 			// rather than letting it fail as an authentication error later.
-			_, err := fee.DecryptRangeWithDescriptor(bytes.NewReader([]byte("blob")), 4096, m,
-				make([]byte, aesstream.KeySize), 0, 10)
+			_, err := fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
+				make([]byte, aesstream.KeySize), 0, 10, &m)
 			require.ErrorIs(t, err, fee.ErrIncompleteDescriptor)
 		})
 	}
 }
 
-// TestDecryptRangeWithDescriptorPoisoned is the safety property that makes caching
-// this descriptor acceptable: a row that has drifted from the bytes on disk fails
-// loudly. Because BaseNonce and the AAD are bound into every chunk's GCM tag and
-// HeaderLen decides which bytes are read at all, a wrong value can only produce
-// an unreadable object — never plausible but incorrect plaintext.
-func TestDecryptRangeWithDescriptorPoisoned(t *testing.T) {
+// TestDecryptRangeWithCEKAndBodyDescriptorPoisoned is the safety property that
+// makes caching this descriptor acceptable: a row that has drifted from the
+// bytes on disk fails loudly. Because BaseNonce and the AAD are bound into every
+// chunk's GCM tag and HeaderLen decides which bytes are read at all, a wrong
+// value can only produce an unreadable object — never plausible but incorrect
+// plaintext.
+func TestDecryptRangeWithCEKAndBodyDescriptorPoisoned(t *testing.T) {
 	const size = 3 * rangeChunk
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
@@ -327,8 +328,7 @@ func TestDecryptRangeWithDescriptorPoisoned(t *testing.T) {
 			poisoned := desc
 			mutate(&poisoned)
 
-			r, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), int64(len(blob)),
-				poisoned, cek, 0, 200)
+			r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, 200, &poisoned)
 			if err != nil {
 				return // rejected at construction, which is a fine outcome
 			}
@@ -339,9 +339,9 @@ func TestDecryptRangeWithDescriptorPoisoned(t *testing.T) {
 	}
 }
 
-// TestDecryptRangeWithDescriptorInvalidArgs covers the argument checks that do not
-// depend on the descriptor being right.
-func TestDecryptRangeWithDescriptorInvalidArgs(t *testing.T) {
+// TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs covers the argument checks
+// that do not depend on the descriptor being right.
+func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 	const size = 2 * rangeChunk
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
@@ -350,28 +350,27 @@ func TestDecryptRangeWithDescriptorInvalidArgs(t *testing.T) {
 	blobSize := int64(len(blob))
 
 	t.Run("short cek", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), blobSize, desc,
-			make([]byte, 16), 0, 10)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, make([]byte, 16), 0, 10, &desc)
 		require.ErrorIs(t, err, fee.ErrInvalidCEK)
 	})
 
 	t.Run("nil blob", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithDescriptor(nil, blobSize, desc, cek, 0, 10)
+		_, err := fee.DecryptRangeWithCEK(nil, blobSize, cek, 0, 10, &desc)
 		require.Error(t, err)
 	})
 
 	t.Run("blob shorter than its envelope", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), desc.HeaderLen-1, desc, cek, 0, 10)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), desc.HeaderLen-1, cek, 0, 10, &desc)
 		require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
 	})
 
 	t.Run("offset past the end", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), blobSize, desc, cek, size+1, 10)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, size+1, 10, &desc)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
 
 	t.Run("negative offset", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithDescriptor(bytes.NewReader(blob), blobSize, desc, cek, -1, 10)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, -1, 10, &desc)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
 }
