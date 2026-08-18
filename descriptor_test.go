@@ -288,13 +288,13 @@ func TestBodyDescriptorValidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := good
 			mutate(&m)
-			require.ErrorIs(t, m.Validate(), fee.ErrIncompleteDescriptor)
+			require.ErrorIs(t, m.Validate(), fee.ErrInvalidDescriptor)
 
 			// The range entry point rejects it up front for the same reason,
 			// rather than letting it fail as an authentication error later.
 			_, err := fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
 				make([]byte, aesstream.KeySize), 0, 10, &m)
-			require.ErrorIs(t, err, fee.ErrIncompleteDescriptor)
+			require.ErrorIs(t, err, fee.ErrInvalidDescriptor)
 		})
 	}
 }

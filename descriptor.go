@@ -8,9 +8,9 @@ import (
 	"github.com/filecoin-project/go-fee/aesstream"
 )
 
-// ErrIncompleteDescriptor means a [BodyDescriptor] is missing a field, or carries
+// ErrInvalidDescriptor means a [BodyDescriptor] is missing a field, or carries
 // one that cannot describe a FEE body — a value that could not decrypt anything.
-var ErrIncompleteDescriptor = errors.New("fee: incomplete body descriptor")
+var ErrInvalidDescriptor = errors.New("fee: invalid body descriptor")
 
 // BodyDescriptor is everything a range decrypt needs from a FEE envelope, so a
 // caller that cached it can serve a byte range without fetching or decoding the
@@ -64,22 +64,22 @@ type BodyDescriptor struct {
 // range read could use.
 //
 // [DecryptRangeWithCEK] calls it when desc is non-nil, so a bad value fails
-// there with [ErrIncompleteDescriptor] rather than as an authentication error
+// there with [ErrInvalidDescriptor] rather than as an authentication error
 // further down.
 func (m BodyDescriptor) Validate() error {
 	if m.HeaderLen <= 0 {
-		return fmt.Errorf("%w: header length %d is not positive", ErrIncompleteDescriptor, m.HeaderLen)
+		return fmt.Errorf("%w: header length %d is not positive", ErrInvalidDescriptor, m.HeaderLen)
 	}
 	if len(m.BaseNonce) != aesstream.BaseNonceSize {
 		return fmt.Errorf("%w: base nonce is %d bytes, want %d",
-			ErrIncompleteDescriptor, len(m.BaseNonce), aesstream.BaseNonceSize)
+			ErrInvalidDescriptor, len(m.BaseNonce), aesstream.BaseNonceSize)
 	}
 	if m.ChunkSize < aesstream.MinChunkSize || m.ChunkSize > aesstream.MaxChunkSize {
 		return fmt.Errorf("%w: chunk size %d out of range [%d, %d]",
-			ErrIncompleteDescriptor, m.ChunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
+			ErrInvalidDescriptor, m.ChunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
 	}
 	if len(m.AAD) == 0 {
-		return fmt.Errorf("%w: missing AAD", ErrIncompleteDescriptor)
+		return fmt.Errorf("%w: missing AAD", ErrInvalidDescriptor)
 	}
 	return nil
 }
@@ -90,7 +90,7 @@ func (m BodyDescriptor) Validate() error {
 // suffix range ("bytes=-N" is off = size-N) from cached metadata alone.
 //
 // blobSize is the whole stored object, envelope included, exactly as passed to
-// [DecryptRangeWithCEK] when desc is non-nil. It reports [ErrIncompleteDescriptor]
+// [DecryptRangeWithCEK] when desc is non-nil. It reports [ErrInvalidDescriptor]
 // for an unusable m, and [aesstream.ErrCiphertextSize] if blobSize cannot
 // describe a FEE blob at this header length and chunk size.
 func (m BodyDescriptor) PlaintextSize(blobSize int64) (int64, error) {

@@ -174,7 +174,7 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, o
 // entirely; the only bytes then fetched from blob are the ciphertext chunks the
 // range overlaps. The descriptor is cloned before use, so later caller mutation
 // cannot affect the decryptor built from it. A malformed descriptor is rejected
-// up front with [ErrIncompleteDescriptor]; a well-formed but stale or wrong one
+// up front with [ErrInvalidDescriptor]; a well-formed but stale or wrong one
 // fails when read as [aesstream.ErrCorrupted], not as plausible plaintext.
 //
 // blobSize is the size of the whole stored blob, envelope included, exactly as
