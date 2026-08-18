@@ -2,6 +2,7 @@ package cose
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
@@ -68,7 +69,7 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 	dec := decMode.NewDecoder(bytes.NewReader(data))
 	var first cbor.RawMessage
 	if err := dec.Decode(&first); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return nil, nil, malformedItem(err)
 	}
 	rest = data[dec.NumBytesRead():]
 
@@ -84,6 +85,21 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 		return nil, nil, err
 	}
 	return env, rest, nil
+}
+
+// malformedItem reports a failure to read the single leading CBOR item as
+// ErrMalformed, additionally wrapping io.ErrUnexpectedEOF when the input simply
+// ran out mid-item (or held no item at all).
+//
+// That distinction is what lets a caller decoding a prefix of a larger object
+// tell "give me more bytes" from "these bytes are complete and wrong" — fee's
+// envelope-header probe grows its read only for the former. Every other decode
+// failure is a final answer no amount of extra input can change.
+func malformedItem(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: %w", ErrMalformed, io.ErrUnexpectedEOF)
+	}
+	return fmt.Errorf("%w: %v", ErrMalformed, err)
 }
 
 // decodeTagArray unmarshals one already-read CBOR item into the tag number and
@@ -180,7 +196,7 @@ func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Rea
 	dec := decMode.NewDecoder(r)
 	var first cbor.RawMessage
 	if err := dec.Decode(&first); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return nil, nil, malformedItem(err)
 	}
 	rest = io.MultiReader(dec.Buffered(), r)
 

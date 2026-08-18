@@ -102,6 +102,29 @@ func DecryptedSize(ciphertextLen int64, chunkSize int) (int64, error) {
 	return plaintextLen, err
 }
 
+// ChunkCount returns how many chunks a complete ciphertext of ciphertextLen
+// bytes contains at the given chunk size. A zero chunkSize selects
+// DefaultChunkSize; any other value must be in [MinChunkSize, MaxChunkSize]
+// (else ErrChunkSize), the same rule as Config.ChunkSize. It returns
+// ErrCiphertextSize if ciphertextLen is not a structurally valid stream length.
+//
+// The count is not derivable from the plaintext length, which is why this is
+// worth asking for: the final chunk may be full, partial, or empty, so a
+// plaintext of exactly k*chunkSize bytes is a valid stream of either k chunks
+// (the last one full) or k+1 (the last one empty). Both are read the same way
+// and yield the same plaintext, and only the ciphertext length tells them apart.
+// A caller checking a stream against a separately recorded chunk count should
+// compare against this rather than against ceil(plaintextLen/chunkSize), which
+// only describes the first form.
+func ChunkCount(ciphertextLen int64, chunkSize int) (int64, error) {
+	chunkSize, err := resolveChunkSize(chunkSize)
+	if err != nil {
+		return 0, err
+	}
+	numChunks, _, _, err := chunkLayout(ciphertextLen, chunkSize)
+	return numChunks, err
+}
+
 // CiphertextRange returns the single contiguous ciphertext byte range
 // [start, start+n) that must be read to serve the plaintext range
 // [off, off+length) of a stream whose complete ciphertext is
@@ -241,10 +264,6 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	aead, err := newGCM(cfg.Key)
-	if err != nil {
-		return nil, err
-	}
 	chunkSize := cfg.effectiveChunkSize()
 
 	numChunks, lastCipherLen, plaintextLen, err := chunkLayout(ciphertextSize, chunkSize)
@@ -259,6 +278,26 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	effLen := length
 	if avail := plaintextLen - off; effLen > avail {
 		effLen = avail
+	}
+
+	if effLen == 0 {
+		r := &SpanReader{
+			src:           span,
+			chunkSize:     chunkSize,
+			encChunk:      int64(chunkSize) + TagSize,
+			numChunks:     numChunks,
+			lastCipherLen: lastCipherLen,
+			total:         0,
+			remaining:     0,
+			err:           io.EOF,
+		}
+		copy(r.base[:], cfg.BaseNonce)
+		return r, nil
+	}
+
+	aead, err := newGCM(cfg.Key)
+	if err != nil {
+		return nil, err
 	}
 
 	r := &SpanReader{
@@ -276,14 +315,9 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	}
 	copy(r.base[:], cfg.BaseNonce)
 
-	if effLen > 0 {
-		r.nextChunk = off / int64(chunkSize)
-		r.skipFirst = int(off - r.nextChunk*int64(chunkSize))
-		r.onFirst = true
-	} else {
-		// Nothing to emit: report EOF immediately and read no ciphertext.
-		r.err = io.EOF
-	}
+	r.nextChunk = off / int64(chunkSize)
+	r.skipFirst = int(off - r.nextChunk*int64(chunkSize))
+	r.onFirst = true
 	return r, nil
 }
 

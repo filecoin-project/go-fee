@@ -1,6 +1,7 @@
 package cose
 
 import (
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,40 @@ func TestDecodeMalformed(t *testing.T) {
 			require.ErrorIs(t, err, tc.want)
 			require.Nil(t, env)
 			require.Nil(t, rest)
+		})
+	}
+}
+
+// TestDecodeTruncatedIsUnexpectedEOF pins that a decode failing only because the
+// input stopped mid-item is distinguishable from one whose bytes are complete and
+// wrong. A caller reading a prefix of a larger object (see fee's envelope-header
+// probe) grows its read only for the former; without this a complete-but-invalid
+// item would be re-read at ever larger sizes to no purpose.
+func TestDecodeTruncatedIsUnexpectedEOF(t *testing.T) {
+	truncated := map[string]string{
+		"empty input":        "",
+		"truncated array":    "d86084",
+		"truncated mid-item": "d8608443a101",
+	}
+	for name, h := range truncated {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Decode(hexDec(t, h))
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		})
+	}
+
+	// Complete items that are simply not what we accept must not look truncated,
+	// however short they are.
+	complete := map[string]string{
+		"bare integer, not a tag":   "01",
+		"tag 96 array too short":    "d8608340a0f6",
+		"duplicate protected label": "d8608445a201030104a0f6818340a041aa",
+		"body ciphertext not null":  "d8608440a041ff818340a041aa",
+	}
+	for name, h := range complete {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Decode(hexDec(t, h))
+			require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
 		})
 	}
 }
