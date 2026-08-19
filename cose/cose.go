@@ -110,6 +110,11 @@ var (
 	// ErrMalformed means the CBOR could not be parsed into a well-formed
 	// COSE_Encrypt or COSE_Encrypt0 structure. A decode that returns ErrMalformed
 	// returns no partial structure.
+	//
+	// When the input ran out before the leading item was complete, the error also
+	// wraps io.ErrUnexpectedEOF. A caller decoding a prefix of a larger object can
+	// therefore tell "read more bytes" from "these bytes are complete and wrong";
+	// no other decode failure carries that signal.
 	ErrMalformed = errors.New("cose: malformed COSE envelope")
 	// ErrDetachedPayload means the body ciphertext field was not CBOR null;
 	// this package only handles detached payloads.

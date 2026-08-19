@@ -46,8 +46,8 @@ import (
 
 | Package | Purpose |
 |---|---|
-| [`fee`](.) (root) | Composes the primitives below into a small encrypt/decrypt API for whole objects. Adds no cryptography of its own. |
-| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range-decryption API (`CiphertextRange`, `SpanReader`, `OpenSpan`). |
+| [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt`, byte-range `DecryptRange`, and the cacheable envelope parameters (`BodyDescriptor`) that let a range read skip the header. Adds no cryptography of its own. |
+| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
 | [`cose`](./cose) | Just enough of COSE (RFC 9052): `COSE_Encrypt` (tag 96) / `COSE_Encrypt0` (tag 16) with a detached payload, and the `Enc_structure` AAD. |
 | [`ecdhkw`](./ecdhkw) | ECDH-ES+A256KW key wrap over X25519 (COSE algorithm −31). |
 | [`aeskw`](./aeskw) | RFC 3394 AES Key Wrap / A256KW (COSE algorithm −5). |
@@ -90,7 +90,7 @@ func main() {
     kid := []byte("did:key:z6MkExample#key-1")
 
     // Encrypt. The returned reader streams envelope‖ciphertext.
-    r, err := fee.Encrypt(
+    r, _, err := fee.Encrypt(
         bytes.NewReader([]byte("hello, filecoin")),
         []fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
     )
@@ -127,7 +127,7 @@ never chooses it.
 
 ```go
 func encryptShared(data []byte, alicePub *ecdh.PublicKey, kek []byte) ([]byte, error) {
-    r, err := fee.Encrypt(bytes.NewReader(data), []fee.Recipient{
+    r, _, err := fee.Encrypt(bytes.NewReader(data), []fee.Recipient{
         // ECDH-ES+A256KW to Alice's X25519 public key.
         fee.NewECDHESRecipient([]byte("did:key:alice#key-1"), alicePub),
         // A256KW under a pre-shared 32-byte key-encryption key.
@@ -172,7 +172,7 @@ func encryptFile(src, dst string, recipients []fee.Recipient) error {
     // WithContentLength is optional: it records the chunk count in the
     // envelope (useful to range/seek consumers) and fails the stream if the
     // plaintext turns out to be a different length.
-    r, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
+    r, _, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
     if err != nil {
         return err
     }
@@ -227,7 +227,7 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
         return nil, err
     }
 
-    r, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, nil)
+    r, _, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, nil)
     if err != nil {
         return nil, err
     }
@@ -254,73 +254,100 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 ### Range (seekable) decryption
 
 Because chunks are sealed independently, any plaintext byte range can be
-decrypted from a single contiguous slice of the ciphertext — one HTTP range
-request against a remote blob. The root `fee` package covers whole-object
-decryption only; ranges use the `cose` and `aesstream` packages directly:
+decrypted without fetching or decrypting the rest of the object.
+`fee.DecryptRange` takes the stored blob as an `io.ReaderAt` plus its exact size,
+unwraps the CEK just as `fee.Decrypt` does, and returns a reader over exactly the
+requested bytes:
 
 ```go
 import (
-    "bytes"
-    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strconv"
 
     fee "github.com/filecoin-project/go-fee"
-    "github.com/filecoin-project/go-fee/aesstream"
-    "github.com/filecoin-project/go-fee/cose"
 )
 
-// readRange decrypts plaintext[off : off+length] from a FEE blob without
-// decrypting the whole object. cek is the content-encryption key, obtained out
-// of band or unwrapped from a recipient entry (see ecdhkw / aeskw).
-func readRange(blob, cek []byte, off, length int64) ([]byte, error) {
-    const labelChunkSize = int64(-65790)
-
-    // Decode the envelope header: base nonce, chunk size, and the
-    // Enc_structure that every chunk is authenticated against.
-    env, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
+// serveRange answers an HTTP range request straight from an encrypted object.
+func serveRange(w http.ResponseWriter, f *os.File, size int64, u fee.RecipientUnwrapper, off, length int64) error {
+    r, err := fee.DecryptRange(f, size, u, off, length)
     if err != nil {
-        return nil, err
-    }
-    baseNonce, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
-    if !ok {
-        return nil, errors.New("missing base nonce")
-    }
-    chunkSize := aesstream.DefaultChunkSize
-    if n, ok := env.Headers.Unprotected.Int(labelChunkSize); ok {
-        chunkSize = int(n)
-    }
-    aad, err := env.EncStructure(nil)
-    if err != nil {
-        return nil, err
+        return err // aesstream.ErrRange here means a 416
     }
 
-    // Which contiguous ciphertext bytes cover the requested plaintext range?
-    // The third result (ignored here) is the clamped plaintext length of the
-    // range — available before any fetch, e.g. for an HTTP Content-Length.
-    start, n, _, err := aesstream.CiphertextRange(int64(len(ciphertext)), chunkSize, off, length)
-    if err != nil {
-        return nil, err
+    // Len is the requested length clamped to the object; Size is the whole
+    // object's plaintext size. Both are known before any ciphertext is read.
+    if r.Len() == 0 {
+        w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", r.Size()))
+        w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+        return nil
     }
+    w.Header().Set("Content-Length", strconv.FormatInt(r.Len(), 10))
+    w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+r.Len()-1, r.Size()))
+    w.WriteHeader(http.StatusPartialContent)
 
-    // Fetch exactly that span. Against a remote blob this is one range
-    // request for bytes [headerLen+start, headerLen+start+n), where
-    // headerLen = len(blob) - len(ciphertext).
-    span := bytes.NewReader(ciphertext[start : start+n])
-
-    // Decrypt and trim to exactly the requested range. For large ranges,
-    // aesstream.NewSpanReader streams instead of buffering.
-    return aesstream.OpenSpan(aesstream.Config{
-        Key:       cek,
-        BaseNonce: baseNonce,
-        AAD:       aad,
-        ChunkSize: chunkSize,
-    }, span, int64(len(ciphertext)), off, length)
+    _, err = io.Copy(w, r) // decrypts chunk by chunk, O(chunk size) memory
+    return err
 }
 ```
 
+Only the envelope header and the ciphertext chunks the range overlaps are read:
+one small `ReadAt` at offset 0 for the header, then one `ReadAt` per overlapping
+chunk as the result is read. Every chunk read is authenticated, so a tampered
+chunk fails rather than yielding corrupt plaintext.
+
+Nothing beyond the header is fetched until the first `Read`, so a caller backed
+by a remote store can prefetch the whole span in a single range request:
+
+```go
+r, err := fee.DecryptRange(blob, size, unwrapper, off, length)
+// ...
+spanOff, spanLen := r.CiphertextSpan() // blob-absolute; one range request
+```
+
 The span is chunk-aligned, so it over-fetches by at most the unused head of the
-first chunk and tail of the last (under 2 × chunk size total). For a local
-random-access source, wrap it with `io.NewSectionReader(src, start, n)` instead
-of a fetch.
+first chunk and tail of the last (under 2 × chunk size total).
+
+`fee.PlaintextSize` reports an object's decrypted size from the envelope header
+alone — no key material, no ciphertext — which is what a `HEAD` response or a
+suffix range (`bytes=-N`) needs. `fee.DecryptRangeWithCEK` is the external-CEK
+counterpart of `DecryptRange`. Callers holding raw ciphertext spans rather than a
+whole blob can use `aesstream.CiphertextRange` / `SpanReader` / `OpenSpan`
+directly.
+
+### Caching the envelope parameters
+
+The envelope is a fixed prefix of every stored object, so a store that keeps its
+own metadata beside the blob can record what a range decrypt needs from it and
+skip the header read as well. `fee.Encrypt` reports those four values alongside
+the reader: envelope length, base nonce, chunk size, and the `Enc_structure` AAD.
+They are complete before any plaintext is read, so a writer can store them while
+the upload is still streaming:
+
+```go
+// d goes alongside the blob's location and size.
+r, d, err := fee.Encrypt(plaintext, recipients)
+```
+
+`fee.DecryptRangeWithCEK(blob, blobSize, cek, off, length, &d)` then serves a
+range with no envelope round trip at all: the only bytes fetched are the
+ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a
+`HEAD` or resolves a suffix range from the stored record alone, reading
+nothing.
+
+Every field is non-secret — all four are already in the clear at the front of the
+blob — and the CEK is deliberately not among them. Store the AAD rather than the
+protected header it contains: the `Enc_structure`'s context string differs between
+a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the protected
+header alone would need a companion flag recording which form was written. A stale
+or corrupted record cannot serve wrong plaintext, since all four values are bound
+into every chunk's GCM tag or decide which bytes are read; it fails with
+`aesstream.ErrCorrupted` instead. The one check it gives up is `ErrSizeMismatch`:
+with no envelope to consult, nothing cross-checks `blobSize` against the declared
+chunk count, so a caller that stores the size should compare it with the store's
+own before trusting a range.
 
 ## Wire format
 
@@ -344,6 +371,13 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 - **Body AAD** — the COSE `Enc_structure` over the protected header, identical
   for every chunk, so the algorithm, envelope type and any protected metadata
   are authenticated into the ciphertext.
+- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
+  with the remainder in the final chunk; empty input is one empty chunk. A
+  decoder also accepts a stream that ends with an empty final chunk, so a
+  plaintext of exactly `k × chunkSize` bytes is a valid stream of either `k`
+  chunks or `k+1`. Only the ciphertext length distinguishes them
+  (`aesstream.ChunkCount`), which is why a declared count must never be checked
+  against a count re-derived from the plaintext length.
 - **Chunk count** (label −65791) — advisory metadata for range/seek consumers,
   emitted only when the plaintext length is known; not required to decrypt.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
