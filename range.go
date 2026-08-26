@@ -63,6 +63,9 @@ type RangeReader struct {
 
 // Read implements io.Reader, yielding the requested plaintext range.
 func (r *RangeReader) Read(p []byte) (int, error) {
+	if r.sr == nil {
+		return 0, io.EOF
+	}
 	return r.sr.Read(p)
 }
 
