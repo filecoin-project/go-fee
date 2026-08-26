@@ -57,25 +57,19 @@ type RangeReader struct {
 	len  int64 // plaintext bytes this reader will emit
 	size int64 // total plaintext size of the whole object
 
-	spanOff int64 // blob-absolute offset of the ciphertext span Read consumes
-	spanLen int64 // byte length of that span (0 for an empty range)
+	spanStart int64 // blob-absolute first byte of the ciphertext span Read consumes
+	spanEnd   int64 // blob-absolute last byte of that span (inclusive)
 }
 
 // Read implements io.Reader, yielding the requested plaintext range.
 func (r *RangeReader) Read(p []byte) (int, error) {
-	if r.sr != nil {
-		return r.sr.Read(p)
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	return 0, io.EOF
+	return r.sr.Read(p)
 }
 
-// Len returns the number of plaintext bytes this reader will emit: the requested
-// length clamped to the bytes available from the offset. It is fixed at
-// construction, so an HTTP consumer can use it as the response Content-Length
-// before reading anything.
+// Len returns the number of plaintext bytes this reader will emit: the
+// requested range's length after end is clamped to the last plaintext byte.
+// It is fixed at construction, so an HTTP consumer can use it as the response
+// Content-Length before reading anything.
 func (r *RangeReader) Len() int64 { return r.len }
 
 // Size returns the total plaintext size of the whole object, derived from the
@@ -84,20 +78,19 @@ func (r *RangeReader) Len() int64 { return r.len }
 // same number from cached descriptor data, without a reader.
 func (r *RangeReader) Size() int64 { return r.size }
 
-// CiphertextSpan returns the blob-absolute byte range [off, off+n) that Read will
-// consume — the envelope header length plus the chunk-aligned ciphertext span the
-// requested range overlaps. n is 0 for an empty range, in which case no
-// ciphertext is read at all.
+// CiphertextSpan returns the blob-absolute, inclusive byte range [start, end]
+// that Read will consume — the envelope header length plus the chunk-aligned
+// ciphertext span the requested range overlaps.
 //
 // Because no ciphertext is read until the first Read, a caller backed by a remote
 // store can construct the reader, fetch exactly this span in a single range
 // request, and serve the reads from that buffer rather than letting each chunk
 // become its own request.
-func (r *RangeReader) CiphertextSpan() (off, n int64) { return r.spanOff, r.spanLen }
+func (r *RangeReader) CiphertextSpan() (start, end int64) { return r.spanStart, r.spanEnd }
 
-// DecryptRange decrypts the plaintext byte range [off, off+length) of a FEE blob
-// (envelope||ciphertext, as produced by [Encrypt]) without fetching or decrypting
-// the whole object.
+// DecryptRange decrypts the inclusive plaintext byte range [start, end] of a FEE
+// blob (envelope||ciphertext, as produced by [Encrypt]) without fetching or
+// decrypting the whole object.
 //
 // blob is random access over the stored bytes and blobSize is their exact total
 // length, as the store reports it. The STREAM geometry — chunk boundaries, which
@@ -116,14 +109,15 @@ func (r *RangeReader) CiphertextSpan() (off, n int64) { return r.spanOff, r.span
 // [ErrNoMatchingRecipient] without attempting an unwrap, and a matched recipient
 // whose wrapped CEK cannot be recovered returns the unwrap error.
 //
-// length is clamped to the bytes available from off — [RangeReader.Len] reports
-// what will actually be emitted, so an open-ended HTTP range can pass
-// math.MaxInt64. off may equal the plaintext size (an empty range), but a larger
-// off, or a negative off or length, fails with an error matching
-// [aesstream.ErrRange] (an HTTP consumer's 416). A blobSize that cannot be a FEE
-// blob fails with [aesstream.ErrCiphertextSize], and one that contradicts the
-// envelope's declared chunk count with [ErrSizeMismatch]. An envelope larger than
-// 1 MiB is rejected as malformed.
+// start/end follow HTTP Range semantics: both inclusive, and an end past the
+// last plaintext byte clamps — [RangeReader.Len] reports what will actually be
+// emitted, so an open-ended HTTP range ("bytes=N-") can pass math.MaxInt64. An
+// unsatisfiable range — a negative start, an end before the start, or a start
+// past the last plaintext byte — fails with an error matching
+// [aesstream.ErrRange] (an HTTP consumer's 416); there is no empty range. A
+// blobSize that cannot be a FEE blob fails with [aesstream.ErrCiphertextSize],
+// and one that contradicts the envelope's declared chunk count with
+// [ErrSizeMismatch]. An envelope larger than 1 MiB is rejected as malformed.
 //
 // Every chunk the range overlaps is authenticated, so a tampered chunk surfaces
 // as an error from Read rather than as corrupt plaintext. Chunks outside the range
@@ -135,7 +129,7 @@ func (r *RangeReader) CiphertextSpan() (off, n int64) { return r.spanOff, r.span
 // accounts for the same number of chunks and so passes it, surfacing instead as
 // an authentication failure when that chunk is read. Whole-object integrity is
 // properly the job of the layer that supplied blobSize.
-func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, off, length int64) (*RangeReader, error) {
+func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, start, end int64) (*RangeReader, error) {
 	if unwrap == nil {
 		return nil, ErrNilUnwrapper
 	}
@@ -159,7 +153,7 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, o
 	// the body cipher (synchronously, before it returns).
 	defer zero(cek)
 
-	return newRangeReader(env, blob, blobSize, headerLen, cek, off, length)
+	return newRangeReader(env, blob, blobSize, headerLen, cek, start, end)
 }
 
 // DecryptRangeWithCEK is [DecryptRange] with a caller-provided content-encryption
@@ -184,7 +178,7 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, o
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.
-func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, length int64, desc *BodyDescriptor) (*RangeReader, error) {
+func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, start, end int64, desc *BodyDescriptor) (*RangeReader, error) {
 	if blob == nil {
 		return nil, errNilBlob
 	}
@@ -201,21 +195,21 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, off, leng
 		if err != nil {
 			return nil, err
 		}
-		return spanRangeReader(blob, blobSize, d.HeaderLen, d.bodyParams(), d.aad(), plainSize, cek, off, length)
+		return spanRangeReader(blob, blobSize, d.HeaderLen, d.bodyParams(), d.aad(), plainSize, cek, start, end)
 	}
 
 	env, headerLen, err := decodeHeaderAt(blob, blobSize)
 	if err != nil {
 		return nil, err
 	}
-	return newRangeReader(env, blob, blobSize, headerLen, cek, off, length)
+	return newRangeReader(env, blob, blobSize, headerLen, cek, start, end)
 }
 
 // PlaintextSize reports the total decrypted size of a FEE blob from its envelope
 // header and blobSize alone. It reads only the header — no ciphertext — and needs
 // no key material, so it answers a HEAD request, fills in the total of a
-// Content-Range header, or resolves a suffix range ("bytes=-N" is off = size-N)
-// without constructing a decryptor.
+// Content-Range header, or resolves a suffix range ("bytes=-N" is
+// start = size-N) without constructing a decryptor.
 //
 // It reports the same envelope, size and chunk-count errors as [DecryptRange].
 func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
@@ -240,7 +234,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 // internalizes the CEK (into a GCM AEAD) synchronously, so a caller may wipe cek
 // as soon as this returns — even though the reader decrypts lazily on later
 // reads, which work from the internalized key, never the cek slice.
-func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen int64, cek []byte, off, length int64) (*RangeReader, error) {
+func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen int64, cek []byte, start, end int64) (*RangeReader, error) {
 	body, aad, err := buildBodyParamsWithAAD(env)
 	if err != nil {
 		return nil, err
@@ -250,7 +244,7 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 	if err != nil {
 		return nil, err
 	}
-	return spanRangeReader(blob, blobSize, headerLen, body, aad, plainSize, cek, off, length)
+	return spanRangeReader(blob, blobSize, headerLen, body, aad, plainSize, cek, start, end)
 }
 
 // spanRangeReader is the geometry-and-wiring tail shared by the envelope-backed
@@ -263,33 +257,25 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 // decoded from the envelope, or supplied from a caller's cache — so keeping the
 // wiring in one place is what makes them accept the same ranges and fail the
 // same way.
-func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParams, aad []byte, plainSize int64, cek []byte, off, length int64) (*RangeReader, error) {
+func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParams, aad []byte, plainSize int64, cek []byte, start, end int64) (*RangeReader, error) {
 	ciphertextSize := blobSize - headerLen
 
-	start, n, plainLen, err := aesstream.CiphertextRange(ciphertextSize, body.chunkSize, off, length)
+	ctStart, ctEnd, plainLen, err := aesstream.CiphertextRange(ciphertextSize, body.chunkSize, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("fee: resolving ciphertext range: %w", err)
-	}
-	if n == 0 {
-		return &RangeReader{
-			len:     plainLen,
-			size:    plainSize,
-			spanOff: headerLen + start,
-			spanLen: n,
-		}, nil
 	}
 
 	// The span is chunk-aligned and contiguous, so the section reader hands
 	// aesstream exactly the bytes it will ask for and nothing else.
 	sr, err := aesstream.NewSpanReader(
-		io.NewSectionReader(blob, headerLen+start, n),
+		io.NewSectionReader(blob, headerLen+ctStart, ctEnd-ctStart+1),
 		body.streamConfig(cek, aad),
-		ciphertextSize, off, length)
+		ciphertextSize, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
 
-	return &RangeReader{sr: sr, len: plainLen, size: plainSize, spanOff: headerLen + start, spanLen: n}, nil
+	return &RangeReader{sr: sr, len: plainLen, size: plainSize, spanStart: headerLen + ctStart, spanEnd: headerLen + ctEnd}, nil
 }
 
 // envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came

@@ -255,9 +255,11 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 
 Because chunks are sealed independently, any plaintext byte range can be
 decrypted without fetching or decrypting the rest of the object.
-`fee.DecryptRange` takes the stored blob as an `io.ReaderAt` plus its exact size,
-unwraps the CEK just as `fee.Decrypt` does, and returns a reader over exactly the
-requested bytes:
+`fee.DecryptRange` takes the stored blob as an `io.ReaderAt` plus its exact
+size and the inclusive plaintext range `[start, end]` — HTTP `Range` semantics,
+where an `end` past the last byte clamps and an unsatisfiable range is
+`aesstream.ErrRange` — unwraps the CEK just as `fee.Decrypt` does, and returns
+a reader over exactly the requested bytes:
 
 ```go
 import (
@@ -271,21 +273,16 @@ import (
 )
 
 // serveRange answers an HTTP range request straight from an encrypted object.
-func serveRange(w http.ResponseWriter, f *os.File, size int64, u fee.RecipientUnwrapper, off, length int64) error {
-    r, err := fee.DecryptRange(f, size, u, off, length)
+func serveRange(w http.ResponseWriter, f *os.File, size int64, u fee.RecipientUnwrapper, start, end int64) error {
+    r, err := fee.DecryptRange(f, size, u, start, end)
     if err != nil {
         return err // aesstream.ErrRange here means a 416
     }
 
-    // Len is the requested length clamped to the object; Size is the whole
+    // Len is the range length after end clamps to the object; Size is the whole
     // object's plaintext size. Both are known before any ciphertext is read.
-    if r.Len() == 0 {
-        w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", r.Size()))
-        w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-        return nil
-    }
     w.Header().Set("Content-Length", strconv.FormatInt(r.Len(), 10))
-    w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+r.Len()-1, r.Size()))
+    w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+r.Len()-1, r.Size()))
     w.WriteHeader(http.StatusPartialContent)
 
     _, err = io.Copy(w, r) // decrypts chunk by chunk, O(chunk size) memory
@@ -302,9 +299,9 @@ Nothing beyond the header is fetched until the first `Read`, so a caller backed
 by a remote store can prefetch the whole span in a single range request:
 
 ```go
-r, err := fee.DecryptRange(blob, size, unwrapper, off, length)
+r, err := fee.DecryptRange(blob, size, unwrapper, start, end)
 // ...
-spanOff, spanLen := r.CiphertextSpan() // blob-absolute; one range request
+spanStart, spanEnd := r.CiphertextSpan() // blob-absolute, inclusive; one range request
 ```
 
 The span is chunk-aligned, so it over-fetches by at most the unused head of the
@@ -331,7 +328,7 @@ the upload is still streaming:
 r, d, err := fee.Encrypt(plaintext, recipients)
 ```
 
-`fee.DecryptRangeWithCEK(blob, blobSize, cek, off, length, &d)` then serves a
+`fee.DecryptRangeWithCEK(blob, blobSize, cek, start, end, &d)` then serves a
 range with no envelope round trip at all: the only bytes fetched are the
 ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a
 `HEAD` or resolves a suffix range from the stored record alone, reading

@@ -72,17 +72,18 @@ func ExampleDecryptRangeWithCEK_withBodyDescriptor() {
 		blobSize   int64
 	}{descriptor, int64(len(blob))}
 
-	// Serving a range later. Nothing here decodes the envelope — the reader is
-	// built from the stored row, so the only bytes fetched are ciphertext.
+	// Serving the inclusive range bytes 4-18 later. Nothing here decodes the
+	// envelope — the reader is built from the stored row, so the only bytes
+	// fetched are ciphertext.
 	src := &countingBlob{blob: bytes.NewReader(blob), headerLen: row.descriptor.HeaderLen}
-	const off, length = 4, 15
-	r, err := fee.DecryptRangeWithCEK(src, row.blobSize, cek, off, length, &row.descriptor)
+	const start, end = 4, 18
+	r, err := fee.DecryptRangeWithCEK(src, row.blobSize, cek, start, end, &row.descriptor)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	fmt.Printf("Content-Length: %d\n", r.Len())
-	fmt.Printf("Content-Range: bytes %d-%d/%d\n", off, off+r.Len()-1, r.Size())
+	fmt.Printf("Content-Range: bytes %d-%d/%d\n", start, start+r.Len()-1, r.Size())
 
 	got, err := io.ReadAll(r)
 	if err != nil {

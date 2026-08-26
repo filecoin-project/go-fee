@@ -155,11 +155,11 @@ func hexBytes(t *testing.T, s string) []byte {
 	return b
 }
 
-// clampLen is the plaintext length a range request of [off, off+length) actually
-// yields from a size-byte object: length clamped to what is left from off. The
-// subtraction comes first, so an open-ended math.MaxInt64 length cannot overflow.
-func clampLen(size, off, length int64) int64 {
-	return min(length, size-off)
+// clampLen is the plaintext length an inclusive range request [start, end]
+// actually yields from a size-byte object: end clamps to the last byte, so an
+// open-ended math.MaxInt64 end cannot overflow the length.
+func clampLen(size, start, end int64) int64 {
+	return min(end, size-1) - start + 1
 }
 
 // headerLenOf reports the encoded envelope length of a blob holding size
@@ -169,11 +169,11 @@ func headerLenOf(blob []byte, size int64) int64 {
 	return int64(len(blob)) - aesstream.EncryptedSize(size, rangeChunk)
 }
 
-// decryptRange range-decrypts [off, off+length) from blob and returns the reader
-// alongside the bytes it emitted, asserting a clean stream.
-func decryptRange(t *testing.T, blob []byte, u fee.RecipientUnwrapper, off, length int64) (*fee.RangeReader, []byte) {
+// decryptRange range-decrypts the inclusive range [start, end] from blob and
+// returns the reader alongside the bytes it emitted, asserting a clean stream.
+func decryptRange(t *testing.T, blob []byte, u fee.RecipientUnwrapper, start, end int64) (*fee.RangeReader, []byte) {
 	t.Helper()
-	r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, off, length)
+	r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, start, end)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
@@ -204,32 +204,32 @@ func testRangeRoundTrip(t *testing.T, size int64) {
 	f := newRangeFixture(t, int(size), fee.WithContentLength(size))
 
 	cases := []struct {
-		name        string
-		off, length int64
+		name       string
+		start, end int64
 	}{
-		{"whole object", 0, size},
-		{"first byte", 0, 1},
-		{"last byte", size - 1, 1},
-		{"within first chunk", 100, 500},
-		{"within middle chunk", rangeChunk + 7, 1000},
-		{"across one boundary", rangeChunk - 10, 20},
-		{"across two boundaries", rangeChunk - 10, 2*rangeChunk + 20},
-		{"exactly one aligned chunk", rangeChunk, rangeChunk},
-		{"aligned start, unaligned end", 2 * rangeChunk, rangeChunk + 5},
-		{"from the last chunk's start", 3 * rangeChunk, rangeChunk / 2},
-		{"into final chunk", 3*rangeChunk - 5, 100},
-		{"ends exactly on boundary", rangeChunk / 2, rangeChunk / 2},
-		{"length past end clamps", size - 10, 1000},
+		{"whole object", 0, size - 1},
+		{"first byte", 0, 0},
+		{"last byte", size - 1, size - 1},
+		{"within first chunk", 100, 599},
+		{"within middle chunk", rangeChunk + 7, rangeChunk + 1006},
+		{"across one boundary", rangeChunk - 10, rangeChunk + 9},
+		{"across two boundaries", rangeChunk - 10, 3*rangeChunk + 9},
+		{"exactly one aligned chunk", rangeChunk, 2*rangeChunk - 1},
+		{"aligned start, unaligned end", 2 * rangeChunk, 3*rangeChunk + 4},
+		{"from the last chunk's start", 3 * rangeChunk, 3*rangeChunk + rangeChunk/2 - 1},
+		{"into final chunk", 3*rangeChunk - 5, 3*rangeChunk + 94},
+		{"ends exactly on boundary", rangeChunk / 2, rangeChunk - 1},
+		{"end past last byte clamps", size - 10, size + 989},
 		{"open-ended range clamps", rangeChunk, math.MaxInt64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, got := decryptRange(t, f.blob, f.unwrapper, tc.off, tc.length)
+			r, got := decryptRange(t, f.blob, f.unwrapper, tc.start, tc.end)
 
-			wantLen := clampLen(size, tc.off, tc.length)
+			wantLen := clampLen(size, tc.start, tc.end)
 			require.Equal(t, wantLen, r.Len(), "Len is the clamped range length")
 			require.Equal(t, size, r.Size(), "Size is the whole object")
-			require.Equal(t, f.plaintext[tc.off:tc.off+wantLen], got)
+			require.Equal(t, f.plaintext[tc.start:tc.start+wantLen], got)
 		})
 	}
 }
@@ -244,9 +244,9 @@ func TestDecryptRangeA256KW(t *testing.T) {
 	}, fee.WithChunkSize(rangeChunk))
 	require.NoError(t, err)
 
-	off, length := int64(rangeChunk-50), int64(200)
-	_, got := decryptRange(t, blob, fee.NewA256KWUnwrapper(a256kwKID, kek), off, length)
-	require.Equal(t, plaintext[off:off+length], got)
+	start, end := int64(rangeChunk-50), int64(rangeChunk+149)
+	_, got := decryptRange(t, blob, fee.NewA256KWUnwrapper(a256kwKID, kek), start, end)
+	require.Equal(t, plaintext[start:end+1], got)
 }
 
 // TestDecryptRangeMixedRecipients confirms the range path picks the recipient
@@ -262,14 +262,14 @@ func TestDecryptRangeMixedRecipients(t *testing.T) {
 	}, fee.WithChunkSize(rangeChunk))
 	require.NoError(t, err)
 
-	off, length := int64(rangeChunk+11), int64(300)
+	start, end := int64(rangeChunk+11), int64(rangeChunk+310)
 	for name, u := range map[string]fee.RecipientUnwrapper{
 		"ecdh-es": fee.NewECDHESUnwrapper(ecdhKID, priv),
 		"a256kw":  fee.NewA256KWUnwrapper(a256kwKID, kek),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, got := decryptRange(t, blob, u, off, length)
-			require.Equal(t, plaintext[off:off+length], got)
+			_, got := decryptRange(t, blob, u, start, end)
+			require.Equal(t, plaintext[start:end+1], got)
 		})
 	}
 }
@@ -280,7 +280,7 @@ func TestDecryptRangeMixedRecipients(t *testing.T) {
 func TestDecryptRangeWithCEK(t *testing.T) {
 	cek := newCEK(t)
 	plaintext := patternBytes(2*rangeChunk + 77)
-	off, length := int64(rangeChunk-20), int64(500)
+	start, end := int64(rangeChunk-20), int64(rangeChunk+479)
 
 	t.Run("tag 96 with recipients", func(t *testing.T) {
 		blob, err := encryptWithCEK(t, plaintext, cek, []fee.Recipient{
@@ -288,11 +288,11 @@ func TestDecryptRangeWithCEK(t *testing.T) {
 		}, fee.WithChunkSize(rangeChunk))
 		require.NoError(t, err)
 
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length, nil)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, start, end, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
-		require.Equal(t, plaintext[off:off+length], got)
+		require.Equal(t, plaintext[start:end+1], got)
 	})
 
 	t.Run("recipient-less tag 16", func(t *testing.T) {
@@ -302,11 +302,11 @@ func TestDecryptRangeWithCEK(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, cose.TagCOSEEncrypt0, tag)
 
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, length, nil)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, start, end, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
-		require.Equal(t, plaintext[off:off+length], got)
+		require.Equal(t, plaintext[start:end+1], got)
 		require.Equal(t, int64(len(plaintext)), r.Size())
 	})
 }
@@ -322,13 +322,14 @@ func TestDecryptRangeReadsOnlySpan(t *testing.T) {
 
 	// A range wholly inside chunk 4 of 8, so there are untouched chunks on both
 	// sides and the span is a small fraction of the blob.
-	off, length := int64(4*rangeChunk+10), int64(100)
+	start, end := int64(4*rangeChunk+10), int64(4*rangeChunk+109)
 
 	rec := newRecordingReaderAt(t, f.blob)
-	r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, off, length)
+	r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, start, end)
 	require.NoError(t, err)
 
-	spanOff, spanLen := r.CiphertextSpan()
+	spanStart, spanEnd := r.CiphertextSpan()
+	spanLen := spanEnd - spanStart + 1
 	headerReads := slices.Clone(rec.reads)
 	require.NotEmpty(t, headerReads, "the header must be read at construction")
 	for _, rd := range headerReads {
@@ -338,7 +339,7 @@ func TestDecryptRangeReadsOnlySpan(t *testing.T) {
 
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, f.plaintext[off:off+length], got)
+	require.Equal(t, f.plaintext[start:end+1], got)
 
 	// Exactly the reported span was fetched: one chunk's worth, no more.
 	require.Equal(t, int64(rangeChunk+aesstream.TagSize), spanLen, "one full ciphertext chunk")
@@ -350,42 +351,35 @@ func TestDecryptRangeReadsOnlySpan(t *testing.T) {
 		if rd.off == 0 {
 			continue // header probe
 		}
-		require.GreaterOrEqual(t, rd.off, spanOff, "read before the span start")
-		require.LessOrEqual(t, rd.off+rd.n, spanOff+spanLen, "read past the span end")
+		require.GreaterOrEqual(t, rd.off, spanStart, "read before the span start")
+		require.LessOrEqual(t, rd.off+rd.n-1, spanEnd, "read past the span end")
 		fetched += rd.n
 	}
 	require.Equal(t, spanLen, fetched, "the span is fetched exactly once, in full")
 }
 
-// TestDecryptRangeZeroLengthReadsNoCiphertext confirms an empty range is valid,
-// reports the object size, and fetches no ciphertext at all — the cheap way for a
-// caller to learn a size while holding unwrap material.
-func TestDecryptRangeZeroLengthReadsNoCiphertext(t *testing.T) {
+// TestDecryptRangeNoEmptyRange pins that there is no empty range: an end before
+// the start, or a start at or past the object's end, is rejected with
+// aesstream.ErrRange at construction — after only the header read, with no
+// ciphertext ever fetched.
+func TestDecryptRangeNoEmptyRange(t *testing.T) {
 	const size = 4 * rangeChunk
 	f := newRangeFixture(t, size)
 
 	for _, tc := range []struct {
-		name        string
-		off, length int64
+		name       string
+		start, end int64
 	}{
-		{"length zero at start", 0, 0},
-		{"length zero in the middle", rangeChunk + 1, 0},
-		{"length zero at end", size, 0},
-		{"length clamps to zero at end", size, 100},
+		{"end before start at the beginning", 0, -1},
+		{"end before start in the middle", rangeChunk + 1, rangeChunk},
+		{"start at the object's end", size, size},
+		{"start past the object's end", size, size + 99},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := newRecordingReaderAt(t, f.blob)
-			r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, tc.off, tc.length)
-			require.NoError(t, err)
-
-			_, spanLen := r.CiphertextSpan()
-			require.Zero(t, spanLen, "an empty range needs no ciphertext")
-			require.Zero(t, r.Len())
-			require.Equal(t, int64(size), r.Size())
-
-			got, err := io.ReadAll(r)
-			require.NoError(t, err)
-			require.Empty(t, got)
+			r, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, tc.start, tc.end)
+			require.ErrorIs(t, err, aesstream.ErrRange)
+			require.Nil(t, r)
 
 			for _, rd := range rec.reads {
 				require.Equal(t, int64(0), rd.off, "only the header prefix is read")
@@ -401,27 +395,27 @@ func TestDecryptRangeZeroLengthReadsNoCiphertext(t *testing.T) {
 func TestDecryptRangePrefetchSpan(t *testing.T) {
 	const size = 6 * rangeChunk
 	f := newRangeFixture(t, size)
-	off, length := int64(2*rangeChunk+5), int64(2*rangeChunk)
+	start, end := int64(2*rangeChunk+5), int64(4*rangeChunk+4)
 
 	rec := newRecordingReaderAt(t, f.blob)
-	plan, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, off, length)
+	plan, err := fee.DecryptRange(rec, int64(len(f.blob)), f.unwrapper, start, end)
 	require.NoError(t, err)
-	spanOff, spanLen := plan.CiphertextSpan()
+	spanStart, spanEnd := plan.CiphertextSpan()
 
 	// One "range request" for the whole span.
-	span := make([]byte, spanLen)
-	_, err = rec.ReadAt(span, spanOff)
+	span := make([]byte, spanEnd-spanStart+1)
+	_, err = rec.ReadAt(span, spanStart)
 	require.NoError(t, err)
 
 	// Re-decrypt against a blob view backed by the prefetched span, and prove the
 	// origin serves nothing further.
 	rec.reject = true
-	r, err := fee.DecryptRange(newPrefetchedBlob(f.blob[:spanOff], span, spanOff),
-		int64(len(f.blob)), f.unwrapper, off, length)
+	r, err := fee.DecryptRange(newPrefetchedBlob(f.blob[:spanStart], span, spanStart),
+		int64(len(f.blob)), f.unwrapper, start, end)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, f.plaintext[off:off+length], got)
+	require.Equal(t, f.plaintext[start:end+1], got)
 }
 
 // prefetchedBlob is an io.ReaderAt that serves the envelope header from one buffer
@@ -450,7 +444,7 @@ func (b prefetchedBlob) ReadAt(p []byte, off int64) (int, error) {
 func TestDecryptRangeTamperedChunkInRange(t *testing.T) {
 	const size = 3 * rangeChunk
 	f := newRangeFixture(t, size)
-	off, length := int64(rangeChunk+10), int64(50)
+	start, end := int64(rangeChunk+10), int64(rangeChunk+59)
 
 	headerLen := headerLenOf(f.blob, size)
 	// Positions inside chunk 1's ciphertext: its first byte, a byte covering the
@@ -464,12 +458,12 @@ func TestDecryptRangeTamperedChunkInRange(t *testing.T) {
 		tampered := bytes.Clone(f.blob)
 		tampered[pos] ^= 0x01
 
-		r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, off, length)
+		r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, start, end)
 		require.NoError(t, err, "construction only reads the header, so it still succeeds")
 		got, err := io.ReadAll(r)
 		require.Error(t, err, "a tampered chunk must not decrypt")
 		require.ErrorIs(t, err, aesstream.ErrCorrupted)
-		require.NotEqual(t, f.plaintext[off:off+length], got, "no corrupt plaintext is returned")
+		require.NotEqual(t, f.plaintext[start:end+1], got, "no corrupt plaintext is returned")
 	}
 }
 
@@ -480,17 +474,17 @@ func TestDecryptRangeTamperedChunkInRange(t *testing.T) {
 func TestDecryptRangeTamperOutsideRange(t *testing.T) {
 	const size = 4 * rangeChunk
 	f := newRangeFixture(t, size)
-	off, length := int64(10), int64(100) // wholly inside chunk 0
+	start, end := int64(10), int64(109) // wholly inside chunk 0
 
 	headerLen := headerLenOf(f.blob, size)
 	tampered := bytes.Clone(f.blob)
 	tampered[headerLen+int64(3*(rangeChunk+aesstream.TagSize))+5] ^= 0x01 // chunk 3
 
-	r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, off, length)
+	r, err := fee.DecryptRange(bytes.NewReader(tampered), int64(len(tampered)), f.unwrapper, start, end)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, f.plaintext[off:off+length], got)
+	require.Equal(t, f.plaintext[start:end+1], got)
 
 	// The same blob fails a whole-object decrypt, which does see chunk 3.
 	full, err := fee.Decrypt(bytes.NewReader(tampered), f.unwrapper)
@@ -511,7 +505,7 @@ func TestDecryptRangeKidMismatch(t *testing.T) {
 			[]byte("did:example:custody#absent"), newKEK(t)),
 	} {
 		t.Run(name, func(t *testing.T) {
-			r, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), u, 0, 100)
+			r, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), u, 0, 99)
 			require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
 			require.Nil(t, r)
 		})
@@ -525,7 +519,7 @@ func TestDecryptRangeWrongKey(t *testing.T) {
 	t.Run("ecdh-es", func(t *testing.T) {
 		f := newRangeFixture(t, 2*rangeChunk)
 		wrong := fee.NewECDHESUnwrapper(ecdhKID, newX25519Key(t))
-		r, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), wrong, 0, 100)
+		r, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), wrong, 0, 99)
 		require.Error(t, err)
 		require.Nil(t, r)
 	})
@@ -538,7 +532,7 @@ func TestDecryptRangeWrongKey(t *testing.T) {
 		require.NoError(t, err)
 
 		wrong := fee.NewA256KWUnwrapper(a256kwKID, newKEK(t))
-		r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), wrong, 0, 100)
+		r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), wrong, 0, 99)
 		require.Error(t, err)
 		require.Nil(t, r)
 	})
@@ -552,7 +546,7 @@ func TestDecryptRangeEncrypt0NeedsCEK(t *testing.T) {
 	require.NoError(t, err)
 
 	r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)),
-		fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)), 0, 100)
+		fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)), 0, 99)
 	require.ErrorIs(t, err, fee.ErrNoRecipientsInEnvelope)
 	require.Nil(t, r)
 }
@@ -564,24 +558,24 @@ func TestDecryptRangeInvalidArgs(t *testing.T) {
 	size := int64(len(f.blob))
 
 	t.Run("nil blob", func(t *testing.T) {
-		_, err := fee.DecryptRange(nil, size, f.unwrapper, 0, 10)
+		_, err := fee.DecryptRange(nil, size, f.unwrapper, 0, 9)
 		require.Error(t, err)
-		_, err = fee.DecryptRangeWithCEK(nil, size, newCEK(t), 0, 10, nil)
+		_, err = fee.DecryptRangeWithCEK(nil, size, newCEK(t), 0, 9, nil)
 		require.Error(t, err)
 	})
 
 	t.Run("nil unwrapper", func(t *testing.T) {
-		_, err := fee.DecryptRange(bytes.NewReader(f.blob), size, nil, 0, 10)
+		_, err := fee.DecryptRange(bytes.NewReader(f.blob), size, nil, 0, 9)
 		require.ErrorIs(t, err, fee.ErrNilUnwrapper)
 	})
 
 	t.Run("cek wrong length", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(f.blob), size, make([]byte, 16), 0, 10, nil)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(f.blob), size, make([]byte, 16), 0, 9, nil)
 		require.ErrorIs(t, err, fee.ErrInvalidCEK)
 	})
 
 	t.Run("negative blob size", func(t *testing.T) {
-		_, err := fee.DecryptRange(bytes.NewReader(f.blob), -1, f.unwrapper, 0, 10)
+		_, err := fee.DecryptRange(bytes.NewReader(f.blob), -1, f.unwrapper, 0, 9)
 		require.Error(t, err)
 		_, err = fee.PlaintextSize(bytes.NewReader(f.blob), -1)
 		require.Error(t, err)
@@ -589,36 +583,29 @@ func TestDecryptRangeInvalidArgs(t *testing.T) {
 }
 
 // TestDecryptRangeBounds pins the out-of-bounds and clamping semantics an HTTP
-// range consumer depends on: a bad range is reported as aesstream.ErrRange (a
-// 416), an offset at the end is a legal empty read, and an overlong length clamps.
+// range consumer depends on: an unsatisfiable range — a negative start, an end
+// before the start, or a start at or past the object's end — is reported as
+// aesstream.ErrRange (a 416), and an end past the last byte clamps.
 func TestDecryptRangeBounds(t *testing.T) {
 	const size = 2*rangeChunk + 10
 	f := newRangeFixture(t, size)
 	blobSize := int64(len(f.blob))
 
 	t.Run("rejected", func(t *testing.T) {
-		for name, rg := range map[string]struct{ off, length int64 }{
-			"negative offset": {-1, 10},
-			"negative length": {0, -1},
-			"offset past end": {size + 1, 10},
+		for name, rg := range map[string]struct{ start, end int64 }{
+			"negative start":   {-1, 8},
+			"end before start": {10, 9},
+			"start at end":     {size, size + 99},
+			"start past end":   {size + 1, size + 10},
 		} {
 			t.Run(name, func(t *testing.T) {
-				_, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize, f.unwrapper, rg.off, rg.length)
+				_, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize, f.unwrapper, rg.start, rg.end)
 				require.ErrorIs(t, err, aesstream.ErrRange)
 			})
 		}
 	})
 
-	t.Run("offset at end is empty", func(t *testing.T) {
-		for _, length := range []int64{0, 100} {
-			r, got := decryptRange(t, f.blob, f.unwrapper, size, length)
-			require.Zero(t, r.Len())
-			require.Empty(t, got)
-			require.Equal(t, int64(size), r.Size())
-		}
-	})
-
-	t.Run("length clamps to the end", func(t *testing.T) {
+	t.Run("end clamps to the last byte", func(t *testing.T) {
 		r, got := decryptRange(t, f.blob, f.unwrapper, size-5, math.MaxInt64)
 		require.Equal(t, int64(5), r.Len())
 		require.Equal(t, f.plaintext[size-5:], got)
@@ -626,33 +613,33 @@ func TestDecryptRangeBounds(t *testing.T) {
 }
 
 // TestDecryptRangeGeometryCorners covers the object sizes whose chunk geometry is
-// degenerate: an empty plaintext (a single empty final chunk) and an object of
-// exactly one full chunk.
+// degenerate: an empty plaintext (a single empty final chunk, with no byte any
+// range could address) and an object of exactly one full chunk.
 func TestDecryptRangeGeometryCorners(t *testing.T) {
 	t.Run("empty plaintext", func(t *testing.T) {
 		f := newRangeFixture(t, 0)
-		r, got := decryptRange(t, f.blob, f.unwrapper, 0, 100)
-		require.Zero(t, r.Len())
-		require.Zero(t, r.Size())
-		require.Empty(t, got)
+		// An empty object has no addressable byte, so every range is out of
+		// bounds; its size is still available via PlaintextSize.
+		_, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), f.unwrapper, 0, 0)
+		require.ErrorIs(t, err, aesstream.ErrRange)
 
-		_, err := fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), f.unwrapper, 1, 1)
+		_, err = fee.DecryptRange(bytes.NewReader(f.blob), int64(len(f.blob)), f.unwrapper, 1, 1)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
 
 	t.Run("exactly one chunk", func(t *testing.T) {
 		f := newRangeFixture(t, rangeChunk)
-		r, got := decryptRange(t, f.blob, f.unwrapper, 0, rangeChunk)
+		r, got := decryptRange(t, f.blob, f.unwrapper, 0, rangeChunk-1)
 		require.Equal(t, int64(rangeChunk), r.Size())
 		require.Equal(t, f.plaintext, got)
 
-		_, tail := decryptRange(t, f.blob, f.unwrapper, rangeChunk-1, 1)
+		_, tail := decryptRange(t, f.blob, f.unwrapper, rangeChunk-1, rangeChunk-1)
 		require.Equal(t, f.plaintext[rangeChunk-1:], tail)
 	})
 
 	t.Run("one byte over a chunk", func(t *testing.T) {
 		f := newRangeFixture(t, rangeChunk+1)
-		_, got := decryptRange(t, f.blob, f.unwrapper, rangeChunk, 1)
+		_, got := decryptRange(t, f.blob, f.unwrapper, rangeChunk, rangeChunk)
 		require.Equal(t, f.plaintext[rangeChunk:], got)
 	})
 }
@@ -671,7 +658,7 @@ func TestDecryptRangeChunkCountMismatch(t *testing.T) {
 		"one chunk long":  blobSize + encChunk,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := fee.DecryptRange(bytes.NewReader(f.blob), claimed, f.unwrapper, 0, 100)
+			_, err := fee.DecryptRange(bytes.NewReader(f.blob), claimed, f.unwrapper, 0, 99)
 			require.ErrorIs(t, err, fee.ErrSizeMismatch)
 
 			_, err = fee.PlaintextSize(bytes.NewReader(f.blob), claimed)
@@ -680,7 +667,7 @@ func TestDecryptRangeChunkCountMismatch(t *testing.T) {
 	}
 
 	t.Run("correct size still works", func(t *testing.T) {
-		_, got := decryptRange(t, f.blob, f.unwrapper, rangeChunk, 100)
+		_, got := decryptRange(t, f.blob, f.unwrapper, rangeChunk, rangeChunk+99)
 		require.Equal(t, f.plaintext[rangeChunk:rangeChunk+100], got)
 	})
 }
@@ -711,17 +698,17 @@ func TestDecryptRangeTrailingEmptyFinalChunk(t *testing.T) {
 	})
 
 	t.Run("range across the last full chunk", func(t *testing.T) {
-		off, length := int64(2*rangeChunk-10), int64(20)
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, off, length, nil)
+		start, end := int64(2*rangeChunk-10), int64(2*rangeChunk+9)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, start, end, nil)
 		require.NoError(t, err)
 		require.Equal(t, int64(size), r.Size())
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
-		require.Equal(t, plaintext[off:off+length], got)
+		require.Equal(t, plaintext[start:end+1], got)
 	})
 
 	t.Run("whole object as one range", func(t *testing.T) {
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, 0, size, nil)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, 0, size-1, nil)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.NoError(t, err)
@@ -743,7 +730,7 @@ func TestDecryptRangeWrongBlobSizeNoChunkCount(t *testing.T) {
 		// at the claimed end either runs off the end of the blob or reads a chunk
 		// under the wrong index and last-chunk flag. Either way it fails rather
 		// than emitting plaintext.
-		r, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize+encChunk, f.unwrapper, size-10, 100)
+		r, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize+encChunk, f.unwrapper, size-10, size+89)
 		require.NoError(t, err)
 		got, err := io.ReadAll(r)
 		require.Error(t, err)
@@ -756,7 +743,7 @@ func TestDecryptRangeWrongBlobSizeNoChunkCount(t *testing.T) {
 		// One chunk short: chunk 2 is now believed final, so its nonce carries
 		// the last-chunk flag and authentication fails.
 		r, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize-encChunk, f.unwrapper,
-			int64(2*rangeChunk), 100)
+			int64(2*rangeChunk), int64(2*rangeChunk+99))
 		require.NoError(t, err)
 		_, err = io.ReadAll(r)
 		require.ErrorIs(t, err, aesstream.ErrCorrupted)
@@ -772,7 +759,7 @@ func TestDecryptRangeInvalidBlobSize(t *testing.T) {
 	// A blob claiming fewer bytes than the envelope plus one tag leaves a
 	// ciphertext too short to be a stream.
 	_, err := fee.DecryptRange(bytes.NewReader(f.blob), blobSize-int64(rangeChunk)-aesstream.TagSize,
-		f.unwrapper, 0, 10)
+		f.unwrapper, 0, 9)
 	require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
 }
 
@@ -793,7 +780,7 @@ func TestDecryptRangeMalformedBlob(t *testing.T) {
 		"not a cose tag": {[]byte{0x01, 0x02, 0x03}, cose.ErrNotEncrypt},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := fee.DecryptRange(bytes.NewReader(tc.blob), int64(len(tc.blob)), f.unwrapper, 0, 10)
+			_, err := fee.DecryptRange(bytes.NewReader(tc.blob), int64(len(tc.blob)), f.unwrapper, 0, 9)
 			require.ErrorIs(t, err, tc.want)
 
 			_, err = fee.PlaintextSize(bytes.NewReader(tc.blob), int64(len(tc.blob)))
@@ -807,7 +794,7 @@ func TestDecryptRangeMalformedBlob(t *testing.T) {
 		require.NoError(t, err)
 		// Random bytes are rejected either as un-decodable CBOR or as a
 		// well-formed item that is not a COSE tag, depending on the first byte.
-		_, err = fee.DecryptRange(bytes.NewReader(garbage), int64(len(garbage)), f.unwrapper, 0, 10)
+		_, err = fee.DecryptRange(bytes.NewReader(garbage), int64(len(garbage)), f.unwrapper, 0, 9)
 		require.Error(t, err)
 		require.True(t, errors.Is(err, cose.ErrMalformed) || errors.Is(err, cose.ErrNotEncrypt),
 			"want a cose decode error, got %v", err)
@@ -816,7 +803,7 @@ func TestDecryptRangeMalformedBlob(t *testing.T) {
 	t.Run("header truncated mid-envelope", func(t *testing.T) {
 		// A blob size that stops inside the envelope: the probe cannot complete a
 		// decode and must report it rather than looping.
-		_, err := fee.DecryptRange(bytes.NewReader(f.blob), 20, f.unwrapper, 0, 10)
+		_, err := fee.DecryptRange(bytes.NewReader(f.blob), 20, f.unwrapper, 0, 9)
 		require.ErrorIs(t, err, cose.ErrMalformed)
 	})
 }
@@ -845,7 +832,7 @@ func TestDecryptRangeMalformedBlobReadsOnce(t *testing.T) {
 			copy(blob, hexBytes(t, tc.prefix))
 
 			rec := newRecordingReaderAt(t, blob)
-			_, err := fee.DecryptRange(rec, int64(len(blob)), f.unwrapper, 0, 10)
+			_, err := fee.DecryptRange(rec, int64(len(blob)), f.unwrapper, 0, 9)
 			require.ErrorIs(t, err, tc.want)
 			require.Len(t, rec.reads, 1, "a complete but invalid prefix must not be re-read")
 		})
@@ -872,9 +859,9 @@ func TestDecryptRangeLargeEnvelope(t *testing.T) {
 
 	require.Greater(t, headerLenOf(blob, size), int64(4096), "the envelope must exceed the first probe size")
 
-	off, length := int64(rangeChunk+7), int64(300)
-	_, got := decryptRange(t, blob, fee.NewECDHESUnwrapper(ecdhKID, priv), off, length)
-	require.Equal(t, plaintext[off:off+length], got)
+	start, end := int64(rangeChunk+7), int64(rangeChunk+306)
+	_, got := decryptRange(t, blob, fee.NewECDHESUnwrapper(ecdhKID, priv), start, end)
+	require.Equal(t, plaintext[start:end+1], got)
 }
 
 // TestPlaintextSize confirms the header-only size query matches the real plaintext
@@ -909,11 +896,11 @@ func TestDecryptRangeMatchesFullDecrypt(t *testing.T) {
 	full := decryptAll(t, f.blob, f.unwrapper)
 	require.Equal(t, f.plaintext, full)
 
-	for _, rg := range []struct{ off, length int64 }{
-		{0, 1}, {1, rangeChunk}, {rangeChunk - 1, 2}, {2 * rangeChunk, 3 * rangeChunk},
-		{5 * rangeChunk, 123}, {size - 1, 1},
+	for _, rg := range []struct{ start, end int64 }{
+		{0, 0}, {1, rangeChunk}, {rangeChunk - 1, rangeChunk}, {2 * rangeChunk, 5*rangeChunk - 1},
+		{5 * rangeChunk, 5*rangeChunk + 122}, {size - 1, size - 1},
 	} {
-		_, got := decryptRange(t, f.blob, f.unwrapper, rg.off, rg.length)
-		require.Equal(t, full[rg.off:rg.off+int64(len(got))], got)
+		_, got := decryptRange(t, f.blob, f.unwrapper, rg.start, rg.end)
+		require.Equal(t, full[rg.start:rg.start+int64(len(got))], got)
 	}
 }
