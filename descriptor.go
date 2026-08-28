@@ -87,7 +87,7 @@ func (m BodyDescriptor) Validate() error {
 // PlaintextSize reports the total decrypted size of a blob of blobSize bytes
 // described by m. It reads nothing and needs no key material, so it answers a
 // HEAD request, fills in the total of a Content-Range header, or resolves a
-// suffix range ("bytes=-N" is off = size-N) from cached metadata alone.
+// suffix range ("bytes=-N" is start = size-N) from cached metadata alone.
 //
 // blobSize is the whole stored object, envelope included, exactly as passed to
 // [DecryptRangeWithCEK] when desc is non-nil. It reports [ErrInvalidDescriptor]

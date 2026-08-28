@@ -37,10 +37,11 @@ func ExampleDecryptRange() {
 	}
 
 	// A store hands over random access to the blob and its exact size; only the
-	// envelope header and the chunks the range overlaps are ever read.
-	const off, length = 4, 15
+	// envelope header and the chunks the range overlaps are ever read. The
+	// range is inclusive, HTTP-style: bytes 4-18.
+	const start, end = 4, 18
 	r, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)),
-		fee.NewECDHESUnwrapper(kid, priv), off, length)
+		fee.NewECDHESUnwrapper(kid, priv), start, end)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func ExampleDecryptRange() {
 	// Both are known up front, so a handler can write its headers before
 	// decrypting a single chunk.
 	fmt.Printf("Content-Length: %d\n", r.Len())
-	fmt.Printf("Content-Range: bytes %d-%d/%d\n", off, off+r.Len()-1, r.Size())
+	fmt.Printf("Content-Range: bytes %d-%d/%d\n", start, start+r.Len()-1, r.Size())
 	got, err := io.ReadAll(r)
 	if err != nil {
 		log.Fatal(err)
