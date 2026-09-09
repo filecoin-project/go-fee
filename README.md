@@ -422,4 +422,4 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 
 ## License
 
-Dual-licensed under [Apache 2.0 and MIT](./LICENSE.md).
+Dual-licensed under [Apache 2.0](./LICENSE-APACHE) OR [MIT](./LICENSE-MIT).
