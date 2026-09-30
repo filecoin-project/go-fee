@@ -269,5 +269,6 @@ func Open(cfg Config, ciphertext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Close()
 	return io.ReadAll(r)
 }

@@ -69,6 +69,17 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 	return r.sr.Read(p)
 }
 
+// Close returns the reader's chunk buffers to the pool for reuse by the next
+// stream (see [aesstream.SpanReader.Close]); reads after Close fail. It does
+// not close the blob. A RangeReader that is never closed is still collected
+// normally.
+func (r *RangeReader) Close() error {
+	if r.sr == nil {
+		return nil
+	}
+	return r.sr.Close()
+}
+
 // Len returns the number of plaintext bytes this reader will emit: the
 // requested range's length after end is clamped to the last plaintext byte.
 // It is fixed at construction, so an HTTP consumer can use it as the response

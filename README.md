@@ -47,7 +47,7 @@ import (
 | Package | Purpose |
 |---|---|
 | [`fee`](.) (root) | Composes the primitives below into a small API: whole-object `Encrypt`/`Decrypt`, byte-range `DecryptRange`, and the cacheable envelope parameters (`BodyDescriptor`) that let a range read skip the header. Adds no cryptography of its own. |
-| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: streaming `Writer`/`Reader` plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
+| [`aesstream`](./aesstream) | The chunked AES-256-GCM STREAM body cipher: push-mode `Writer`, pull-mode `EncryptReader`, the decrypting `Reader`, plus the range primitives (`CiphertextRange`, `SpanReader`, `OpenSpan`) that `fee.DecryptRange` is built on. |
 | [`cose`](./cose) | Just enough of COSE (RFC 9052): `COSE_Encrypt` (tag 96) / `COSE_Encrypt0` (tag 16) with a detached payload, and the `Enc_structure` AAD. |
 | [`ecdhkw`](./ecdhkw) | ECDH-ES+A256KW key wrap over X25519 (COSE algorithm −31). |
 | [`aeskw`](./aeskw) | RFC 3394 AES Key Wrap / A256KW (COSE algorithm −5). |
@@ -60,8 +60,9 @@ Most applications only need the root `fee` package.
 ### Encrypt and decrypt to an X25519 recipient
 
 `fee.Encrypt` generates a fresh CEK, wraps it to each recipient, and returns a
-streaming reader over `envelope ‖ ciphertext`. The caller **must** read it to
-EOF or `Close` it.
+streaming reader over `envelope ‖ ciphertext`. Plaintext is pulled through the
+cipher as the reader is read; `Close` it when done so its chunk buffers go back
+to the pool for the next stream.
 
 ```go
 package main
@@ -156,6 +157,15 @@ Both directions stream with O(chunk size) memory: `Encrypt` produces the blob
 as the plaintext is read, and `Decrypt` reads only the small envelope header up
 front, decrypting the ciphertext on demand. Neither buffers the whole object.
 
+Both directions are pull-based. The reader `Encrypt` returns fills one chunk
+from the plaintext per read, seals it, and serves the sealed bytes; no
+goroutine or pipe sits between the source and the consumer. It also implements
+`io.WriterTo`, so `io.Copy` from it hands each sealed chunk to the destination
+in a single write (256 KiB + tag at the default chunk size) rather than in
+32 KiB pieces. A `Close` returns the reader's two chunk buffers to a pool that
+the next stream draws from; the readers `Decrypt` and `DecryptRange` return can
+be closed the same way.
+
 ```go
 func encryptFile(src, dst string, recipients []fee.Recipient) error {
     in, err := os.Open(src)
@@ -213,6 +223,70 @@ func decryptFile(src, dst string, u fee.RecipientUnwrapper) error {
     return err
 }
 ```
+
+### Pull-mode body cipher
+
+The `aesstream` package exposes the body cipher on its own, without the COSE
+envelope, for callers that carry the key material and parameters some other
+way. It encrypts in either direction of data flow: `Writer` is pushed
+plaintext and writes ciphertext to a destination, and `EncryptReader` pulls
+plaintext from a source as its consumer reads ciphertext. Both produce
+identical bytes for the same `Config`; `Reader` decrypts what either wrote.
+
+`EncryptReader` suits a pipeline that is already shaped as readers, such as a
+request body streamed into a store that hashes and writes whatever it is
+handed. Each chunk is filled straight from the source with one `io.ReadFull`,
+so a source that delivers small reads still yields full chunks, and `WriteTo`
+passes each sealed chunk to the destination whole.
+
+```go
+import (
+    "io"
+
+    "github.com/filecoin-project/go-fee/aesstream"
+)
+
+// sealStream encrypts plaintext into dst and returns the ciphertext length.
+// cfg carries the CEK, the 7-byte base nonce and the AAD the decryptor will
+// be given; the caller records them beside the ciphertext.
+func sealStream(dst io.Writer, plaintext io.Reader, cfg aesstream.Config) (int64, error) {
+    r, err := aesstream.NewEncryptReader(plaintext, cfg)
+    if err != nil {
+        return 0, err
+    }
+    // Close returns the chunk buffers to the pool; a stream that is never
+    // closed is collected normally, it just allocates its own next time.
+    defer r.Close()
+
+    // io.Copy uses WriteTo: one write per sealed chunk. A source read error
+    // surfaces here and ends the stream before its final chunk, so the bytes
+    // written so far are a truncated ciphertext that will fail to decrypt.
+    return io.Copy(dst, r)
+}
+
+func newConfig(cek []byte, aad []byte) (aesstream.Config, error) {
+    baseNonce, err := aesstream.NewBaseNonce()
+    if err != nil {
+        return aesstream.Config{}, err
+    }
+    return aesstream.Config{Key: cek, BaseNonce: baseNonce, AAD: aad}, nil
+}
+
+func openStream(dst io.Writer, ciphertext io.Reader, cfg aesstream.Config) error {
+    r, err := aesstream.NewReader(ciphertext, cfg)
+    if err != nil {
+        return err
+    }
+    defer r.Close()
+    _, err = io.Copy(dst, r)
+    return err
+}
+```
+
+`cfg.Key` is a 32-byte AES-256 CEK, fresh from `crypto/rand` for every stream
+(the CEK-reuse warning above applies here too). The same applies inside the `fee` package: `Encrypt` and `EncryptWithCEK`
+are built on `EncryptReader`, which is why their readers implement
+`io.WriterTo` and why closing them matters.
 
 ### External CEK (recipient-less envelopes)
 
