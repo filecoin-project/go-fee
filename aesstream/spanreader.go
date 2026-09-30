@@ -241,10 +241,12 @@ type SpanReader struct {
 	skipFirst int   // bytes to drop from the front of the first chunk
 	onFirst   bool  // nextChunk is still the first chunk of the range
 
-	inBuf  []byte // raw ciphertext of the current chunk, cap encChunk
-	outBuf []byte // plaintext backing array, cap chunkSize
-	unread []byte // decrypted-but-unread plaintext, trimmed to the range
-	err    error  // sticky terminal state (io.EOF on clean end)
+	inBuf  []byte          // raw ciphertext of the current chunk, cap encChunk
+	outBuf []byte          // plaintext backing array, cap chunkSize
+	unread []byte          // decrypted-but-unread plaintext, trimmed to the range
+	nonce  [NonceSize]byte // the current chunk's nonce, built in place
+	err    error           // sticky terminal state (io.EOF on clean end)
+	closed bool
 }
 
 // NewSpanReader returns a SpanReader that yields the plaintext bytes
@@ -293,8 +295,8 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, start, end int64)
 		lastCipherLen: lastCipherLen,
 		total:         total,
 		remaining:     total,
-		inBuf:         make([]byte, chunkSize+TagSize),
-		outBuf:        make([]byte, 0, chunkSize),
+		inBuf:         getBuf(chunkSize + TagSize),
+		outBuf:        getBuf(chunkSize)[:0],
 	}
 	copy(r.base[:], cfg.BaseNonce)
 
@@ -308,6 +310,23 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, start, end int64)
 // — the requested length clamped to the bytes available from the offset.
 // It is fixed at construction and does not change as bytes are read.
 func (r *SpanReader) Len() int64 { return r.total }
+
+// Close returns the SpanReader's chunk buffers to the pool (see pool.go).
+// Further reads fail rather than return more plaintext. Close does not
+// close the span. A SpanReader that is never closed is still collected
+// normally; Close only lets the next stream reuse its buffers.
+func (r *SpanReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.unread = nil
+	r.err = errReadAfterClose
+	putBuf(r.inBuf)
+	putPlaintextBuf(r.outBuf)
+	r.inBuf, r.outBuf = nil, nil
+	return nil
+}
 
 // ChunkSize returns the plaintext chunk size in effect.
 func (r *SpanReader) ChunkSize() int { return r.chunkSize }
@@ -365,8 +384,8 @@ func (r *SpanReader) nextSpanChunk() error {
 		return r.fail(fmt.Errorf("aesstream: read chunk %d: %w", r.nextChunk, err))
 	}
 
-	nonce := streamNonce(r.base, uint32(r.nextChunk), last)
-	plain, err := r.aead.Open(r.outBuf[:0], nonce[:], r.inBuf[:clen], r.aad)
+	r.nonce = streamNonce(r.base, uint32(r.nextChunk), last)
+	plain, err := r.aead.Open(r.outBuf[:0], r.nonce[:], r.inBuf[:clen], r.aad)
 	if err != nil {
 		return r.fail(ErrCorrupted)
 	}
@@ -422,6 +441,7 @@ func OpenSpan(cfg Config, span io.Reader, ciphertextSize, start, end int64) ([]b
 	if r.Len() > math.MaxInt {
 		return nil, fmt.Errorf("aesstream: range of %d bytes is too large to buffer; use NewSpanReader to stream", r.Len())
 	}
+	defer r.Close()
 	buf := make([]byte, r.Len())
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
