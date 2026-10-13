@@ -1154,3 +1154,71 @@ func withUnprotected(t *testing.T, blob []byte, label, value any) []byte {
 	require.NoError(t, err)
 	return append(header, ciphertext...)
 }
+
+// TestDecryptReaderCloses: the plaintext reader closes whether or not the
+// envelope declares a plaintext length, so a caller abandoning a partial read
+// still returns its chunk buffers.
+func TestDecryptReaderCloses(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(3*aesstream.MinChunkSize)
+	for name, opts := range map[string][]fee.EncryptOption{
+		"declared length": {fee.WithChunkSize(aesstream.MinChunkSize), fee.WithContentLength(int64(len(plaintext)))},
+		"no length":       {fee.WithChunkSize(aesstream.MinChunkSize)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil, opts...)
+			require.NoError(t, err)
+			blob, err := io.ReadAll(rc)
+			require.NoError(t, err)
+			require.NoError(t, rc.Close())
+
+			r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.NoError(t, err)
+			_, err = io.ReadFull(r, make([]byte, 10))
+			require.NoError(t, err)
+
+			c, ok := r.(io.Closer)
+			require.True(t, ok, "the plaintext reader implements io.Closer")
+			require.NoError(t, c.Close())
+			_, err = r.Read(make([]byte, 10))
+			require.Error(t, err, "reads after Close fail")
+		})
+	}
+}
+
+// TestECDHESRecipientUnprotectedAlgRejected: an ECDH-ES recipient's protected
+// header feeds its key derivation and is fixed at {1: -31}, so one whose alg
+// is unprotected is malformed rather than unwrapped.
+func TestECDHESRecipientUnprotectedAlgRejected(t *testing.T) {
+	key := newX25519Key(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	r := env.Recipients[0]
+	r.Headers.Unprotected.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+	r.Headers.Protected = cose.Header{}
+	r.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	_, err = fee.Decrypt(bytes.NewReader(append(header, ciphertext...)), fee.NewECDHESUnwrapper(ecdhKID, key))
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+}
+
+// TestDecryptRejectsMalformedAppMetadata: app_metadata must be a map with
+// text-string keys.
+func TestDecryptRejectsMalformedAppMetadata(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	for name, value := range map[string]any{
+		"not a map":   int64(7),
+		"integer key": map[any]any{"ok": "x", int64(1): "y"},
+		"boolean key": map[any]any{"ok": "x", true: "y"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(labelAppMetadata, value), plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}

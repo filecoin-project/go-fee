@@ -18,7 +18,7 @@ var (
 	// an empty final chunk). It is a structural complaint about the length,
 	// whether declared for a range or found by Reader at the end of the
 	// stream, distinct from ErrCorrupted (a chunk that failed authentication).
-	ErrCiphertextSize = fmt.Errorf("aesstream: ciphertext length is not a valid stream (the final chunk must be at least %d bytes, to hold the tag)", TagSize)
+	ErrCiphertextSize = errors.New("aesstream: ciphertext length is not a valid stream")
 
 	// ErrRange is returned when a requested plaintext range is unsatisfiable:
 	// a negative start, an end before the start, or a start past the last

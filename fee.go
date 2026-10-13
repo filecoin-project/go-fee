@@ -525,8 +525,9 @@ func (e *encryptReader) Close() error { return e.body.Close() }
 //
 // Decryption is streaming: a non-EOF error from the returned reader (see
 // fee/aesstream) means the plaintext is incomplete and must be discarded. The
-// reader is an [*aesstream.Reader]; a caller that closes it once done lets its
-// chunk buffers be reused by the next stream.
+// reader also implements io.Closer; a caller that closes it once done, or on
+// abandoning a partial read, lets its chunk buffers be reused by the next
+// stream.
 //
 // If the envelope carries no recipients (a COSE_Encrypt0), Decrypt returns
 // [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient kid matches
@@ -615,10 +616,14 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 // stream that authenticates to its end but yields a different length fails
 // with [ErrSizeMismatch] instead of a clean EOF.
 type declaredLengthReader struct {
-	r        io.Reader
+	r        *aesstream.Reader
 	declared int64
 	n        int64
 }
+
+// Close releases the underlying reader's chunk buffers (see
+// aesstream.Reader.Close).
+func (d *declaredLengthReader) Close() error { return d.r.Close() }
 
 func (d *declaredLengthReader) Read(p []byte) (int, error) {
 	n, err := d.r.Read(p)
@@ -713,6 +718,20 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	if chunkSize < int64(aesstream.MinChunkSize) || chunkSize > int64(aesstream.MaxChunkSize) {
 		return bodyParams{}, fmt.Errorf("%w: declared chunk size %d out of range [%d, %d]",
 			ErrMalformedEnvelope, chunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
+	}
+
+	// app_metadata is carried authenticated and otherwise ignored, but its shape
+	// is part of the wire format: a map with text-string keys.
+	if v, ok := env.Headers.Protected.Get(labelAppMetadata); ok {
+		m, ok := v.(map[any]any)
+		if !ok {
+			return bodyParams{}, fmt.Errorf("%w: app_metadata is not a map", ErrMalformedEnvelope)
+		}
+		for k := range m {
+			if _, ok := k.(string); !ok {
+				return bodyParams{}, fmt.Errorf("%w: app_metadata key %v is not a text string", ErrMalformedEnvelope, k)
+			}
+		}
 	}
 
 	plaintextLength := int64(-1)

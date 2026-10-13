@@ -51,6 +51,11 @@ func (u *ecdhESUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
 	if alg != cose.AlgECDHESA256KW {
 		return nil, fmt.Errorf("%w: recipient algorithm %d is not ECDH-ES+A256KW", ErrUnsupportedRecipientAlg, alg)
 	}
+	// The protected header feeds the key derivation, and FEE fixes it at
+	// {1: -31}, so an ECDH-ES recipient whose alg is unprotected is malformed.
+	if !r.Headers.Protected.Has(cose.HeaderLabelAlg) {
+		return nil, fmt.Errorf("%w: ECDH-ES+A256KW recipient algorithm must be protected", ErrMalformedEnvelope)
+	}
 	ephPub, err := ephemeralX25519(r.Headers.Unprotected)
 	if err != nil {
 		return nil, err
