@@ -513,4 +513,4 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
 
 ## License
 
-Dual-licensed under [Apache 2.0 and MIT](./LICENSE.md).
+Dual-licensed under [Apache 2.0](./LICENSE-APACHE) OR [MIT](./LICENSE-MIT).
