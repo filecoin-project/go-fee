@@ -140,12 +140,24 @@ func (u *a256kwUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
 	return cek, nil
 }
 
-// recipientAlg returns a recipient's key-wrap algorithm. COSE lets alg sit in
+// recipientUnderstoodLabels are the recipient header parameters the unwrappers
+// process, so a recipient may list them as critical: alg, crit, kid, and the
+// ECDH-ES ephemeral key.
+var recipientUnderstoodLabels = map[int64]bool{
+	cose.HeaderLabelAlg: true, cose.HeaderLabelCrit: true,
+	cose.HeaderLabelKID: true, cose.HeaderLabelEphemeralKey: true,
+}
+
+// recipientAlg returns a recipient's key-wrap algorithm, after processing its
+// crit parameter. COSE lets alg sit in
 // either header bucket, and FEE uses both: ECDH-ES+A256KW recipients carry it
 // protected, while A256KW recipients must leave the protected header empty and
 // carry it unprotected (RFC 9053 §6.2.1). A recipient that names it in both is
 // malformed.
 func recipientAlg(r *cose.Recipient) (int64, error) {
+	if err := checkCrit(r.Headers, recipientUnderstoodLabels); err != nil {
+		return 0, err
+	}
 	if r.Headers.Protected.Has(cose.HeaderLabelAlg) && r.Headers.Unprotected.Has(cose.HeaderLabelAlg) {
 		return 0, fmt.Errorf("%w: recipient algorithm header in both buckets", ErrMalformedEnvelope)
 	}

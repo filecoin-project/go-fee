@@ -466,6 +466,12 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
   does not write it.
 - **A256KW recipients** (alg −5) — the protected header is empty (`h''`) and
   `alg` is unprotected, as RFC 9053 §6.2.1 requires.
+- **Envelope processing** — every CBOR item, including the serialized protected
+  headers, must use definite lengths and shortest-form arguments and contain no
+  floats (`cose.WithStrictEncoding`); duplicate labels are rejected. `crit` must
+  be protected and may name only parameters this package processes. A Partial IV
+  in either content bucket is rejected. Unknown non-critical parameters are
+  ignored.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,

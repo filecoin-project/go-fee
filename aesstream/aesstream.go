@@ -101,9 +101,10 @@ const (
 	MinChunkSize = 4 * 1024
 	MaxChunkSize = 16 * 1024 * 1024
 
-	// MaxChunks is the number of chunks a single stream may contain. The
-	// chunk index is a uint32, so valid indices run 0 .. MaxChunks-1.
-	MaxChunks = 1 << 32
+	// MaxChunks is the number of chunks a single stream may contain, per the
+	// FEE spec: 2^32 − 1, so the uint32 chunk index runs 0 .. MaxChunks-1 and
+	// never reaches its last value.
+	MaxChunks = 1<<32 - 1
 )
 
 // last-chunk flag values for the final nonce byte.

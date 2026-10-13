@@ -136,6 +136,48 @@ var bodyContentLabels = []int64{
 	labelChunkSize, labelPlaintextLength, labelAppMetadata,
 }
 
+// bodyUnderstoodLabels are the body header parameters this package knows how
+// to process, so an envelope may list them as critical (crit, label 2).
+var bodyUnderstoodLabels = map[int64]bool{
+	cose.HeaderLabelAlg: true, cose.HeaderLabelCrit: true, cose.HeaderLabelContentType: true,
+	cose.HeaderLabelIV: true, cose.HeaderLabelType: true,
+	labelChunkSize: true, labelPlaintextLength: true, labelAppMetadata: true,
+}
+
+// envelopeDecodeOptions are the cose decode rules every FEE envelope is held
+// to: the FEE envelope type, and one accepted CBOR encoding (definite lengths,
+// shortest-form arguments, no floats).
+var envelopeDecodeOptions = []cose.DecodeOption{
+	cose.WithExpectedType(EnvelopeType),
+	cose.WithStrictEncoding(),
+}
+
+// checkCrit processes a header pair's crit parameter (label 2, RFC 9052 §3.1):
+// it must be protected, it must be a non-empty array of labels, and every label
+// it names must be one the caller understands. An envelope that marks a
+// parameter critical which this package cannot process is malformed rather
+// than read with that parameter ignored.
+func checkCrit(h cose.Headers, understood map[int64]bool) error {
+	if h.Unprotected.Has(cose.HeaderLabelCrit) {
+		return fmt.Errorf("%w: crit must be protected", ErrMalformedEnvelope)
+	}
+	v, ok := h.Protected.Get(cose.HeaderLabelCrit)
+	if !ok {
+		return nil
+	}
+	labels, ok := v.([]any)
+	if !ok || len(labels) == 0 {
+		return fmt.Errorf("%w: crit must be a non-empty array of labels", ErrMalformedEnvelope)
+	}
+	for _, l := range labels {
+		n, ok := l.(int64)
+		if !ok || !understood[n] {
+			return fmt.Errorf("%w: crit names header %v, which this package does not understand", ErrMalformedEnvelope, l)
+		}
+	}
+	return nil
+}
+
 // Sentinel errors. Decrypt failures that originate in a sub-package are wrapped
 // rather than replaced, so errors.Is still matches the sub-package sentinel
 // (e.g. cose.ErrMalformed, aeskw.ErrIntegrity, aesstream.ErrCorrupted) in
@@ -499,7 +541,7 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 		return nil, ErrNilUnwrapper
 	}
 
-	env, ciphertext, err := cose.DecodeReader(src, cose.WithExpectedType(EnvelopeType))
+	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
 	}
@@ -537,7 +579,7 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 	if err := checkCEK(cek); err != nil {
 		return nil, err
 	}
-	env, ciphertext, err := cose.DecodeReader(src, cose.WithExpectedType(EnvelopeType))
+	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
 	}
@@ -633,6 +675,15 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 // so both accept exactly the same envelopes and report the same errors for a
 // body header they cannot honour.
 func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
+	if err := checkCrit(env.Headers, bodyUnderstoodLabels); err != nil {
+		return bodyParams{}, err
+	}
+	// The nonce is the iv, never rebuilt from a Partial IV, so a Partial IV in
+	// either bucket would be a second, conflicting instruction for it.
+	if env.Headers.Protected.Has(cose.HeaderLabelPartialIV) || env.Headers.Unprotected.Has(cose.HeaderLabelPartialIV) {
+		return bodyParams{}, fmt.Errorf("%w: Partial IV is not supported", ErrMalformedEnvelope)
+	}
+
 	// Every FEE parameter belongs in the protected header, where the AAD
 	// authenticates it. A copy in the unprotected header would be
 	// unauthenticated and ambiguous, so it makes the envelope malformed.

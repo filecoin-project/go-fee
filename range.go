@@ -344,7 +344,7 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		// claimed, so growing the probe cannot produce more bytes.
 		atEnd := rerr == io.EOF || int64(n) < probe
 
-		env, rest, derr := cose.Decode(buf[:n], cose.WithExpectedType(EnvelopeType))
+		env, rest, derr := cose.Decode(buf[:n], envelopeDecodeOptions...)
 		if derr == nil {
 			return env, int64(n - len(rest)), nil
 		}

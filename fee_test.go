@@ -1051,3 +1051,106 @@ func TestDecryptDeclaredLengthMismatch(t *testing.T) {
 	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
 	require.ErrorIs(t, err, fee.ErrSizeMismatch)
 }
+
+// TestDecryptCrit: crit must be protected, must be a non-empty array, and may
+// name only body parameters this package processes.
+func TestDecryptCrit(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(aesstream.MinChunkSize+9)
+
+	t.Run("naming understood parameters decrypts", func(t *testing.T) {
+		blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelCrit, []any{labelChunkSize, cose.HeaderLabelIV}), plaintext, cek)
+		r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+		require.NoError(t, err)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+		require.Equal(t, plaintext, got)
+	})
+
+	for name, protected := range map[string]cose.Header{
+		"naming an unknown parameter": bodyHeader().Set(cose.HeaderLabelCrit, []any{int64(-70000)}),
+		"naming a text label":         bodyHeader().Set(cose.HeaderLabelCrit, []any{"x"}),
+		"empty":                       bodyHeader().Set(cose.HeaderLabelCrit, []any{}),
+		"not an array":                bodyHeader().Set(cose.HeaderLabelCrit, int64(5)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, protected, plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+
+	t.Run("unprotected", func(t *testing.T) {
+		blob := sealEnvelope(t, bodyHeader(), plaintext, cek)
+		moved := withUnprotected(t, blob, cose.HeaderLabelCrit, []any{labelChunkSize})
+		_, err := fee.DecryptWithCEK(bytes.NewReader(moved), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+	})
+}
+
+// TestDecryptRejectsPartialIV: the nonce comes from the iv alone, so a Partial
+// IV in either bucket is refused rather than ignored.
+func TestDecryptRejectsPartialIV(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+
+	blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelPartialIV, []byte{1}), plaintext, cek)
+	_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "protected")
+
+	moved := withUnprotected(t, sealEnvelope(t, bodyHeader(), plaintext, cek), cose.HeaderLabelPartialIV, []byte{1})
+	_, err = fee.DecryptWithCEK(bytes.NewReader(moved), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "unprotected")
+}
+
+// TestDecryptRequiresStrictEncoding: envelopes are decoded under the strict
+// CBOR profile, so a float anywhere, even in an otherwise ignored unprotected
+// parameter, is refused.
+func TestDecryptRequiresStrictEncoding(t *testing.T) {
+	cek := newCEK(t)
+	blob := withUnprotected(t, sealEnvelope(t, bodyHeader(), patternBytes(100), cek), int64(99), 1.5)
+
+	_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, cose.ErrMalformed)
+	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+	require.ErrorIs(t, err, cose.ErrMalformed)
+}
+
+// TestRecipientCrit: a recipient's crit is processed before its unwrap, and
+// naming a parameter the unwrapper does not understand is malformed.
+func TestRecipientCrit(t *testing.T) {
+	key := newX25519Key(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+
+	for name, mutate := range map[string]func(*cose.Recipient){
+		"naming an unknown parameter": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{int64(-70000)})
+			r.Headers.RawProtected = nil
+		},
+		"unprotected": func(r *cose.Recipient) {
+			r.Headers.Unprotected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelKID})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, ciphertext, err := cose.Decode(blob)
+			require.NoError(t, err)
+			mutate(env.Recipients[0])
+			header, err := env.Encode()
+			require.NoError(t, err)
+
+			_, err = fee.Decrypt(bytes.NewReader(append(header, ciphertext...)), fee.NewECDHESUnwrapper(ecdhKID, key))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// withUnprotected re-encodes blob with label set to value in its body
+// unprotected header, leaving the protected header and ciphertext alone.
+func withUnprotected(t *testing.T, blob []byte, label, value any) []byte {
+	t.Helper()
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Headers.Unprotected.Set(label, value)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	return append(header, ciphertext...)
+}

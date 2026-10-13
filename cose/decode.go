@@ -13,6 +13,7 @@ import (
 type decodeConfig struct {
 	checkType    bool
 	expectedType string
+	strict       bool
 }
 
 // DecodeOption configures [Decode] and [DecodeReader].
@@ -28,6 +29,39 @@ func WithExpectedType(typ string) DecodeOption {
 		c.checkType = true
 		c.expectedType = typ
 	}
+}
+
+// WithStrictEncoding requires every CBOR item in the envelope, including the
+// serialized protected headers it carries, to use definite lengths and
+// shortest-form arguments and to contain no floating-point values; otherwise
+// decoding fails with ErrMalformed. It lets a profile give each envelope one
+// accepted encoding. Duplicate map labels are rejected with or without it.
+func WithStrictEncoding() DecodeOption {
+	return func(c *decodeConfig) { c.strict = true }
+}
+
+// checkStrict enforces WithStrictEncoding against the envelope item and the
+// protected headers nested inside it as byte strings.
+func (cfg decodeConfig) checkStrict(item []byte, env *Envelope) error {
+	if !cfg.strict {
+		return nil
+	}
+	if err := checkStrictEncoding(item); err != nil {
+		return err
+	}
+	protected := [][]byte{env.Headers.RawProtected}
+	for _, r := range env.Recipients {
+		protected = append(protected, r.Headers.RawProtected)
+	}
+	for _, p := range protected {
+		if len(p) == 0 {
+			continue
+		}
+		if err := checkStrictEncoding(p); err != nil {
+			return fmt.Errorf("protected header: %w", err)
+		}
+	}
+	return nil
 }
 
 func newDecodeConfig(opts []DecodeOption) decodeConfig {
@@ -81,7 +115,11 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := newDecodeConfig(opts).checkTyp(env.Headers.Protected); err != nil {
+	cfg := newDecodeConfig(opts)
+	if err := cfg.checkStrict(first, env); err != nil {
+		return nil, nil, err
+	}
+	if err := cfg.checkTyp(env.Headers.Protected); err != nil {
 		return nil, nil, err
 	}
 	return env, rest, nil
@@ -208,7 +246,11 @@ func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Rea
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := newDecodeConfig(opts).checkTyp(env.Headers.Protected); err != nil {
+	cfg := newDecodeConfig(opts)
+	if err := cfg.checkStrict(first, env); err != nil {
+		return nil, nil, err
+	}
+	if err := cfg.checkTyp(env.Headers.Protected); err != nil {
 		return nil, nil, err
 	}
 	return env, rest, nil
