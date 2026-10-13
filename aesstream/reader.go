@@ -24,13 +24,15 @@ type Reader struct {
 	chunkSize int
 	encChunk  int // chunkSize + TagSize: a full ciphertext chunk
 
-	inBuf  []byte // raw ciphertext of the current chunk, cap encChunk
-	outBuf []byte // plaintext backing array, cap chunkSize
-	unread []byte // decrypted-but-unread plaintext, a slice of outBuf
+	inBuf  []byte          // raw ciphertext of the current chunk, cap encChunk
+	outBuf []byte          // plaintext backing array, cap chunkSize
+	unread []byte          // decrypted-but-unread plaintext, a slice of outBuf
+	nonce  [NonceSize]byte // the current chunk's nonce, built in place
 
 	index     uint64 // index of the next chunk to read
 	maxChunks uint64 // overridable in tests; defaults to MaxChunks
 	err       error  // sticky terminal state (io.EOF on clean end)
+	closed    bool
 }
 
 // NewReader returns a Reader that decrypts the stream from src under cfg.
@@ -55,8 +57,8 @@ func NewReader(src io.Reader, cfg Config) (*Reader, error) {
 		aad:       append([]byte(nil), cfg.AAD...),
 		chunkSize: chunkSize,
 		encChunk:  chunkSize + TagSize,
-		inBuf:     make([]byte, chunkSize+TagSize),
-		outBuf:    make([]byte, 0, chunkSize),
+		inBuf:     getBuf(chunkSize + TagSize),
+		outBuf:    getBuf(chunkSize)[:0],
 		maxChunks: MaxChunks,
 	}
 	copy(r.base[:], cfg.BaseNonce)
@@ -159,19 +161,36 @@ func (r *Reader) nextChunk() error {
 // last.
 func (r *Reader) openChunk(index uint64, ciphertext []byte, mustBeLast bool) ([]byte, bool, error) {
 	wasLast := mustBeLast
-	nonce := streamNonce(r.base, uint32(index), wasLast)
-	out, err := r.aead.Open(r.outBuf[:0], nonce[:], ciphertext, r.aad)
+	r.nonce = streamNonce(r.base, uint32(index), wasLast)
+	out, err := r.aead.Open(r.outBuf[:0], r.nonce[:], ciphertext, r.aad)
 	if err != nil && !mustBeLast {
 		// A full-size chunk that fails as non-last must be the full-size
 		// final chunk; retry with the last flag set.
 		wasLast = true
-		nonce = streamNonce(r.base, uint32(index), wasLast)
-		out, err = r.aead.Open(r.outBuf[:0], nonce[:], ciphertext, r.aad)
+		r.nonce = streamNonce(r.base, uint32(index), wasLast)
+		out, err = r.aead.Open(r.outBuf[:0], r.nonce[:], ciphertext, r.aad)
 	}
 	if err != nil {
 		return nil, false, ErrCorrupted
 	}
 	return out, wasLast, nil
+}
+
+// Close returns the Reader's chunk buffers to the pool (see pool.go).
+// Further reads fail rather than return more plaintext. Close does not
+// close the source. A Reader that is never closed is still collected
+// normally; Close only lets the next stream reuse its buffers.
+func (r *Reader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.unread = nil
+	r.err = errReadAfterClose
+	putBuf(r.inBuf)
+	putPlaintextBuf(r.outBuf)
+	r.inBuf, r.outBuf = nil, nil
+	return nil
 }
 
 // ChunkSize returns the plaintext chunk size in effect.

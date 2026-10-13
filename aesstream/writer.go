@@ -27,8 +27,9 @@ type Writer struct {
 	aad       []byte
 	chunkSize int
 
-	buf     []byte // pending plaintext, len 0..chunkSize, cap chunkSize
-	sealBuf []byte // scratch for one sealed chunk, cap chunkSize+TagSize
+	buf     []byte          // pending plaintext, len 0..chunkSize, cap chunkSize
+	sealBuf []byte          // scratch for one sealed chunk, cap chunkSize+TagSize
+	nonce   [NonceSize]byte // the current chunk's nonce, built in place
 
 	index     uint64 // index of the next chunk to flush
 	maxChunks uint64 // overridable in tests; defaults to MaxChunks
@@ -56,8 +57,8 @@ func NewWriter(dst io.Writer, cfg Config) (*Writer, error) {
 		aead:      aead,
 		aad:       append([]byte(nil), cfg.AAD...),
 		chunkSize: chunkSize,
-		buf:       make([]byte, 0, chunkSize),
-		sealBuf:   make([]byte, 0, chunkSize+TagSize),
+		buf:       getBuf(chunkSize)[:0],
+		sealBuf:   getBuf(chunkSize + TagSize)[:0],
 		maxChunks: MaxChunks,
 	}
 	copy(w.base[:], cfg.BaseNonce)
@@ -98,6 +99,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 // Close flushes the final chunk — marked as the last chunk — and reports
 // any error. It is idempotent: calling it again returns the same result
 // without writing more data. Close does not close the underlying writer.
+// It returns the Writer's chunk buffers to the pool (see pool.go).
 func (w *Writer) Close() error {
 	if w.err != nil {
 		return w.err
@@ -106,11 +108,21 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closed = true
-	if err := w.flush(true); err != nil {
+	err := w.flush(true)
+	w.release()
+	if err != nil {
 		w.err = err
 		return err
 	}
 	return nil
+}
+
+// release returns the chunk buffers to the pool; the Writer must not touch
+// them afterwards.
+func (w *Writer) release() {
+	putPlaintextBuf(w.buf)
+	putBuf(w.sealBuf)
+	w.buf, w.sealBuf = nil, nil
 }
 
 // ChunkSize returns the plaintext chunk size in effect.
@@ -123,10 +135,11 @@ func (w *Writer) flush(last bool) error {
 	if w.index >= w.maxChunks {
 		return ErrTooManyChunks
 	}
-	nonce := streamNonce(w.base, uint32(w.index), last)
-	// Seal appends the ciphertext+tag into sealBuf's backing array, which
-	// is sized for one chunk, so no allocation happens in steady state.
-	w.sealBuf = w.aead.Seal(w.sealBuf[:0], nonce[:], w.buf, w.aad)
+	// The nonce is built on the Writer and Seal appends the ciphertext+tag
+	// into sealBuf's backing array, which is sized for one chunk, so no
+	// allocation happens in steady state.
+	w.nonce = streamNonce(w.base, uint32(w.index), last)
+	w.sealBuf = w.aead.Seal(w.sealBuf[:0], w.nonce[:], w.buf, w.aad)
 	if err := writeAll(w.dst, w.sealBuf); err != nil {
 		return err
 	}
