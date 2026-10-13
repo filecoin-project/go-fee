@@ -7,11 +7,13 @@ across two implementations:
 - **TypeScript** — the reference `foc-encryption`
   ([`Kubuxu/foc-encryption-demo`](https://github.com/Kubuxu/foc-encryption-demo),
   `packages/foc-encryption`), **pinned** in
-  [`pull-foc-encryption.sh`](./pull-foc-encryption.sh) to `158571ae…` on
-  `master` — the RFC 9052 §5.3 fix, which landed upstream in
-  [PR #2](https://github.com/Kubuxu/foc-encryption-demo/pull/2). Before that fix
-  the reference sealed tag-96 bodies under the wrong `"Encrypt0"` context, so
-  vectors are only comparable against this commit or later.
+  [`pull-foc-encryption.sh`](./pull-foc-encryption.sh) to `69d888d…`, the
+  head of [PR #3](https://github.com/Kubuxu/foc-encryption-demo/pull/3), which
+  moves the chunk size and count into the protected header. Commits before it
+  carry them unprotected, and commits before
+  [PR #2](https://github.com/Kubuxu/foc-encryption-demo/pull/2) also seal
+  tag-96 bodies under the wrong `"Encrypt0"` context, so vectors are only
+  comparable against this commit or later.
 
 The reference is the **source of truth** for the wire format; these vectors pin
 to it and this repo matches it (see [Wire format](#wire-format)).
@@ -103,7 +105,8 @@ The driver writes a TS-produced fixture only when its directory is absent; set
 `FEE_VECTORS_REGEN=1` to rewrite one that is already committed.
 
 `pull-foc-encryption.sh` vendors the pinned reference into `ts/vendor/`
-(gitignored — never committed): `git clone` + `git fetch refs/heads/master`,
+(gitignored — never committed): `git clone` + `git fetch` of the ref that
+reaches the pin (`REF_FETCH`),
 checking out the pinned SHA, and falling back to fetching the pinned source files
 from `raw.githubusercontent.com` where `git` is unavailable. It requires
 [`bun`](https://bun.sh) to run the TypeScript.

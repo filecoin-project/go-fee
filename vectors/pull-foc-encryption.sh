@@ -18,8 +18,8 @@
 set -euo pipefail
 
 REF_REPO="https://github.com/Kubuxu/foc-encryption-demo"
-REF_SHA="158571aed08239d6b08b41d390d8ff9d915fd145"
-REF_FETCH="refs/heads/master"                         # ref that reaches REF_SHA
+REF_SHA="69d888d9de1732b1973f46cc6576a8089b68a287"
+REF_FETCH="refs/pull/3/head"                          # ref that reaches REF_SHA
 
 PKG_SUBDIR="packages/foc-encryption"
 
