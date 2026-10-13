@@ -164,6 +164,9 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 	// The recovered CEK is ours; wipe it once newRangeReader has copied it into
 	// the body cipher (synchronously, before it returns).
 	defer zero(cek)
+	if err := checkCEK(cek); err != nil {
+		return nil, err
+	}
 
 	return newRangeReader(env, blob, blobSize, headerLen, cek, start, end)
 }

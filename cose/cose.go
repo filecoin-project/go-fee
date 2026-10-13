@@ -139,14 +139,21 @@ const (
 	majorMap        byte = 5
 )
 
+// maxNestedLevels is how deeply decoding descends into nested arrays and maps,
+// counting the outermost item. It matches the TypeScript FEE implementation's
+// limit, so both accept the same application metadata; the CBOR library's
+// default is 32.
+const maxNestedLevels = 256
+
 // encMode encodes in RFC 8949 core deterministic form (definite lengths,
 // shortest integers, canonical map-key ordering). Deterministic encoding is
 // what keeps the protected header — and therefore the AAD — byte-stable.
 //
-// decMode rejects duplicate map keys (which COSE forbids) and decodes CBOR
-// integers leniently — unsigned to uint64, negative to int64. Decoded header
-// values then pass through normalizeValue, which folds every integer that fits
-// into an int64 and keeps only an unsigned value exceeding int64 as a uint64.
+// decMode rejects duplicate map keys (which COSE forbids), allows up to
+// maxNestedLevels of nesting, and decodes CBOR integers leniently — unsigned to
+// uint64, negative to int64. Decoded header values then pass through
+// normalizeValue, which folds every integer that fits into an int64 and keeps
+// only an unsigned value exceeding int64 as a uint64.
 // This mirrors the encode-side normalization, so any header this package can
 // Encode it can also Decode: an unsigned value above MaxInt64 round-trips as a
 // uint64 instead of failing to decode.
@@ -163,8 +170,9 @@ func init() {
 	encMode = em
 
 	dm, err := cbor.DecOptions{
-		DupMapKey: cbor.DupMapKeyEnforcedAPF,
-		IntDec:    cbor.IntDecConvertNone,
+		DupMapKey:       cbor.DupMapKeyEnforcedAPF,
+		IntDec:          cbor.IntDecConvertNone,
+		MaxNestedLevels: maxNestedLevels,
 	}.DecMode()
 	if err != nil {
 		panic(fmt.Sprintf("cose: building CBOR decode mode: %v", err))

@@ -33,8 +33,9 @@ func WithExpectedType(typ string) DecodeOption {
 
 // WithStrictEncoding requires every CBOR item in the envelope, including the
 // serialized protected headers it carries, to use definite lengths and
-// shortest-form arguments and to contain no floating-point values; otherwise
-// decoding fails with ErrMalformed. It lets a profile give each envelope one
+// shortest-form arguments, and to contain no floating-point values, no simple
+// values other than false, true and null, and no tags other than the
+// envelope's own; otherwise decoding fails with ErrMalformed. It lets a profile give each envelope one
 // accepted encoding. Duplicate map labels are rejected with or without it.
 func WithStrictEncoding() DecodeOption {
 	return func(c *decodeConfig) { c.strict = true }
@@ -46,7 +47,7 @@ func (cfg decodeConfig) checkStrict(item []byte, env *Envelope) error {
 	if !cfg.strict {
 		return nil
 	}
-	if err := checkStrictEncoding(item); err != nil {
+	if err := checkStrictEncoding(item, true); err != nil {
 		return err
 	}
 	protected := [][]byte{env.Headers.RawProtected}
@@ -57,7 +58,7 @@ func (cfg decodeConfig) checkStrict(item []byte, env *Envelope) error {
 		if len(p) == 0 {
 			continue
 		}
-		if err := checkStrictEncoding(p); err != nil {
+		if err := checkStrictEncoding(p, false); err != nil {
 			return fmt.Errorf("protected header: %w", err)
 		}
 	}

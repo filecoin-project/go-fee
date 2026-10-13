@@ -218,9 +218,10 @@ var (
 	// ErrNilUnwrapper means Decrypt was given a nil RecipientUnwrapper.
 	ErrNilUnwrapper = errors.New("fee: nil recipient unwrapper")
 
-	// ErrInvalidCEK means a caller-provided content-encryption key (see
-	// EncryptWithCEK / DecryptWithCEK) was not the required AES-256 key length.
-	ErrInvalidCEK = errors.New("fee: content-encryption key must be 32 bytes")
+	// ErrInvalidCEK means a content-encryption key, whether caller-provided (see
+	// EncryptWithCEK / DecryptWithCEK) or recovered by unwrapping a recipient,
+	// was not 32 bytes or was all zeros.
+	ErrInvalidCEK = errors.New("fee: content-encryption key must be 32 bytes and not all zeros")
 
 	// ErrContentLengthMismatch means the plaintext length declared via
 	// WithContentLength did not match the number of bytes actually read; it
@@ -566,6 +567,9 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 	// The recovered CEK is ours; wipe it once openStream has copied it into the
 	// body cipher (synchronously, before it returns).
 	defer zero(cek)
+	if err := checkCEK(cek); err != nil {
+		return nil, err
+	}
 
 	return openStream(env, ciphertext, cek)
 }
@@ -790,14 +794,20 @@ func buildBodyParamsWithAAD(env *cose.Envelope) (bodyParams, []byte, error) {
 	return body, aad, nil
 }
 
-// checkCEK reports whether a caller-provided content-encryption key is the right
-// length for the FEE body cipher. It is the one spelling of the check every
-// external-CEK entry point applies, so they all report ErrInvalidCEK the same way.
+// checkCEK reports whether a content-encryption key is usable by the FEE body
+// cipher: exactly 32 bytes and not all zeros. It is the one spelling of the
+// check every entry point applies, to caller-provided keys and to keys
+// recovered by unwrapping alike, so they all report ErrInvalidCEK the same way.
 func checkCEK(cek []byte) error {
 	if len(cek) != aesstream.KeySize {
-		return fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+		return fmt.Errorf("%w, got %d bytes", ErrInvalidCEK, len(cek))
 	}
-	return nil
+	for _, b := range cek {
+		if b != 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w, got an all-zero key", ErrInvalidCEK)
 }
 
 // matchRecipient returns the first recipient whose kid equals want. A recipient

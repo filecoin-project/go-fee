@@ -6,17 +6,28 @@ import (
 )
 
 // maxStrictDepth bounds how deeply checkStrictEncoding descends into nested
-// arrays, maps and tags, so a hostile envelope cannot exhaust the stack.
-const maxStrictDepth = 256
+// arrays and maps, so a hostile envelope cannot exhaust the stack. It matches
+// maxNestedLevels, the limit the CBOR decoder itself applies.
+const maxStrictDepth = maxNestedLevels
 
 // checkStrictEncoding reports whether data is exactly one CBOR item encoded
 // under the strict profile [WithStrictEncoding] enables: every length and
 // integer argument in its shortest form, no indefinite-length items, no
-// floating-point values, and no reserved additional-information values. Byte
-// strings are not descended into; a caller checks nested CBOR (a protected
-// header) separately.
-func checkStrictEncoding(data []byte) error {
-	next, err := strictItem(data, 0, 0)
+// floating-point values, no simple values other than false, true and null, no
+// reserved additional-information values, and no tags except, when outerTag is
+// set, the one tag that wraps the whole item (a COSE envelope's 16 or 96).
+// Byte strings are not descended into; a caller checks nested CBOR (a
+// protected header) separately.
+func checkStrictEncoding(data []byte, outerTag bool) error {
+	start := 0
+	if outerTag && len(data) > 0 && data[0]>>5 == 6 {
+		_, i, err := strictArgument(data, 1, data[0]&0x1f)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		start = i
+	}
+	next, err := strictItem(data, start, 0)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
@@ -40,16 +51,12 @@ func strictItem(data []byte, i, depth int) (int, error) {
 
 	if major == 7 {
 		switch {
+		case info >= 20 && info <= 22:
+			return i, nil // false, true, null
 		case info < 24:
-			return i, nil // false, true, null, undefined and other simple values
+			return 0, fmt.Errorf("simple value %d", info) // undefined and unassigned
 		case info == 24:
-			if i >= len(data) {
-				return 0, fmt.Errorf("truncated simple value")
-			}
-			if data[i] < 32 {
-				return 0, fmt.Errorf("simple value %d not in its shortest form", data[i])
-			}
-			return i + 1, nil
+			return 0, fmt.Errorf("simple value")
 		case info <= 27:
 			return 0, fmt.Errorf("floating-point value")
 		case info == 31:
@@ -88,8 +95,8 @@ func strictItem(data []byte, i, depth int) (int, error) {
 			}
 		}
 		return i, nil
-	default: // 6, tags
-		return strictItem(data, i, depth+1)
+	default: // 6
+		return 0, fmt.Errorf("tag %d", arg)
 	}
 }
 

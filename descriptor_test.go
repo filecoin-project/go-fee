@@ -305,7 +305,7 @@ func TestBodyDescriptorValidate(t *testing.T) {
 			// The range entry point rejects it up front for the same reason,
 			// rather than letting it fail as an authentication error later.
 			_, err := fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
-				make([]byte, aesstream.KeySize), 0, 9, &m)
+				bytes.Repeat([]byte{1}, aesstream.KeySize), 0, 9, &m)
 			require.ErrorIs(t, err, fee.ErrInvalidDescriptor)
 		})
 	}

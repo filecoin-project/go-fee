@@ -327,6 +327,10 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 > catastrophic. `fee.Encrypt` draws a fresh CEK every call; with
 > `EncryptWithCEK` this is the caller's obligation.
 
+A CEK must be 32 bytes and not all zeros. Every entry point that takes one
+rejects any other key with `fee.ErrInvalidCEK`, and so does decryption when a
+recipient unwraps to one.
+
 ### Range (seekable) decryption
 
 Because chunks are sealed independently, any plaintext byte range can be
@@ -467,8 +471,10 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
 - **A256KW recipients** (alg −5) — the protected header is empty (`h''`) and
   `alg` is unprotected, as RFC 9053 §6.2.1 requires.
 - **Envelope processing** — every CBOR item, including the serialized protected
-  headers, must use definite lengths and shortest-form arguments and contain no
-  floats (`cose.WithStrictEncoding`); duplicate labels are rejected. `crit` must
+  headers, must use definite lengths and shortest-form arguments, and may
+  contain no floats, no tags besides the envelope's own, and no simple values
+  other than `false`, `true` and `null` (`cose.WithStrictEncoding`); nesting is
+  limited to 256 levels and duplicate labels are rejected. `crit` must
   be protected and may name only parameters this package processes that are
   present in the same protected header, never `crit` itself. A Partial IV
   in either content bucket is rejected. Unknown non-critical parameters are

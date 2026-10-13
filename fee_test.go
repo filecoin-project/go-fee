@@ -1284,3 +1284,58 @@ func TestBaseNonceLength(t *testing.T) {
 		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %d-byte iv", n)
 	}
 }
+
+// TestAllZeroCEKRejected: an all-zero CEK is refused wherever one enters,
+// including when a recipient unwraps to one.
+func TestAllZeroCEKRejected(t *testing.T) {
+	zeroCEK := make([]byte, aesstream.KeySize)
+
+	_, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), zeroCEK, nil)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "EncryptWithCEK")
+
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(blob), zeroCEK)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptWithCEK")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), zeroCEK, 0, 9, nil)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptRangeWithCEK")
+
+	// A recipient whose wrapped key unwraps to all zeros.
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Recipients[0].Ciphertext, err = aeskw.Wrap(kek, zeroCEK)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	forged := append(header, ciphertext...)
+
+	_, err = fee.Decrypt(bytes.NewReader(forged), fee.NewA256KWUnwrapper(a256kwKID, kek))
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "Decrypt")
+	_, err = fee.DecryptRange(bytes.NewReader(forged), int64(len(forged)), fee.NewA256KWUnwrapper(a256kwKID, kek), 0, 9)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptRange")
+}
+
+// TestAppMetadataNesting: application metadata may nest up to 256 levels
+// deep, the TypeScript implementation's limit, and no deeper.
+func TestAppMetadataNesting(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	nested := func(depth int) any {
+		var v any = int64(1)
+		for range depth {
+			v = []any{v}
+		}
+		return v
+	}
+
+	blob := sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[any]any{"x": nested(200)}), plaintext, cek)
+	r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.NoError(t, err, "200 levels decode")
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+
+	blob = sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[any]any{"x": nested(300)}), plaintext, cek)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, cose.ErrMalformed, "300 levels are refused")
+}

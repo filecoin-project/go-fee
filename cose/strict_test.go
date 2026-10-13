@@ -30,13 +30,12 @@ func TestCheckStrictEncoding(t *testing.T) {
 		"byte string":          mustHex(t, "43010203"),
 		"text string":          mustHex(t, "6161"),
 		"nested array and map": mustHex(t, "82a1010280"),
-		"tag":                  mustHex(t, "d0f6"),
 		"false true null":      mustHex(t, "83f4f5f6"),
-		"simple value":         mustHex(t, "f820"),
 	}
 	for name, data := range valid {
-		require.NoError(t, checkStrictEncoding(data), name)
+		require.NoError(t, checkStrictEncoding(data, false), name)
 	}
+	require.NoError(t, checkStrictEncoding(mustHex(t, "d08343a10101a0f6"), true), "the envelope's own outer tag")
 
 	invalid := map[string][]byte{
 		"non-minimal one-byte argument":   mustHex(t, "1805"),
@@ -52,15 +51,21 @@ func TestCheckStrictEncoding(t *testing.T) {
 		"indefinite map":                  mustHex(t, "bf0102ff"),
 		"lone break":                      mustHex(t, "ff"),
 		"reserved additional info":        mustHex(t, "1c"),
-		"non-minimal simple value":        mustHex(t, "f810"),
+		"undefined":                       mustHex(t, "f7"),
+		"unassigned simple value":         mustHex(t, "e0"),
+		"one-byte simple value":           mustHex(t, "f820"),
+		"tag":                             mustHex(t, "d0f6"),
+		"tag inside an array":             mustHex(t, "81d82a4101"),
 		"truncated string":                mustHex(t, "4301"),
 		"truncated array":                 mustHex(t, "8201"),
 		"trailing bytes":                  mustHex(t, "0000"),
 		"too deeply nested":               deep,
 	}
 	for name, data := range invalid {
-		require.ErrorIs(t, checkStrictEncoding(data), ErrMalformed, name)
+		require.ErrorIs(t, checkStrictEncoding(data, false), ErrMalformed, name)
 	}
+	// Only the outermost tag is exempt: one nested inside the envelope is not.
+	require.ErrorIs(t, checkStrictEncoding(mustHex(t, "d08343a10101a1186dd82a4101f6"), true), ErrMalformed, "tag inside the envelope")
 }
 
 // TestDecodeWithStrictEncoding: the option rejects an envelope whose outer
@@ -72,6 +77,8 @@ func TestDecodeWithStrictEncoding(t *testing.T) {
 		"non-minimal int in the protected header": "d08344a1011801a0f6",
 		"float in the unprotected header":         "d08343a10101a101f93e00f6",
 		"indefinite unprotected map":              "d08343a10101bffff6",
+		"tag in the unprotected header":           "d08343a10101a1186dd82a4101f6",
+		"undefined in the unprotected header":     "d08343a10101a1186df7f6",
 	}
 	for name, h := range cases {
 		data := mustHex(t, h)
