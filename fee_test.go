@@ -1232,3 +1232,55 @@ func TestDecryptRejectsMalformedAppMetadata(t *testing.T) {
 		})
 	}
 }
+
+// TestDecryptContentType: content_type must be a text string or a
+// non-negative integer, and an envelope may mark a present one critical.
+func TestDecryptContentType(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+
+	for name, protected := range map[string]cose.Header{
+		"text":                  bodyHeader().Set(cose.HeaderLabelContentType, "application/pdf"),
+		"integer":               bodyHeader().Set(cose.HeaderLabelContentType, int64(50)),
+		"text, marked critical": bodyHeader().Set(cose.HeaderLabelContentType, "text/plain").Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelContentType}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, err := fee.DecryptWithCEK(bytes.NewReader(sealEnvelope(t, protected, plaintext, cek)), cek)
+			require.NoError(t, err)
+			got, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, got)
+		})
+	}
+
+	for name, value := range map[string]any{
+		"negative integer": int64(-1),
+		"byte string":      []byte("text/plain"),
+		"boolean":          true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelContentType, value), plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// TestBaseNonceLength: an iv that is not a 7-byte base nonce is malformed on
+// every path, including the header-only PlaintextSize, which builds no cipher.
+func TestBaseNonceLength(t *testing.T) {
+	cek := newCEK(t)
+	for _, n := range []int{aesstream.BaseNonceSize - 1, aesstream.BaseNonceSize + 1} {
+		env := &cose.Envelope{Headers: cose.Headers{
+			Protected:   bodyHeader().Set(cose.HeaderLabelIV, bytes.Repeat([]byte{0x5a}, n)),
+			Unprotected: cose.Header{},
+		}}
+		header, err := env.Encode()
+		require.NoError(t, err)
+		blob := append(header, make([]byte, 100+aesstream.TagSize)...)
+
+		_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %d-byte iv", n)
+		_, err = fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %d-byte iv", n)
+	}
+}

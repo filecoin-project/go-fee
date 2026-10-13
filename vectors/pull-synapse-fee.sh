@@ -92,10 +92,13 @@ else
   log "source obtained via raw.githubusercontent.com"
 fi
 
-command -v node >/dev/null 2>&1 || {
-  echo "error: Node 22.18 or later is required to run the TS reference" >&2
+# The driver relies on Node's built-in TypeScript type stripping and
+# import.meta.dirname, both available unflagged from Node 22.18.
+if ! command -v node >/dev/null 2>&1 ||
+  ! node -e 'const [maj, min] = process.versions.node.split(".").map(Number); process.exit(maj > 22 || (maj === 22 && min >= 18) ? 0 : 1)'; then
+  echo "error: Node 22.18 or later is required to run the TS reference (found: $(node --version 2>/dev/null || echo none))" >&2
   exit 1
-}
+fi
 
 log "installing the reference's dependencies (cborg, zod)"
 (cd "$TS_DIR" && npm install --silent --no-package-lock --no-audit --no-fund)

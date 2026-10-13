@@ -677,8 +677,9 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 
 // validateBodyParams checks a decoded envelope's FEE body headers — every FEE
 // parameter is protected, the algorithm is the chunked AES-256-GCM-STREAM
-// cipher, the base nonce (iv) is present, the chunk size is present and in
-// range, and a declared plaintext length is a non-negative integer.
+// cipher, the base nonce (iv) is present and 7 bytes, the chunk size is
+// present and in range, content_type and app_metadata have the types the wire
+// format allows, and a declared plaintext length is a non-negative integer.
 //
 // It is shared by the whole-object path's AAD-building resolution
 // ([buildBodyParamsWithAAD]) and the header-only sizing path ([PlaintextSize]),
@@ -714,6 +715,25 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	baseNonce, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: missing iv (base nonce)", ErrMalformedEnvelope)
+	}
+	// Checked here rather than left to the cipher, so the header-only sizing
+	// path refuses the same envelopes as the decrypting ones.
+	if len(baseNonce) != aesstream.BaseNonceSize {
+		return bodyParams{}, fmt.Errorf("%w: iv (base nonce) is %d bytes, want %d", ErrMalformedEnvelope, len(baseNonce), aesstream.BaseNonceSize)
+	}
+
+	// content_type is informational and otherwise ignored, but its type is
+	// part of the wire format: a text string or a non-negative integer.
+	if v, ok := env.Headers.Protected.Get(cose.HeaderLabelContentType); ok {
+		switch ct := v.(type) {
+		case string:
+		case int64:
+			if ct < 0 {
+				return bodyParams{}, fmt.Errorf("%w: content_type %d is negative", ErrMalformedEnvelope, ct)
+			}
+		default:
+			return bodyParams{}, fmt.Errorf("%w: content_type is neither a text string nor a non-negative integer", ErrMalformedEnvelope)
+		}
 	}
 
 	chunkSize, ok := env.Headers.Protected.Int(labelChunkSize)
