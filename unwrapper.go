@@ -44,9 +44,9 @@ func NewECDHESUnwrapper(kid []byte, priv *ecdh.PrivateKey) RecipientUnwrapper {
 func (u *ecdhESUnwrapper) keyID() []byte { return u.kid }
 
 func (u *ecdhESUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
-	alg, ok := r.Headers.Protected.Int(cose.HeaderLabelAlg)
-	if !ok {
-		return nil, fmt.Errorf("%w: recipient algorithm header missing or not an integer", ErrUnsupportedRecipientAlg)
+	alg, err := recipientAlg(r)
+	if err != nil {
+		return nil, err
 	}
 	if alg != cose.AlgECDHESA256KW {
 		return nil, fmt.Errorf("%w: recipient algorithm %d is not ECDH-ES+A256KW", ErrUnsupportedRecipientAlg, alg)
@@ -121,16 +121,41 @@ func NewA256KWUnwrapper(kid, kek []byte) RecipientUnwrapper {
 func (u *a256kwUnwrapper) keyID() []byte { return u.kid }
 
 func (u *a256kwUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
-	alg, ok := r.Headers.Protected.Int(cose.HeaderLabelAlg)
-	if !ok {
-		return nil, fmt.Errorf("%w: recipient algorithm header missing or not an integer", ErrUnsupportedRecipientAlg)
+	alg, err := recipientAlg(r)
+	if err != nil {
+		return nil, err
 	}
 	if alg != cose.AlgA256KW {
 		return nil, fmt.Errorf("%w: recipient algorithm %d is not A256KW", ErrUnsupportedRecipientAlg, alg)
+	}
+	// RFC 9053 §6.2.1: an AES Key Wrap recipient's protected header MUST be
+	// empty, so its algorithm can only have come from the unprotected header.
+	if prot, err := r.Headers.ProtectedBytes(); err != nil || len(prot) != 0 {
+		return nil, fmt.Errorf("%w: A256KW recipient protected header must be empty", ErrMalformedEnvelope)
 	}
 	cek, err := aeskw.Unwrap(u.kek, r.Ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("fee: A256KW unwrap: %w", err)
 	}
 	return cek, nil
+}
+
+// recipientAlg returns a recipient's key-wrap algorithm. COSE lets alg sit in
+// either header bucket, and FEE uses both: ECDH-ES+A256KW recipients carry it
+// protected, while A256KW recipients must leave the protected header empty and
+// carry it unprotected (RFC 9053 §6.2.1). A recipient that names it in both is
+// malformed.
+func recipientAlg(r *cose.Recipient) (int64, error) {
+	if r.Headers.Protected.Has(cose.HeaderLabelAlg) && r.Headers.Unprotected.Has(cose.HeaderLabelAlg) {
+		return 0, fmt.Errorf("%w: recipient algorithm header in both buckets", ErrMalformedEnvelope)
+	}
+	h := r.Headers.Protected
+	if r.Headers.Unprotected.Has(cose.HeaderLabelAlg) {
+		h = r.Headers.Unprotected
+	}
+	alg, ok := h.Int(cose.HeaderLabelAlg)
+	if !ok {
+		return 0, fmt.Errorf("%w: recipient algorithm header missing or not an integer", ErrUnsupportedRecipientAlg)
+	}
+	return alg, nil
 }

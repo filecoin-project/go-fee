@@ -1,30 +1,32 @@
-// driver.ts drives the real (pinned) foc-encryption reference implementation to
-// (re)generate and verify the FEE cross-implementation fixtures under
-// ../testdata. It is invoked by ../pull-foc-encryption.sh, which vendors the
-// pinned source into ./vendor/foc-encryption and installs cborg. Run with bun:
+// driver.ts drives the real (pinned) TypeScript FEE reference,
+// @filoz/filecoin-encryption-envelope from synapse-sdk, to (re)generate and
+// verify the FEE cross-implementation fixtures under ../testdata. It is invoked
+// by ../pull-synapse-fee.sh, which vendors the pinned source into
+// ./vendor/filecoin-encryption-envelope and installs its dependencies. Run with
+// Node, which strips the TypeScript types itself:
 //
-//   bun driver.ts [generate|verify|all]   (default: all)
+//   node driver.ts [generate|verify|all]   (default: all)
 //
-// generate — encrypt with foc-encryption and write the TS-produced fixtures
+// generate — encrypt with the reference and write the TS-produced fixtures
 //            (`multi-chunk-ts`, `empty-file-ts`: TS seals, Go decrypts). A
 //            fixture that already exists on disk is left alone unless
 //            FEE_VECTORS_REGEN=1 is set: the reference draws a random base nonce
 //            per encrypt, so regenerating rewrites a committed blob.
-// verify   — decrypt every committed fixture with foc-encryption and check the
-//            recovered plaintext (TS decrypts the Go-sealed blobs, and the
-//            reference parses their recipient descriptors). Exits non-zero on
-//            any mismatch.
-import { CoseAlgorithm, decrypt, encrypt, parseEnvelope } from './vendor/foc-encryption/src/index.ts'
+// verify   — for every committed fixture, decrypt the whole object from the CEK,
+//            decrypt a range from the CEK, and unwrap the CEK from each A256KW
+//            recipient, checking the recovered plaintext each time (TS reads
+//            the Go-sealed blobs). Exits non-zero on any mismatch.
+import * as fee from './vendor/filecoin-encryption-envelope/src/index.ts'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const HERE = import.meta.dir
+const HERE = import.meta.dirname
 const TESTDATA = join(HERE, '..', 'testdata')
 
-// Must match the Go side (fee/vectors/helpers_test.go) and the reference
-// (packages/foc-encryption/src/cose/headers.ts).
-const FEE_TYP = 'application/vnd.foc-envelope+cose'
+// Must match the Go side (fee/vectors/helpers_test.go) and FIP-1253.
+const FEE_TYP = 'application/vnd.filecoin-encryption+cose'
+const ALG_CHUNKED = -65793
 const CHUNK_SIZE = 4096
 
 function sha256(label: string, n = 32): Uint8Array {
@@ -32,6 +34,7 @@ function sha256(label: string, n = 32): Uint8Array {
 }
 const toHex = (u: Uint8Array): string => Buffer.from(u).toString('hex')
 const fromHex = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, 'hex'))
+const equal = (a: Uint8Array, b: Uint8Array): boolean => Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0
 
 // repeatTo returns label repeated until it reaches at least n bytes, the
 // deterministic filler for a multi-chunk plaintext.
@@ -42,6 +45,21 @@ function repeatTo(label: string, n: number): Uint8Array {
   return new Uint8Array(bytes)
 }
 
+// through pipes bytes through one of the reference's transform pairs and
+// collects the output.
+async function through(input: Uint8Array, pair: ReadableWritablePair<Uint8Array, Uint8Array>): Promise<Uint8Array> {
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (input.length > 0) controller.enqueue(new Uint8Array(input))
+      controller.close()
+    },
+  })
+  return new Uint8Array(await new Response(source.pipeThrough(pair)).arrayBuffer())
+}
+
+const collect = async (stream: ReadableStream<Uint8Array>): Promise<Uint8Array> =>
+  new Uint8Array(await new Response(stream).arrayBuffer())
+
 // The TS-produced fixtures. Each carries its own CEK label: no two fixtures may
 // share a CEK, since several are single-chunk and a shared CEK would give them
 // identical chunk-0 nonces (baseNonce ‖ 0 ‖ lastFlag) over different plaintexts.
@@ -50,7 +68,7 @@ const TS_FIXTURES = [
   {
     name: 'multi-chunk-ts',
     cekLabel: 'fil-473-fee-cek-ts-v1',
-    description: 'AC2: multi-chunk file encrypted in foc-encryption (TS); decrypts in Go.',
+    description: 'AC2: multi-chunk file encrypted in filecoin-encryption-envelope (TS); decrypts in Go.',
     // ~15 KiB, so the STREAM spans several 4 KiB chunks.
     plaintext: () => repeatTo('multi-chunk-ts/FIL-473 ', 15000),
   },
@@ -58,7 +76,7 @@ const TS_FIXTURES = [
     name: 'empty-file-ts',
     cekLabel: 'fee-cek-ts-empty-v1',
     description:
-      'Empty plaintext encrypted in foc-encryption (TS) (one empty final chunk, tag-only body); decrypts in Go.',
+      'Empty plaintext encrypted in filecoin-encryption-envelope (TS) (one empty final chunk, tag-only body); decrypts in Go.',
     plaintext: () => new Uint8Array(0),
   },
 ]
@@ -81,12 +99,13 @@ async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> 
 
   const cek = sha256(fixture.cekLabel)
   const plaintext = fixture.plaintext()
-
-  const blob = await encrypt(plaintext, cek, {
-    algorithm: CoseAlgorithm.CHUNKED_AES_256_GCM_STREAM,
-    chunkSize: CHUNK_SIZE,
-  })
-  const meta = parseEnvelope(blob)
+  const blob = await through(
+    plaintext,
+    fee.encrypt({ cek: new Uint8Array(cek), chunkSize: CHUNK_SIZE, contentLength: plaintext.length }),
+  )
+  const info = await fee.parse(blob)
+  if (info.scheme !== 'chunked') throw new Error(`${name}: expected a chunked envelope, got ${info.scheme}`)
+  const chunkCount = Math.max(1, Math.ceil(plaintext.length / info.params.chunkSize))
 
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'blob.bin'), blob)
@@ -99,17 +118,47 @@ async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> 
         producer: 'ts',
         description,
         tag: 16,
-        algorithm: CoseAlgorithm.CHUNKED_AES_256_GCM_STREAM,
+        algorithm: ALG_CHUNKED,
         typ: FEE_TYP,
-        chunk_size: meta.chunkSize ?? CHUNK_SIZE,
-        chunk_count: meta.chunkCount ?? 0,
+        chunk_size: info.params.chunkSize,
+        chunk_count: chunkCount,
         cek_hex: toHex(cek),
       },
       null,
       2,
     ) + '\n',
   )
-  console.log(`generated ${name}: blob=${blob.length}B chunks=${meta.chunkCount}`)
+  console.log(`generated ${name}: blob=${blob.length}B chunks=${chunkCount}`)
+}
+
+// verifyFixture runs every check the reference can make on one fixture and
+// returns the failures it found.
+async function verifyFixture(meta: any, blob: Uint8Array, expected: Uint8Array): Promise<string[]> {
+  const failures: string[] = []
+  const cek = fromHex(meta.cek_hex)
+
+  const whole = await through(blob, fee.decrypt(new Uint8Array(cek)))
+  if (!equal(whole, expected)) failures.push('whole-object plaintext does not match')
+
+  // A range from the middle of the object, when it has bytes to address.
+  if (expected.length > 0) {
+    const offset = Math.floor(expected.length / 3)
+    const length = Math.min(100, expected.length - offset)
+    const result = await fee.decryptRange(blob, new Uint8Array(cek), { offset, length })
+    const got = await collect(result.stream)
+    if (!equal(got, expected.subarray(offset, offset + length))) failures.push(`range ${offset}+${length} does not match`)
+    if (result.totalPlaintextLength !== expected.length) {
+      failures.push(`range reports ${result.totalPlaintextLength} plaintext bytes, want ${expected.length}`)
+    }
+  }
+
+  for (const r of meta.recipients ?? []) {
+    if (r.kind !== 'a256kw') continue
+    const unwrapper = await fee.recipients.createA256KWUnwrapper([{ kek: fromHex(r.a256kw_kek_hex), kid: fromHex(r.kid_hex) }])
+    const got = await through(blob, fee.decryptWith(unwrapper))
+    if (!equal(got, expected)) failures.push('plaintext via the A256KW recipient does not match')
+  }
+  return failures
 }
 
 async function verifyAll(): Promise<number> {
@@ -132,11 +181,11 @@ async function verifyAll(): Promise<number> {
     const expected = new Uint8Array(readFileSync(join(dir, 'plaintext.bin')))
     checked++
     try {
-      const got = await decrypt(blob, fromHex(meta.cek_hex))
-      if (Buffer.compare(Buffer.from(got), Buffer.from(expected)) === 0) {
+      const problems = await verifyFixture(meta, blob, expected)
+      if (problems.length === 0) {
         console.log(`PASS ${meta.name} (producer=${meta.producer}, tag=${meta.tag})`)
       } else {
-        console.error(`FAIL ${meta.name}: recovered plaintext does not match`)
+        for (const p of problems) console.error(`FAIL ${meta.name}: ${p}`)
         failures++
       }
     } catch (err) {
@@ -144,7 +193,7 @@ async function verifyAll(): Promise<number> {
       failures++
     }
   }
-  console.log(`verified ${checked} fixture(s) with foc-encryption; ${failures} failure(s)`)
+  console.log(`verified ${checked} fixture(s) with filecoin-encryption-envelope; ${failures} failure(s)`)
   return failures
 }
 

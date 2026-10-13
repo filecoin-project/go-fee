@@ -44,7 +44,7 @@ var coreVectors = map[string]string{
 func TestVectors(t *testing.T) {
 	fixtures, err := loadFixtures()
 	require.NoError(t, err)
-	require.NotEmpty(t, fixtures, "no fixtures found; run FEE_VECTORS_REGEN=1 go test -run TestGenerate and pull-foc-encryption.sh")
+	require.NotEmpty(t, fixtures, "no fixtures found; run FEE_VECTORS_REGEN=1 go test -run TestGenerate and pull-synapse-fee.sh")
 
 	seen := map[string]string{}
 	for _, f := range fixtures {
@@ -100,7 +100,7 @@ func TestVectors(t *testing.T) {
 
 	for name, producer := range coreVectors {
 		require.Equalf(t, producer, seen[name],
-			"missing/mismatched core fixture %q (have %q); regenerate Go fixtures and run pull-foc-encryption.sh", name, seen[name])
+			"missing/mismatched core fixture %q (have %q); regenerate Go fixtures and run pull-synapse-fee.sh", name, seen[name])
 	}
 }
 
@@ -115,8 +115,18 @@ func verifyRecipients(t *testing.T, f fixture, cek []byte) {
 
 	byAlg := map[int64]*cose.Recipient{}
 	for _, r := range p.recipients {
+		// alg is protected for ECDH-ES+A256KW and unprotected for A256KW,
+		// whose protected header must be empty (RFC 9053 §6.2.1).
 		alg, ok := r.Headers.Protected.Int(cose.HeaderLabelAlg)
+		if !ok {
+			alg, ok = r.Headers.Unprotected.Int(cose.HeaderLabelAlg)
+		}
 		require.True(t, ok, "recipient algorithm present")
+		if alg == cose.AlgA256KW {
+			prot, err := r.Headers.ProtectedBytes()
+			require.NoError(t, err)
+			require.Empty(t, prot, "A256KW recipient protected header is empty")
+		}
 		byAlg[alg] = r
 	}
 
@@ -200,7 +210,7 @@ func (zeroReader) Read(p []byte) (int, error) {
 
 // TestGenerate (re)writes the Go-produced fixtures. It is guarded by
 // FEE_VECTORS_REGEN so a normal `go test` never rewrites checked-in files. The
-// TS-produced fixtures come from pull-foc-encryption.sh, not from here.
+// TS-produced fixtures come from pull-synapse-fee.sh, not from here.
 //
 //	FEE_VECTORS_REGEN=1 GOWORK=off go test ./fee/vectors -run TestGenerate -v
 func TestGenerate(t *testing.T) {
@@ -210,19 +220,19 @@ func TestGenerate(t *testing.T) {
 
 	// AC1 — single-chunk file sealed in Go (tag 16), for the reference to decrypt.
 	genGoBody(t, "single-chunk-go",
-		"AC1: single-chunk file encrypted in Go; decrypts in foc-encryption (TS).",
+		"AC1: single-chunk file encrypted in Go; decrypts in filecoin-encryption-envelope (TS).",
 		[]byte("FEE cross-impl vector FIL-473: single chunk, sealed in Go, opened in TS.\n"))
 
 	// A Go-sealed multi-chunk file too (tag 16), so the reference is exercised
 	// across a chunk boundary in the Go->TS direction as well.
 	genGoBody(t, "multi-chunk-go",
-		"Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in foc-encryption (TS).",
+		"Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in filecoin-encryption-envelope (TS).",
 		bytes.Repeat([]byte("multi-chunk-go/FIL-473 "), 700)) // ~15 KiB > chunk size
 
 	// An empty file sealed in Go (tag 16): one empty final chunk, so the body is
 	// a bare 16-byte tag. The framing edge case the reference must agree on.
 	genGoBody(t, "empty-file-go",
-		"Empty plaintext encrypted in Go (one empty final chunk, tag-only body); decrypts in foc-encryption (TS).",
+		"Empty plaintext encrypted in Go (one empty final chunk, tag-only body); decrypts in filecoin-encryption-envelope (TS).",
 		[]byte{})
 
 	// A plaintext that is an exact multiple of the chunk size, where the final
@@ -232,13 +242,13 @@ func TestGenerate(t *testing.T) {
 	// declare one more, and a decoder must not derive the count from the
 	// plaintext length.
 	genGoBody(t, "exact-multiple-go",
-		"Plaintext of exactly 3 chunks (full final chunk) encrypted in Go; decrypts in foc-encryption (TS).",
+		"Plaintext of exactly 3 chunks (full final chunk) encrypted in Go; decrypts in filecoin-encryption-envelope (TS).",
 		bytes.Repeat([]byte{0x5a}, 3*vectorChunkSize))
 
 	// AC3 — multi-recipient envelope sealed in Go (tag 96) with a real
 	// ECDH-ES+A256KW (X25519) recipient and a real A256KW recipient.
 	genGoMultiRecipient(t, "multi-recipient-go",
-		"AC3: multi-recipient envelope (ECDH-ES+A256KW/X25519 and A256KW) encrypted in Go; foc-encryption parses recipients and decrypts the body from the CEK.",
+		"AC3: multi-recipient envelope (ECDH-ES+A256KW/X25519 and A256KW) encrypted in Go; filecoin-encryption-envelope decrypts the body from the CEK and unwraps the A256KW recipient.",
 		[]byte("FEE cross-impl vector FIL-473: multi-recipient envelope, two wrapped CEKs.\n"))
 }
 

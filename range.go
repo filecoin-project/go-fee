@@ -9,17 +9,16 @@ import (
 	"github.com/filecoin-project/go-fee/cose"
 )
 
-// ErrSizeMismatch means the number of chunks the supplied blob size accounts for
-// disagrees with the chunk count the envelope declares: the blob is truncated or
+// ErrSizeMismatch means the plaintext length the blob size implies disagrees
+// with the plaintext length the envelope declares: the blob is truncated or
 // padded, or the size came from the wrong object.
 //
-// The chunk count rides in the unprotected header ([WithContentLength] writes it
-// when the plaintext length is known), so it is not covered by the envelope AAD
-// and an attacker rewriting the blob can strip or adjust it. This check therefore
-// catches operational mistakes — a stale size in a store's metadata, a partially
-// written object — and is not an integrity guarantee. Whole-object integrity must
-// come from the layer that supplied the size (a CID, a signed manifest).
-var ErrSizeMismatch = errors.New("fee: blob size disagrees with the envelope's declared chunk count")
+// The length rides in the protected header ([WithContentLength] writes it when
+// the plaintext length is known), so the envelope AAD covers it: an attacker can
+// neither adjust it to match a shortened blob nor strip it, since either change
+// fails every chunk's tag. The declared value is trustworthy once a chunk
+// authenticates, which a range read does before returning plaintext.
+var ErrSizeMismatch = errors.New("fee: blob size disagrees with the envelope's declared plaintext length")
 
 // errNilBlob is reported by every range entry point that would otherwise read
 // from a nil blob, whether or not it decodes an envelope first.
@@ -130,19 +129,18 @@ func (r *RangeReader) CiphertextSpan() (start, end int64) { return r.spanStart, 
 // past the last plaintext byte — fails with an error matching
 // [aesstream.ErrRange] (an HTTP consumer's 416); there is no empty range. A
 // blobSize that cannot be a FEE blob fails with [aesstream.ErrCiphertextSize],
-// and one that contradicts the envelope's declared chunk count with
+// and one that contradicts the envelope's declared plaintext length with
 // [ErrSizeMismatch]. An envelope larger than 1 MiB is rejected as malformed.
 //
 // Every chunk the range overlaps is authenticated, so a tampered chunk surfaces
 // as an error from Read rather than as corrupt plaintext. Chunks outside the range
-// are never read and so never checked, and — unlike whole-object [Decrypt] — a
-// range read cannot by itself detect that the stored object was truncated: an
-// understated blobSize describes a shorter object whose ranges decrypt cleanly.
-// The chunk-count check catches an understatement of a whole chunk or more when
-// the envelope carries a count, but a size short by only part of the final chunk
-// accounts for the same number of chunks and so passes it, surfacing instead as
-// an authentication failure when that chunk is read. Whole-object integrity is
-// properly the job of the layer that supplied blobSize.
+// are never read and so never checked. When the envelope declares the plaintext
+// length, any truncated or padded blobSize contradicts it and fails with
+// [ErrSizeMismatch], and the declaration itself is authenticated by every chunk
+// the range reads. Without a declared length a range read cannot by itself
+// detect that the stored object was truncated: an understated blobSize describes
+// a shorter object whose ranges decrypt cleanly, and only reading the final
+// chunk (or the layer that supplied blobSize) settles it.
 func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, start, end int64) (*RangeReader, error) {
 	if unwrap == nil {
 		return nil, ErrNilUnwrapper
@@ -187,7 +185,7 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 //
 // blobSize is the size of the whole stored blob, envelope included, exactly as
 // for [DecryptRange]. When desc is non-nil there is no envelope to consult, so
-// this path cannot perform the chunk-count cross-check that reports
+// this path cannot perform the plaintext-length cross-check that reports
 // [ErrSizeMismatch] on the envelope-backed paths.
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
@@ -225,7 +223,7 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, start, en
 // Content-Range header, or resolves a suffix range ("bytes=-N" is
 // start = size-N) without constructing a decryptor.
 //
-// It reports the same envelope, size and chunk-count errors as [DecryptRange].
+// It reports the same envelope, size and plaintext-length errors as [DecryptRange].
 func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 	env, headerLen, err := decodeHeaderAt(blob, blobSize)
 	if err != nil {
@@ -294,35 +292,25 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 
 // envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came
 // from its envelope rather than from a caller's cache: it adds the cross-check of
-// the envelope's declared chunk count against the chunks the ciphertext actually
-// holds, when a count is present, catching a blob size that describes a different
-// object than the envelope does.
-//
-// The comparison is against [aesstream.ChunkCount] rather than a count re-derived
-// from the plaintext size, because a plaintext that is an exact multiple of the
-// chunk size seals to either k chunks or k+1 (with an empty final chunk) and both
-// decrypt identically. Deriving from the plaintext size would recognize only the
-// first form and refuse the second, which the whole-object [Decrypt] path reads
-// without complaint.
+// the envelope's declared plaintext length against the length the ciphertext
+// actually holds, when a length is declared, catching a blob size that describes
+// a different object than the envelope does. Each plaintext length has exactly
+// one valid ciphertext length, so the comparison is exact.
 func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
 	plainSize, err := plaintextSizeFrom(blobSize, headerLen, chunkSize)
 	if err != nil {
 		return 0, err
 	}
-	if !env.Headers.Protected.Has(labelChunkCount) {
+	if !env.Headers.Protected.Has(labelPlaintextLength) {
 		return plainSize, nil
 	}
-	declared, ok := env.Headers.Protected.Int(labelChunkCount)
-	if !ok {
-		return 0, fmt.Errorf("%w: chunk-count header is present but not an integer", ErrMalformedEnvelope)
+	declared, ok := env.Headers.Protected.Int(labelPlaintextLength)
+	if !ok || declared < 0 {
+		return 0, fmt.Errorf("%w: plaintext-length header is not a non-negative integer", ErrMalformedEnvelope)
 	}
-	want, err := aesstream.ChunkCount(blobSize-headerLen, chunkSize)
-	if err != nil {
-		return 0, fmt.Errorf("fee: blob of %d ciphertext bytes: %w", blobSize-headerLen, err)
-	}
-	if declared != want {
-		return 0, fmt.Errorf("%w: envelope declares %d chunks, the ciphertext holds %d",
-			ErrSizeMismatch, declared, want)
+	if declared != plainSize {
+		return 0, fmt.Errorf("%w: envelope declares %d plaintext bytes, the ciphertext holds %d",
+			ErrSizeMismatch, declared, plainSize)
 	}
 	return plainSize, nil
 }

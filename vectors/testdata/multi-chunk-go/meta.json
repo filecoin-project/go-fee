@@ -1,10 +1,10 @@
 {
   "name": "multi-chunk-go",
   "producer": "go",
-  "description": "Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in foc-encryption (TS).",
+  "description": "Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in filecoin-encryption-envelope (TS).",
   "tag": 16,
   "algorithm": -65793,
-  "typ": "application/vnd.foc-envelope+cose",
+  "typ": "application/vnd.filecoin-encryption+cose",
   "chunk_size": 4096,
   "chunk_count": 4,
   "cek_hex": "d3ce4f95acfb99deec601eb606a844cf931b4a2f82ece273a3b91ed2f5acbefd",

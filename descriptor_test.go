@@ -114,7 +114,7 @@ func TestIngotWriteReadFlow(t *testing.T) {
 		// on the encrypt side cannot hide behind a self-consistent round trip.
 		env, rest, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		iv, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+		iv, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
 		require.True(t, ok)
 		aad, err := env.EncStructure(nil)
 		require.NoError(t, err)

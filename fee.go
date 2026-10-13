@@ -47,12 +47,12 @@
 //
 // The blob is the detached-payload convention: the encoded COSE envelope
 // immediately followed by the STREAM ciphertext (envelope || ciphertext). The
-// body protected header pins the FEE envelope type ([EnvelopeType]) and the body
-// algorithm (chunked AES-256-GCM-STREAM); the body unprotected header carries the
-// STREAM base nonce in the COSE iv parameter, the plaintext chunk size, and —
-// when the plaintext length is known — the chunk count. These conventions and
-// their private-use label values match the foc-encryption reference and the FEE
-// cross-implementation vectors (see fee/vectors).
+// body protected header carries every FEE content parameter, so the envelope AAD
+// authenticates all of them: the envelope type ([EnvelopeType]), the body
+// algorithm (chunked AES-256-GCM-STREAM), the STREAM base nonce in the COSE iv
+// parameter, the plaintext chunk size and — when the plaintext length is known —
+// the plaintext length. The body unprotected header is empty. These conventions
+// follow FIP-1253 and the FEE cross-implementation vectors (see fee/vectors).
 //
 // # Streaming
 //
@@ -98,9 +98,9 @@ import (
 // EnvelopeType is the COSE "typ" (RFC 9596, header label 16) that every FEE
 // envelope is pinned to. [Encrypt] writes it into the body protected header and
 // [Decrypt] requires it on decode, so a blob that is not a FEE envelope is
-// rejected before any key material is touched. Its value matches the
-// foc-encryption reference.
-const EnvelopeType = "application/vnd.foc-envelope+cose"
+// rejected before any key material is touched. Its value is the one FIP-1253
+// defines.
+const EnvelopeType = "application/vnd.filecoin-encryption+cose"
 
 // algChunkedAES256GCMStream is the FEE private-use COSE algorithm id for the
 // chunked AES-256-GCM-STREAM body cipher (fee/aesstream). It is the body
@@ -108,19 +108,33 @@ const EnvelopeType = "application/vnd.foc-envelope+cose"
 // different body cipher is refused rather than mis-decrypted.
 const algChunkedAES256GCMStream int64 = -65793
 
-// FEE private-use COSE header labels carried in the body protected header,
-// matching the foc-encryption reference (src/cose/headers.ts). Being
-// protected, both are authenticated by every chunk's AAD. An envelope that
-// carries either one in its unprotected header is malformed.
+// FEE body header labels. All of them belong in the body protected header,
+// where every chunk's AAD authenticates them; an envelope that carries any of
+// them, or the iv, in its unprotected header is malformed.
 const (
-	// labelChunkSize holds the STREAM plaintext chunk size, in bytes.
-	labelChunkSize int64 = -65790
-	// labelChunkCount holds the number of STREAM chunks. It is emitted only when
-	// the plaintext length is known ([WithContentLength]) and is not required
-	// to decrypt; a range consumer can plan fetches from it, and any chunk that
-	// authenticates vouches for it.
-	labelChunkCount int64 = -65791
+	// labelChunkSize holds the STREAM plaintext chunk size, in bytes. It is
+	// required. FIP-1253 places it at -1, a label whose meaning COSE scopes to
+	// the algorithm (RFC 9052 §3.1), here chunked AES-256-GCM-STREAM.
+	labelChunkSize int64 = -1
+	// labelPlaintextLength holds the exact plaintext length, in bytes. It is
+	// emitted only when the length is known before encryption
+	// ([WithContentLength]) and is not required to decrypt. Each plaintext
+	// length has one valid ciphertext length, so a reader checks it against
+	// the blob size and detects any truncation, even a range that never reads
+	// the final chunk.
+	labelPlaintextLength int64 = -65789
+	// labelAppMetadata holds application metadata: a string-keyed map that
+	// this package carries authenticated but neither writes nor interprets.
+	labelAppMetadata int64 = -65792
 )
+
+// bodyContentLabels are the body header parameters FEE requires to be
+// protected; [validateBodyParams] rejects any of them in the unprotected
+// header.
+var bodyContentLabels = []int64{
+	cose.HeaderLabelAlg, cose.HeaderLabelType, cose.HeaderLabelIV,
+	labelChunkSize, labelPlaintextLength, labelAppMetadata,
+}
 
 // Sentinel errors. Decrypt failures that originate in a sub-package are wrapped
 // rather than replaced, so errors.Is still matches the sub-package sentinel
@@ -163,15 +177,15 @@ var (
 
 	// ErrContentLengthMismatch means the plaintext length declared via
 	// WithContentLength did not match the number of bytes actually read; it
-	// surfaces from the returned reader, and the envelope's chunk count (already
-	// written) is not to be trusted.
+	// surfaces from the returned reader, and the envelope's declared length
+	// (already written) is not to be trusted.
 	ErrContentLengthMismatch = errors.New("fee: plaintext length did not match the declared content length")
 )
 
 // encryptConfig holds the resolved, optional Encrypt parameters.
 type encryptConfig struct {
 	chunkSize     int
-	contentLength int64 // < 0 means unknown (chunk count omitted)
+	contentLength int64 // < 0 means unknown (plaintext length omitted)
 }
 
 // EncryptOption configures [Encrypt] and [EncryptWithCEK].
@@ -186,16 +200,16 @@ func WithChunkSize(n int) EncryptOption {
 }
 
 // WithContentLength declares the total plaintext length in bytes. When set to a
-// non-negative value, the envelope records the chunk count (advisory metadata
-// that lets a range/seek consumer plan fetches from the header alone), and the
-// returned reader fails with [ErrContentLengthMismatch] if the plaintext turns
-// out to be a different length.
+// non-negative value, the envelope records it in the protected header, which
+// lets a reader detect a truncated blob from its size alone, and the returned
+// reader fails with [ErrContentLengthMismatch] if the plaintext turns out to be
+// a different length.
 //
 // A negative n is treated as "unknown", identical to not calling this option: a
 // caller propagating an unknown HTTP Content-Length as -1 gets the unset
-// behavior (no recorded chunk count, no mismatch check) rather than an error.
-// When unknown, the chunk count is omitted — the object still decrypts, and
-// range decryption derives the geometry from the ciphertext length instead.
+// behavior (no recorded length, no mismatch check) rather than an error. When
+// unknown, the length is omitted — the object still decrypts, and range
+// decryption derives the geometry from the ciphertext length alone.
 func WithContentLength(n int64) EncryptOption {
 	return func(c *encryptConfig) { c.contentLength = n }
 }
@@ -317,20 +331,21 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: generating base nonce: %w", err)
 	}
 
-	// The body header is fixed before encryption: the algorithm, envelope
-	// type, chunk size and (when the length is known) chunk count are
-	// protected (authenticated through the Enc_structure AAD); the base nonce
-	// rides in the unprotected header.
+	// The body header is fixed before encryption, and every parameter in it is
+	// protected (authenticated through the Enc_structure AAD): the algorithm,
+	// envelope type, base nonce, chunk size and, when the length is known, the
+	// plaintext length. The unprotected header is empty.
 	protected := cose.Header{}.
 		Set(cose.HeaderLabelAlg, algChunkedAES256GCMStream).
 		Set(cose.HeaderLabelType, EnvelopeType).
+		Set(cose.HeaderLabelIV, baseNonce).
 		Set(labelChunkSize, int64(cfg.chunkSize))
 	if cfg.contentLength >= 0 {
-		protected.Set(labelChunkCount, int64(chunkCountFor(cfg.contentLength, int64(cfg.chunkSize))))
+		protected.Set(labelPlaintextLength, cfg.contentLength)
 	}
 	headers := cose.Headers{
 		Protected:   protected,
-		Unprotected: cose.Header{}.Set(cose.HeaderLabelIV, baseNonce),
+		Unprotected: cose.Header{},
 	}
 
 	// Wrap the CEK to each recipient (none → a recipient-less envelope). All the
@@ -391,21 +406,6 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		AAD:       aad,
 	}.clone()
 	return &encryptReader{header: header, body: body}, descriptor, nil
-}
-
-// chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
-// produces at the given chunk size. Empty input is one (empty) final chunk.
-//
-// This is the producer's rule, matching the reference implementation, and it is
-// only for writing the chunk-count header. It is not a decoder's rule: a stream
-// whose plaintext is an exact multiple of the chunk size may legitimately carry
-// one more chunk than this (an empty final chunk), so a count read off the wire
-// is checked against [aesstream.ChunkCount] instead.
-func chunkCountFor(nPlain, chunkSize int64) int64 {
-	if nPlain <= 0 {
-		return 1
-	}
-	return (nPlain + chunkSize - 1) / chunkSize
 }
 
 // lengthCheckedReader enforces [WithContentLength]: it passes plaintext
@@ -562,7 +562,32 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
+	if body.plaintextLength >= 0 {
+		return &declaredLengthReader{r: r, declared: body.plaintextLength}, nil
+	}
 	return r, nil
+}
+
+// declaredLengthReader holds a whole-object read to the envelope's declared
+// plaintext length, so it accepts exactly the blobs the range path does: a
+// stream that authenticates to its end but yields a different length fails
+// with [ErrSizeMismatch] instead of a clean EOF.
+type declaredLengthReader struct {
+	r        io.Reader
+	declared int64
+	n        int64
+}
+
+func (d *declaredLengthReader) Read(p []byte) (int, error) {
+	n, err := d.r.Read(p)
+	d.n += int64(n)
+	if d.n > d.declared {
+		return n, fmt.Errorf("%w: envelope declares %d plaintext bytes, the stream holds more", ErrSizeMismatch, d.declared)
+	}
+	if err == io.EOF && d.n != d.declared {
+		return n, fmt.Errorf("%w: envelope declares %d plaintext bytes, the stream holds %d", ErrSizeMismatch, d.declared, d.n)
+	}
+	return n, err
 }
 
 // bodyParams is the validated STREAM configuration a FEE envelope's body header
@@ -579,6 +604,9 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 type bodyParams struct {
 	baseNonce []byte
 	chunkSize int
+	// plaintextLength is the declared plaintext length, or -1 when the
+	// envelope does not declare one.
+	plaintextLength int64
 }
 
 // streamConfig returns the fee/aesstream configuration for decrypting a body
@@ -595,15 +623,25 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 	}
 }
 
-// validateBodyParams checks a decoded envelope's FEE body headers — the
-// algorithm is the chunked AES-256-GCM-STREAM cipher, the base nonce (iv) is
-// present, and the self-describing chunk size is in range.
+// validateBodyParams checks a decoded envelope's FEE body headers — every FEE
+// parameter is protected, the algorithm is the chunked AES-256-GCM-STREAM
+// cipher, the base nonce (iv) is present, the chunk size is present and in
+// range, and a declared plaintext length is a non-negative integer.
 //
 // It is shared by the whole-object path's AAD-building resolution
 // ([buildBodyParamsWithAAD]) and the header-only sizing path ([PlaintextSize]),
 // so both accept exactly the same envelopes and report the same errors for a
 // body header they cannot honour.
 func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
+	// Every FEE parameter belongs in the protected header, where the AAD
+	// authenticates it. A copy in the unprotected header would be
+	// unauthenticated and ambiguous, so it makes the envelope malformed.
+	for _, label := range bodyContentLabels {
+		if env.Headers.Unprotected.Has(label) {
+			return bodyParams{}, fmt.Errorf("%w: header %d must be protected", ErrMalformedEnvelope, label)
+		}
+	}
+
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: body algorithm header missing or not an integer", ErrUnsupportedBodyAlg)
@@ -612,38 +650,30 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 		return bodyParams{}, fmt.Errorf("%w: body algorithm %d is not chunked AES-256-GCM-STREAM", ErrUnsupportedBodyAlg, alg)
 	}
 
-	baseNonce, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+	baseNonce, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: missing iv (base nonce)", ErrMalformedEnvelope)
 	}
 
-	// Chunk size and count belong in the protected header, where the AAD
-	// authenticates them. A copy in the unprotected header would be
-	// unauthenticated and ambiguous, so it makes the envelope malformed.
-	for _, label := range []int64{labelChunkSize, labelChunkCount} {
-		if env.Headers.Unprotected.Has(label) {
-			return bodyParams{}, fmt.Errorf("%w: header %d must be protected", ErrMalformedEnvelope, label)
-		}
-	}
-
-	// Self-describing chunk size; an envelope that omits it is read at the FEE
-	// default, but a header present with a non-integer value is a malformed
-	// envelope rather than a silent fallback. (The chunk count, when present,
-	// is not needed to decrypt.)
-	chunkSize := int64(aesstream.DefaultChunkSize)
-	if env.Headers.Protected.Has(labelChunkSize) {
-		n, ok := env.Headers.Protected.Int(labelChunkSize)
-		if !ok {
-			return bodyParams{}, fmt.Errorf("%w: chunk-size header is present but not an integer", ErrMalformedEnvelope)
-		}
-		chunkSize = n
+	chunkSize, ok := env.Headers.Protected.Int(labelChunkSize)
+	if !ok {
+		return bodyParams{}, fmt.Errorf("%w: chunk-size header missing or not an integer", ErrMalformedEnvelope)
 	}
 	if chunkSize < int64(aesstream.MinChunkSize) || chunkSize > int64(aesstream.MaxChunkSize) {
 		return bodyParams{}, fmt.Errorf("%w: declared chunk size %d out of range [%d, %d]",
 			ErrMalformedEnvelope, chunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
 	}
 
-	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize)}, nil
+	plaintextLength := int64(-1)
+	if env.Headers.Protected.Has(labelPlaintextLength) {
+		n, ok := env.Headers.Protected.Int(labelPlaintextLength)
+		if !ok || n < 0 {
+			return bodyParams{}, fmt.Errorf("%w: plaintext-length header is not a non-negative integer", ErrMalformedEnvelope)
+		}
+		plaintextLength = n
+	}
+
+	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize), plaintextLength: plaintextLength}, nil
 }
 
 // buildBodyParamsWithAAD validates the body headers and rebuilds the

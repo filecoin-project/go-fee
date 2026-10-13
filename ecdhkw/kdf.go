@@ -8,7 +8,7 @@ import (
 // This file implements the key derivation half of ECDH-ES: turning the raw
 // X25519 shared secret into the A256KW key-encryption key. Two pieces are
 // involved, both pinned here so the byte layout is unambiguous for the
-// cross-implementation test vectors (foc-encryption / FIL-473):
+// cross-implementation test vectors (fee/vectors):
 //
 //  1. hkdfKEK — HKDF-SHA-256 (RFC 5869), which RFC 9053 §5.1 specifies for COSE
 //     key derivation and §6.3.1 mandates for every ECDH algorithm, alg -31

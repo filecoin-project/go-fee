@@ -498,9 +498,7 @@ func TestDecryptedSize_InvertsEncryptedSize(t *testing.T) {
 }
 
 // TestChunkCount pins the exported chunk count over the boundary ciphertext
-// lengths, including the two encodings of an exact-multiple plaintext: the same
-// plaintext length is one chunk more when the stream ends with an empty final
-// chunk, which is why callers must not re-derive the count from a plaintext size.
+// lengths, and its refusal of a length ending in an empty chunk after full ones.
 func TestChunkCount(t *testing.T) {
 	const cs = aesstream.MinChunkSize
 	enc := int64(cs) + aesstream.TagSize
@@ -512,7 +510,6 @@ func TestChunkCount(t *testing.T) {
 		"empty stream (one tag-only chunk)": {aesstream.TagSize, 1},
 		"single partial chunk":              {aesstream.TagSize + 100, 1},
 		"single full chunk":                 {enc, 1},
-		"full + empty final":                {enc + aesstream.TagSize, 2},
 		"full + partial final":              {enc + aesstream.TagSize + 7, 2},
 		"two full chunks":                   {2 * enc, 2},
 	}
@@ -530,6 +527,12 @@ func TestChunkCount(t *testing.T) {
 func TestChunkCountInvalid(t *testing.T) {
 	t.Run("ciphertext too short to hold a tag", func(t *testing.T) {
 		_, err := aesstream.ChunkCount(aesstream.TagSize-1, aesstream.MinChunkSize)
+		require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
+	})
+
+	t.Run("empty final chunk after a full one", func(t *testing.T) {
+		enc := int64(aesstream.MinChunkSize) + aesstream.TagSize
+		_, err := aesstream.ChunkCount(enc+aesstream.TagSize, aesstream.MinChunkSize)
 		require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
 	})
 

@@ -23,9 +23,11 @@ number of recipients — **ECDH-ES+A256KW** to an X25519 public key,
 **A256KW** under a pre-shared symmetric key, or managed entirely out of band —
 without re-encrypting the data.
 
-The wire format's source of truth is the TypeScript reference implementation,
-[`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo); this repo is
-pinned to it by [cross-implementation test vectors](./vectors/README.md).
+The wire format follows FIP-1253 with the amendments FilOz's TypeScript
+implementation, `@filoz/filecoin-encryption-envelope` in
+[`synapse-sdk`](https://github.com/FilOzone/synapse-sdk), adopts; this repo is
+pinned to that implementation by
+[cross-implementation test vectors](./vectors/README.md).
 
 ## Install
 
@@ -179,9 +181,9 @@ func encryptFile(src, dst string, recipients []fee.Recipient) error {
         return err
     }
 
-    // WithContentLength is optional: it records the chunk count in the
-    // envelope (useful to range/seek consumers) and fails the stream if the
-    // plaintext turns out to be a different length.
+    // WithContentLength is optional: it records the plaintext length in the
+    // envelope, so readers detect a truncated blob from its size, and fails
+    // the stream if the plaintext turns out to be a different length.
     r, _, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
     if err != nil {
         return err
@@ -417,8 +419,8 @@ or corrupted record cannot serve wrong plaintext, since all four values are boun
 into every chunk's GCM tag or decide which bytes are read; it fails with
 `aesstream.ErrCorrupted` instead. The one check it gives up is `ErrSizeMismatch`:
 with no envelope to consult, nothing cross-checks `blobSize` against the declared
-chunk count, so a caller that stores the size should compare it with the store's
-own before trusting a range.
+plaintext length, so a caller that stores the size should compare it with the
+store's own before trusting a range.
 
 ## Wire format
 
@@ -428,10 +430,12 @@ self-delimiting CBOR; everything after it is the STREAM ciphertext.
 ```
 envelope    = 16([ protected, unprotected, null ])              # no recipients
             | 96([ protected, unprotected, null, recipients ])  # with recipients
-protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose",
-                -65790: chunkSize, -65791: chunkCount }
-unprotected = { 5: baseNonce(7B) }
-recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
+protected   = { 1: -65793, 16: "application/vnd.filecoin-encryption+cose",
+                5: baseNonce(7B), -1: chunkSize,
+                ? -65789: plaintextLength, ? -65792: appMetadata }
+unprotected = { }
+recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
+            | [ { 1: -31 },   { 4: kid, -1: ephemeralKey }, wrappedKey ]  # ECDH-ES+A256KW
 ```
 
 - **Body cipher** — chunked AES-256-GCM-STREAM (private-use COSE algorithm
@@ -441,21 +445,27 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   Vizár, as used by [age](https://age-encryption.org) and Google Tink) enforces
   chunk order and detects truncation and insertion.
 - **Body AAD** — the COSE `Enc_structure` over the protected header, identical
-  for every chunk, so the algorithm, envelope type, chunk size, chunk count and
-  any protected metadata are authenticated into the ciphertext.
-- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
-  with the remainder in the final chunk; empty input is one empty chunk. A
-  decoder also accepts a stream that ends with an empty final chunk, so a
-  plaintext of exactly `k × chunkSize` bytes is a valid stream of either `k`
-  chunks or `k+1`. Only the ciphertext length distinguishes them
-  (`aesstream.ChunkCount`), which is why a declared count must never be checked
-  against a count re-derived from the plaintext length.
-- **Chunk size and count** (labels −65790 and −65791) — protected, so every
-  chunk that authenticates also vouches for them. The count is emitted only
-  when the plaintext length is known and is not required to decrypt; a range
-  read that checks it against the blob size detects a truncated blob even when
-  the range avoids the final chunk. An envelope that carries either label in
-  its unprotected header is rejected as `ErrMalformedEnvelope`.
+  for every chunk. Every FEE body parameter is protected, so the algorithm,
+  envelope type, base nonce, chunk size, plaintext length and application
+  metadata are all authenticated into the ciphertext. The body unprotected
+  header is empty, and an envelope that carries any FEE parameter there is
+  rejected as `ErrMalformedEnvelope`.
+- **Chunking** — a producer writes `max(1, ceil(len / chunkSize))` chunks, with
+  the remainder in the final chunk; empty input is one empty chunk. Each
+  plaintext length has exactly one encoding: a plaintext of exactly
+  `k × chunkSize` bytes ends in a full final chunk, and a stream that ends in an
+  empty chunk after full ones is rejected (`aesstream.ErrCiphertextSize`).
+- **Chunk size** (label −1) — required. FIP-1253 places it in COSE's
+  algorithm-scoped label range (RFC 9052 §3.1).
+- **Plaintext length** (label −65789) — emitted only when the length is known
+  before encryption, and not required to decrypt. Because each length has one
+  encoding, a reader checks it exactly against the blob size and detects any
+  truncation, including one inside the final chunk, even when a range never
+  reads that chunk (`ErrSizeMismatch`).
+- **Application metadata** (label −65792) — accepted and ignored; this package
+  does not write it.
+- **A256KW recipients** (alg −5) — the protected header is empty (`h''`) and
+  `alg` is unprotected, as RFC 9053 §6.2.1 requires.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
@@ -481,15 +491,17 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   byte-for-byte equals the unwrapper's key id; no unwrap is attempted
   otherwise.
 - **Envelope type pinning.** Encrypt writes, and Decrypt requires, the COSE
-  `typ` `application/vnd.foc-envelope+cose`, so non-FEE blobs are rejected
+  `typ` `application/vnd.filecoin-encryption+cose`, so non-FEE blobs are rejected
   before any key material is touched.
 
 ## Specifications and related work
 
 - [FIP discussion #1253 — Filecoin Encryption Envelope](https://github.com/filecoin-project/FIPs/discussions/1253)
-- [`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo) — TypeScript
-  reference implementation (wire-format source of truth); see
+- [`@filoz/filecoin-encryption-envelope`](https://github.com/FilOzone/synapse-sdk/tree/master/packages/filecoin-encryption-envelope)
+  — TypeScript implementation and its implementation guide; see
   [`vectors/`](./vectors/README.md) for the cross-implementation fixtures
+- [`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo) — the
+  original TypeScript demo of the envelope
 - [RFC 9052](https://www.rfc-editor.org/rfc/rfc9052) COSE structure,
   [RFC 9053](https://www.rfc-editor.org/rfc/rfc9053) COSE algorithms,
   [RFC 9596](https://www.rfc-editor.org/rfc/rfc9596) COSE `typ` header,

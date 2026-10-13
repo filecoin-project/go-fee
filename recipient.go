@@ -15,7 +15,7 @@ import (
 // is a self-describing COSE_Key map — not raw bytes — so a decoder learns the
 // curve from the key itself; this matches standard COSE (RFC 9052 §7,
 // RFC 9053 §7.1; IANA "COSE Key Common Parameters" and "COSE Key Type
-// Parameters") and the foc-encryption reference. The map is:
+// Parameters"). The map is:
 //
 //	{ 1: 1 (kty: OKP), -1: 4 (crv: X25519), -2: <x, the public-key bytes> }
 const (
@@ -151,11 +151,13 @@ func (r *a256kwRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fee: A256KW wrap: %w", err)
 	}
+	// RFC 9053 §6.2.1: an AES Key Wrap recipient's protected header MUST be
+	// empty (encoded as a zero-length byte string), so its algorithm rides in
+	// the unprotected header.
 	return &cose.Recipient{
 		Headers: cose.Headers{
-			Protected: cose.Header{}.
-				Set(cose.HeaderLabelAlg, cose.AlgA256KW),
 			Unprotected: cose.Header{}.
+				Set(cose.HeaderLabelAlg, cose.AlgA256KW).
 				Set(cose.HeaderLabelKID, r.kid),
 		},
 		Ciphertext: wrapped,

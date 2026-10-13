@@ -36,6 +36,12 @@
 // empty plaintext is encoded as a single empty final chunk (just the
 // 16-byte tag), so the ciphertext stream is never zero-length.
 //
+// Each plaintext length has exactly one encoding. A plaintext that is an
+// exact multiple of ChunkSize ends in a full final chunk, never in a full
+// chunk followed by an empty one; an empty final chunk is valid only as
+// the sole chunk of an empty plaintext, and decoders reject it anywhere
+// else (ErrCiphertextSize).
+//
 // The chunk index is a 4-byte counter, so a single stream holds at most
 // MaxChunks chunks (~1 PiB at the default chunk size); exceeding that is
 // an error rather than a silent counter wrap.
