@@ -136,6 +136,10 @@ var (
 	// chunk. (Bytes appended after a short final chunk are instead pulled
 	// into that chunk and fail authentication as ErrCorrupted.)
 	ErrTrailingData = errors.New("aesstream: trailing data after final chunk")
+
+	// errReadAfterClose is returned by Read on a Reader, SpanReader or
+	// EncryptReader once its Close has been called.
+	errReadAfterClose = errors.New("aesstream: read after close")
 )
 
 // Config holds the parameters shared by a Writer and the Reader that
@@ -263,11 +267,16 @@ func Seal(cfg Config, plaintext []byte) ([]byte, error) {
 // Open decrypts a complete ciphertext stream in a single call and
 // returns the plaintext. It is a convenience wrapper over Reader; like
 // Reader it reports tampering, truncation, reordering and trailing data
-// as a non-nil error, in which case the returned bytes must be discarded.
+// as a non-nil error, in which case it returns no plaintext.
 func Open(cfg Config, ciphertext []byte) ([]byte, error) {
 	r, err := NewReader(bytes.NewReader(ciphertext), cfg)
 	if err != nil {
 		return nil, err
 	}
-	return io.ReadAll(r)
+	defer r.Close()
+	plaintext, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }

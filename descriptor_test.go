@@ -136,16 +136,15 @@ func TestIngotWriteReadFlow(t *testing.T) {
 	})
 
 	// --- read path --------------------------------------------------------
-	for name, tc := range map[string]struct{ off, length int64 }{
-		"whole object":         {0, size},
-		"inside one chunk":     {100, 50},
-		"aligned chunk":        {rangeChunk, rangeChunk},
-		"crosses a boundary":   {rangeChunk - 10, 20},
-		"partial final chunk":  {4 * rangeChunk, 123},
+	for name, tc := range map[string]struct{ start, end int64 }{
+		"whole object":         {0, size - 1},
+		"inside one chunk":     {100, 149},
+		"aligned chunk":        {rangeChunk, 2*rangeChunk - 1},
+		"crosses a boundary":   {rangeChunk - 10, rangeChunk + 9},
+		"partial final chunk":  {4 * rangeChunk, 4*rangeChunk + 122},
 		"open-ended suffix":    {size - 50, math.MaxInt64},
-		"single byte at start": {0, 1},
-		"single byte at end":   {size - 1, 1},
-		"empty range at eof":   {size, 0},
+		"single byte at start": {0, 0},
+		"single byte at end":   {size - 1, size - 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			// Everything from here reads the row, never desc or the envelope.
@@ -155,10 +154,10 @@ func TestIngotWriteReadFlow(t *testing.T) {
 
 			recording := newRecordingReaderAt(t, blob)
 			desc := row.descriptor()
-			r, err := fee.DecryptRangeWithCEK(recording, row.size, cek, tc.off, tc.length, &desc)
+			r, err := fee.DecryptRangeWithCEK(recording, row.size, cek, tc.start, tc.end, &desc)
 			require.NoError(t, err)
 
-			want := plaintext[tc.off : tc.off+clampLen(size, tc.off, tc.length)]
+			want := plaintext[tc.start : tc.start+clampLen(size, tc.start, tc.end)]
 			require.Equal(t, int64(len(want)), r.Len(), "Len must be known before reading")
 			require.Equal(t, int64(size), r.Size())
 
@@ -169,6 +168,18 @@ func TestIngotWriteReadFlow(t *testing.T) {
 			requireNoEnvelopeRead(t, recording, row.headerLen)
 		})
 	}
+
+	t.Run("range at eof is rejected", func(t *testing.T) {
+		// There is no empty range: a start at the object's end is
+		// unsatisfiable, from the row alone.
+		cek, err := aeskw.Unwrap(regionKEK, row.regionWrappedCEK)
+		require.NoError(t, err)
+		defer clear(cek)
+
+		desc := row.descriptor()
+		_, err = fee.DecryptRangeWithCEK(bytes.NewReader(blob), row.size, cek, size, size, &desc)
+		require.ErrorIs(t, err, aesstream.ErrRange)
+	})
 }
 
 // TestEncryptDescriptorDoesNotAliasTheStream pins that the descriptor handed back
@@ -200,7 +211,7 @@ func TestEncryptDescriptorDoesNotAliasTheStream(t *testing.T) {
 
 	// The blob still decrypts under the pristine values, so the mutation never
 	// reached the cipher or the encoded header.
-	r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, int64(len(plaintext)), &kept)
+	r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, int64(len(plaintext))-1, &kept)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
@@ -226,7 +237,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorEncrypt0(t *testing.T) {
 	require.Equal(t, cose.TagCOSEEncrypt0, tag)
 
 	recording := newRecordingReaderAt(t, blob)
-	r, err := fee.DecryptRangeWithCEK(recording, int64(len(blob)), cek, 10, 4000, &desc)
+	r, err := fee.DecryptRangeWithCEK(recording, int64(len(blob)), cek, 10, 4009, &desc)
 	require.NoError(t, err)
 	got, err := io.ReadAll(r)
 	require.NoError(t, err)
@@ -249,15 +260,16 @@ func TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath(t *testing.T) {
 		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
 	unwrapper := fee.NewECDHESUnwrapper(ecdhKID, tenantKey)
 
-	for _, off := range []int64{0, 1, rangeChunk - 1, rangeChunk, 2 * rangeChunk, size - 7} {
-		_, viaEnvelope := decryptRange(t, blob, unwrapper, off, 500)
+	for _, start := range []int64{0, 1, rangeChunk - 1, rangeChunk, 2 * rangeChunk, size - 7} {
+		end := start + 499 // clamps on the trailing ranges, identically on both paths
+		_, viaEnvelope := decryptRange(t, blob, unwrapper, start, end)
 
-		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, off, 500, &desc)
+		r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, start, end, &desc)
 		require.NoError(t, err)
 		viaDescriptor, err := io.ReadAll(r)
 		require.NoError(t, err)
 
-		require.Equalf(t, viaEnvelope, viaDescriptor, "paths disagree at off=%d", off)
+		require.Equalf(t, viaEnvelope, viaDescriptor, "paths disagree at start=%d", start)
 	}
 }
 
@@ -293,7 +305,7 @@ func TestBodyDescriptorValidate(t *testing.T) {
 			// The range entry point rejects it up front for the same reason,
 			// rather than letting it fail as an authentication error later.
 			_, err := fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
-				make([]byte, aesstream.KeySize), 0, 10, &m)
+				make([]byte, aesstream.KeySize), 0, 9, &m)
 			require.ErrorIs(t, err, fee.ErrInvalidDescriptor)
 		})
 	}
@@ -328,7 +340,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorPoisoned(t *testing.T) {
 			poisoned := desc
 			mutate(&poisoned)
 
-			r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, 200, &poisoned)
+			r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, 199, &poisoned)
 			if err != nil {
 				return // rejected at construction, which is a fine outcome
 			}
@@ -350,27 +362,27 @@ func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 	blobSize := int64(len(blob))
 
 	t.Run("short cek", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, make([]byte, 16), 0, 10, &desc)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, make([]byte, 16), 0, 9, &desc)
 		require.ErrorIs(t, err, fee.ErrInvalidCEK)
 	})
 
 	t.Run("nil blob", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(nil, blobSize, cek, 0, 10, &desc)
+		_, err := fee.DecryptRangeWithCEK(nil, blobSize, cek, 0, 9, &desc)
 		require.Error(t, err)
 	})
 
 	t.Run("blob shorter than its envelope", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), desc.HeaderLen-1, cek, 0, 10, &desc)
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), desc.HeaderLen-1, cek, 0, 9, &desc)
 		require.ErrorIs(t, err, aesstream.ErrCiphertextSize)
 	})
 
-	t.Run("offset past the end", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, size+1, 10, &desc)
+	t.Run("start past the end", func(t *testing.T) {
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, size+1, size+10, &desc)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
 
-	t.Run("negative offset", func(t *testing.T) {
-		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, -1, 10, &desc)
+	t.Run("negative start", func(t *testing.T) {
+		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, -1, 8, &desc)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
 }

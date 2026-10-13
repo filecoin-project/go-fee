@@ -210,9 +210,12 @@ func WithContentLength(n int64) EncryptOption {
 // before any plaintext is read. To seal under a CEK you already hold, or a
 // recipient-less envelope, use [EncryptWithCEK].
 //
-// Encryption runs in a background goroutine that feeds the returned reader, so a
-// caller MUST either read it to EOF or Close it: Close aborts the goroutine. An
-// encryption failure surfaces as a non-EOF error from the reader's Read.
+// The plaintext is pulled through the body cipher as the returned reader is
+// read (no goroutine or pipe stands between them), and the reader implements
+// io.WriterTo, so an io.Copy from it writes each sealed chunk whole. A
+// plaintext read failure surfaces as a non-EOF error from the reader's Read,
+// and ends the stream before its final chunk. Close releases the reader; a
+// caller that abandons a partial read should still Close it.
 //
 // The second result is the envelope parameters a later range decrypt needs, for a
 // caller that wants to cache them rather than re-read the header; see
@@ -274,11 +277,10 @@ func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opt
 // (tag 96). It does not modify or wipe cek.
 //
 // It also does not retain cek past its own return: the recipient wraps and the
-// aesstream.NewWriter that internalizes the CEK (into a GCM AEAD) both run
-// synchronously before encryptStream returns, so a caller may wipe cek as soon
-// as it returns — even though the returned reader has not been read and its
-// background encryption goroutine is still running. That goroutine works from
-// the writer's internalized key, never from the cek slice.
+// aesstream.NewEncryptReader that internalizes the CEK (into a GCM AEAD) both
+// run synchronously before encryptStream returns, so a caller may wipe cek as
+// soon as it returns — even though the returned reader has not been read. The
+// body cipher works from its internalized key, never from the cek slice.
 func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, BodyDescriptor, error) {
 	if plaintext == nil {
 		return nil, BodyDescriptor{}, errors.New("fee: nil plaintext reader")
@@ -357,41 +359,24 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: encoding envelope: %w", err)
 	}
 
-	// The body cipher streams into a pipe that the returned reader drains. Create
-	// it only now that every fallible step above has succeeded; the one remaining
-	// fallible call (NewWriter) closes both ends on error, so no pipe is left
-	// dangling on any error path.
-	pr, pw := io.Pipe()
-	w, err := aesstream.NewWriter(pw, aesstream.Config{
+	// Every fallible step above has succeeded, so the body cipher can be
+	// built; NewEncryptReader's own validation (key, base nonce, chunk size) is
+	// already satisfied here. The cipher pulls plaintext as the returned reader
+	// is read: no goroutine, no pipe, and each sealed chunk reaches the consumer
+	// in one piece (see aesstream.EncryptReader).
+	src := plaintext
+	if cfg.contentLength >= 0 {
+		src = &lengthCheckedReader{r: plaintext, declared: cfg.contentLength}
+	}
+	body, err := aesstream.NewEncryptReader(src, aesstream.Config{
 		Key:       cek,
 		BaseNonce: baseNonce,
 		AAD:       aad,
 		ChunkSize: cfg.chunkSize,
 	})
 	if err != nil {
-		_ = pw.Close()
-		_ = pr.Close()
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
-
-	declaredLen := cfg.contentLength
-	go func() {
-		n, cerr := io.Copy(w, plaintext)
-		if cerr == nil && declaredLen >= 0 && n != declaredLen {
-			cerr = fmt.Errorf("%w: declared %d, got %d", ErrContentLengthMismatch, declaredLen, n)
-		}
-		// Emit the final chunk only on a clean, length-matched copy. On a
-		// mismatch we deliberately skip w.Close(), so the stream ends without its
-		// last-flag chunk: a caller that ignores the error and stores the blob
-		// anyway gets a truncated ciphertext that fails to decrypt
-		// (aesstream.ErrTruncated), rather than a valid-but-mislabeled object.
-		if cerr == nil {
-			cerr = w.Close()
-		}
-		// A nil error closes the pipe with io.EOF (clean end); otherwise the
-		// error surfaces from the reader's Read.
-		_ = pw.CloseWithError(cerr)
-	}()
 
 	// Every value the descriptor reports is fixed above, before any plaintext is
 	// read, so a caller can record it while the upload is still streaming. The
@@ -403,10 +388,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		ChunkSize: cfg.chunkSize,
 		AAD:       aad,
 	}.clone()
-	return &encryptReader{
-		body: io.MultiReader(bytes.NewReader(header), pr),
-		pr:   pr,
-	}, descriptor, nil
+	return &encryptReader{header: header, body: body}, descriptor, nil
 }
 
 // chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
@@ -424,20 +406,70 @@ func chunkCountFor(nPlain, chunkSize int64) int64 {
 	return (nPlain + chunkSize - 1) / chunkSize
 }
 
-// encryptReader is the wire blob [Encrypt] hands back: the encoded envelope
-// header, served from memory, followed by the ciphertext the background
-// encryption goroutine streams through the pipe.
-//
-// Close closes the pipe, which aborts that goroutine, so a caller may abandon a
-// partial read.
-type encryptReader struct {
-	body io.Reader      // io.MultiReader(header, pipe reader)
-	pr   *io.PipeReader // closing it stops the encryption goroutine
+// lengthCheckedReader enforces [WithContentLength]: it passes plaintext
+// through and turns the source's EOF into [ErrContentLengthMismatch] when the
+// byte count differs from the declared length (and fails as soon as the
+// count exceeds it). The body cipher sees a read error, not EOF, so it never
+// seals the final chunk: the ciphertext produced so far is truncated and
+// fails to decrypt (aesstream.ErrTruncated) rather than passing as a
+// valid-but-mislabeled object.
+type lengthCheckedReader struct {
+	r        io.Reader
+	declared int64
+	n        int64
 }
 
-func (e *encryptReader) Read(p []byte) (int, error) { return e.body.Read(p) }
+func (l *lengthCheckedReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	l.n += int64(n)
+	if l.n > l.declared {
+		return n, fmt.Errorf("%w: declared %d, got more", ErrContentLengthMismatch, l.declared)
+	}
+	if err == io.EOF && l.n != l.declared {
+		return n, fmt.Errorf("%w: declared %d, got %d", ErrContentLengthMismatch, l.declared, l.n)
+	}
+	return n, err
+}
 
-func (e *encryptReader) Close() error { return e.pr.Close() }
+// encryptReader is the wire blob [Encrypt] hands back: the encoded envelope
+// header, served from memory, followed by the ciphertext the body cipher
+// produces as the plaintext is pulled through it.
+//
+// It implements io.WriterTo so an io.Copy from it writes the header and then
+// each sealed chunk whole, rather than in io.Copy's 32 KiB pieces. Close
+// releases the body cipher; reads after Close fail.
+type encryptReader struct {
+	header []byte // the envelope bytes not yet returned
+	body   *aesstream.EncryptReader
+}
+
+func (e *encryptReader) Read(p []byte) (int, error) {
+	if len(e.header) > 0 {
+		n := copy(p, e.header)
+		e.header = e.header[n:]
+		return n, nil
+	}
+	return e.body.Read(p)
+}
+
+func (e *encryptReader) WriteTo(w io.Writer) (int64, error) {
+	var total int64
+	if len(e.header) > 0 {
+		n, err := w.Write(e.header)
+		e.header = e.header[n:]
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+		if len(e.header) > 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	n, err := e.body.WriteTo(w)
+	return total + n, err
+}
+
+func (e *encryptReader) Close() error { return e.body.Close() }
 
 // Decrypt recovers the plaintext from a FEE COSE_Encrypt (tag 96) envelope read
 // from src.
@@ -448,7 +480,9 @@ func (e *encryptReader) Close() error { return e.pr.Close() }
 // is read up front; the detached ciphertext is streamed from src on demand.
 //
 // Decryption is streaming: a non-EOF error from the returned reader (see
-// fee/aesstream) means the plaintext is incomplete and must be discarded.
+// fee/aesstream) means the plaintext is incomplete and must be discarded. The
+// reader is an [*aesstream.Reader]; a caller that closes it once done lets its
+// chunk buffers be reused by the next stream.
 //
 // If the envelope carries no recipients (a COSE_Encrypt0), Decrypt returns
 // [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient kid matches

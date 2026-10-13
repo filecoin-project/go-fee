@@ -18,10 +18,11 @@ var (
 	// distinct from ErrCorrupted (a chunk that failed authentication).
 	ErrCiphertextSize = fmt.Errorf("aesstream: ciphertext length is not a valid stream (the final chunk must be at least %d bytes, to hold the tag)", TagSize)
 
-	// ErrRange is returned when a requested plaintext range is invalid: a
-	// negative offset or length, or an offset past the end of the plaintext.
-	// A length that runs past the end is not an error — it is clamped to the
-	// bytes available from the offset.
+	// ErrRange is returned when a requested plaintext range is unsatisfiable:
+	// a negative start, an end before the start, or a start past the last
+	// plaintext byte — HTTP Range semantics, where there is no such thing as
+	// an empty range. An end past the last byte is not an error; it is
+	// clamped, exactly as HTTP clamps "bytes=a-b" to the resource length.
 	ErrRange = fmt.Errorf("aesstream: requested range is out of bounds")
 
 	// ErrShortSpan is returned when the supplied ciphertext span ends before
@@ -126,12 +127,15 @@ func ChunkCount(ciphertextLen int64, chunkSize int) (int64, error) {
 }
 
 // CiphertextRange returns the single contiguous ciphertext byte range
-// [start, start+n) that must be read to serve the plaintext range
-// [off, off+length) of a stream whose complete ciphertext is
+// [ctStart, ctEnd] (inclusive) that must be read to serve the plaintext
+// range [start, end] (inclusive) of a stream whose complete ciphertext is
 // ciphertextSize bytes long, along with plainLen, the plaintext length of
 // the range after clamping. A zero chunkSize selects DefaultChunkSize; any
 // other value must be in [MinChunkSize, MaxChunkSize] (else ErrChunkSize),
 // the same rule as Config.ChunkSize.
+//
+// start/end follow HTTP Range semantics (see ErrRange): both inclusive, end
+// clamped to the last plaintext byte, no empty ranges.
 //
 // Because the chunks overlapping any plaintext range are adjacent in the
 // ciphertext, the bytes needed are always one contiguous span — so a caller
@@ -141,24 +145,23 @@ func ChunkCount(ciphertextLen int64, chunkSize int) (int64, error) {
 // itself (its first byte is 0); a caller whose blob prefixes the stream
 // with an envelope header must add that header length.
 //
-// plainLen is min(length, plaintext size − off): exactly the byte count the
-// span decrypts to (SpanReader.Len, the length of OpenSpan's result). It is
-// available before any ciphertext is fetched, so an HTTP consumer can size
-// its response (Content-Length, the end of a Content-Range) from it rather
-// than re-deriving the clamping rule.
+// plainLen is the byte count the span decrypts to after end is clamped
+// (SpanReader.Len, the length of OpenSpan's result). It is available before
+// any ciphertext is fetched, so an HTTP consumer can size its response
+// (Content-Length, the end of a Content-Range) from it rather than
+// re-deriving the clamping rule.
 //
 // For a random-access source already in hand (a local file or in-memory
 // buffer) rather than a one-shot fetch, wrap it as the span with
-// io.NewSectionReader(src, start, n) and pass that to NewSpanReader.
+// io.NewSectionReader(src, ctStart, ctEnd-ctStart+1) and pass that to
+// NewSpanReader.
 //
 // The span is chunk-aligned, so it may include a little more than the
 // requested bytes: at most the unused head of the first overlapping chunk
 // and tail of the last (under 2*chunkSize total), since GCM authenticates a
-// whole chunk at a time. A length past the end of the plaintext clamps; an
-// empty span (n == 0) means no ciphertext need be fetched. off/length and
-// ciphertextSize are validated exactly as in NewSpanReader, returning
-// ErrRange, ErrCiphertextSize or ErrChunkSize.
-func CiphertextRange(ciphertextSize int64, chunkSize int, off, length int64) (start, n, plainLen int64, err error) {
+// whole chunk at a time. start/end and ciphertextSize are validated exactly
+// as in NewSpanReader, returning ErrRange, ErrCiphertextSize or ErrChunkSize.
+func CiphertextRange(ciphertextSize int64, chunkSize int, start, end int64) (ctStart, ctEnd, plainLen int64, err error) {
 	chunkSize, err = resolveChunkSize(chunkSize)
 	if err != nil {
 		return 0, 0, 0, err
@@ -167,27 +170,23 @@ func CiphertextRange(ciphertextSize int64, chunkSize int, off, length int64) (st
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	if off < 0 || length < 0 || off > plaintextLen {
+	if start < 0 || end < start || start > plaintextLen-1 {
 		return 0, 0, 0, ErrRange
 	}
-	effLen := length
-	if avail := plaintextLen - off; effLen > avail {
-		effLen = avail
-	}
-	if effLen == 0 {
-		return 0, 0, 0, nil
+	if end > plaintextLen-1 {
+		end = plaintextLen - 1
 	}
 
 	enc := int64(chunkSize) + TagSize
-	firstChunk := off / int64(chunkSize)
-	lastChunk := (off + effLen - 1) / int64(chunkSize)
-	start = firstChunk * enc
-	end := (lastChunk + 1) * enc
+	firstChunk := start / int64(chunkSize)
+	lastChunk := end / int64(chunkSize)
+	ctStart = firstChunk * enc
+	ctEnd = (lastChunk+1)*enc - 1
 	if lastChunk == numChunks-1 {
 		// The final chunk may be short; clamp to the true stream end.
-		end = ciphertextSize
+		ctEnd = ciphertextSize - 1
 	}
-	return start, end - start, effLen, nil
+	return ctStart, ctEnd, end - start + 1, nil
 }
 
 // SpanReader decrypts an arbitrary plaintext byte range of a chunked
@@ -201,13 +200,13 @@ func CiphertextRange(ciphertextSize int64, chunkSize int, off, length int64) (st
 // The span must begin at the offset CiphertextRange reported (the boundary
 // of the first overlapping chunk) and contain the whole chunks overlapping
 // the range, in order. SpanReader recomputes that geometry from the same
-// (ciphertextSize, off, length) and reads exactly the chunks it needs, so:
+// (ciphertextSize, start, end) and reads exactly the chunks it needs, so:
 //
 //   - the total ciphertext length pins each chunk's index, final-chunk flag
 //     and length up front — no last-chunk look-ahead or retry, unlike the
 //     whole-stream Reader; and
-//   - the head of the first chunk (before off) and the tail of the last
-//     (after the range end) are trimmed, so the output is exactly the range.
+//   - the head of the first chunk (before start) and the tail of the last
+//     (after end) are trimmed, so the output is exactly the range.
 //
 // A SpanReader implements io.Reader. Any non-EOF error means the plaintext
 // is incomplete and must be discarded: a tampered/reordered/misframed chunk
@@ -242,25 +241,28 @@ type SpanReader struct {
 	skipFirst int   // bytes to drop from the front of the first chunk
 	onFirst   bool  // nextChunk is still the first chunk of the range
 
-	inBuf  []byte // raw ciphertext of the current chunk, cap encChunk
-	outBuf []byte // plaintext backing array, cap chunkSize
-	unread []byte // decrypted-but-unread plaintext, trimmed to the range
-	err    error  // sticky terminal state (io.EOF on clean end)
+	inBuf  []byte          // raw ciphertext of the current chunk, cap encChunk
+	outBuf []byte          // plaintext backing array, cap chunkSize
+	unread []byte          // decrypted-but-unread plaintext, trimmed to the range
+	nonce  [NonceSize]byte // the current chunk's nonce, built in place
+	err    error           // sticky terminal state (io.EOF on clean end)
+	closed bool
 }
 
 // NewSpanReader returns a SpanReader that yields the plaintext bytes
-// [off, off+length) of the stream whose complete ciphertext is
+// [start, end] (inclusive) of the stream whose complete ciphertext is
 // ciphertextSize bytes long, reading the ciphertext from span. span must be
 // positioned at the start of the contiguous range CiphertextRange reports
-// for the same (ciphertextSize, chunkSize, off, length) — typically the
+// for the same (ciphertextSize, chunkSize, start, end) — typically the
 // body of a single range request for exactly that span. cfg must match the
 // Writer that produced the stream, including the chunk size.
 //
-// length is clamped to the bytes available from off; off may equal the
-// plaintext length (an empty read) but a larger off, or a negative off or
-// length, returns ErrRange. ciphertextSize must be a structurally valid
-// stream length (else ErrCiphertextSize).
-func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64) (*SpanReader, error) {
+// start/end follow HTTP Range semantics (see ErrRange): an end past the
+// last plaintext byte clamps; a negative start, an end before the start, or
+// a start past the last byte returns ErrRange — there is no empty range.
+// ciphertextSize must be a structurally valid stream length (else
+// ErrCiphertextSize).
+func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, start, end int64) (*SpanReader, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -270,30 +272,13 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 	if err != nil {
 		return nil, err
 	}
-	if off < 0 || length < 0 || off > plaintextLen {
+	if start < 0 || end < start || start > plaintextLen-1 {
 		return nil, ErrRange
 	}
-
-	// Clamp the length to what's actually available from off.
-	effLen := length
-	if avail := plaintextLen - off; effLen > avail {
-		effLen = avail
+	if end > plaintextLen-1 {
+		end = plaintextLen - 1
 	}
-
-	if effLen == 0 {
-		r := &SpanReader{
-			src:           span,
-			chunkSize:     chunkSize,
-			encChunk:      int64(chunkSize) + TagSize,
-			numChunks:     numChunks,
-			lastCipherLen: lastCipherLen,
-			total:         0,
-			remaining:     0,
-			err:           io.EOF,
-		}
-		copy(r.base[:], cfg.BaseNonce)
-		return r, nil
-	}
+	total := end - start + 1
 
 	aead, err := newGCM(cfg.Key)
 	if err != nil {
@@ -308,15 +293,15 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 		encChunk:      int64(chunkSize) + TagSize,
 		numChunks:     numChunks,
 		lastCipherLen: lastCipherLen,
-		total:         effLen,
-		remaining:     effLen,
-		inBuf:         make([]byte, chunkSize+TagSize),
-		outBuf:        make([]byte, 0, chunkSize),
+		total:         total,
+		remaining:     total,
+		inBuf:         getBuf(chunkSize + TagSize),
+		outBuf:        getBuf(chunkSize)[:0],
 	}
 	copy(r.base[:], cfg.BaseNonce)
 
-	r.nextChunk = off / int64(chunkSize)
-	r.skipFirst = int(off - r.nextChunk*int64(chunkSize))
+	r.nextChunk = start / int64(chunkSize)
+	r.skipFirst = int(start - r.nextChunk*int64(chunkSize))
 	r.onFirst = true
 	return r, nil
 }
@@ -325,6 +310,23 @@ func NewSpanReader(span io.Reader, cfg Config, ciphertextSize, off, length int64
 // — the requested length clamped to the bytes available from the offset.
 // It is fixed at construction and does not change as bytes are read.
 func (r *SpanReader) Len() int64 { return r.total }
+
+// Close returns the SpanReader's chunk buffers to the pool (see pool.go).
+// Further reads fail rather than return more plaintext. Close does not
+// close the span. A SpanReader that is never closed is still collected
+// normally; Close only lets the next stream reuse its buffers.
+func (r *SpanReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.unread = nil
+	r.err = errReadAfterClose
+	putBuf(r.inBuf)
+	putPlaintextBuf(r.outBuf)
+	r.inBuf, r.outBuf = nil, nil
+	return nil
+}
 
 // ChunkSize returns the plaintext chunk size in effect.
 func (r *SpanReader) ChunkSize() int { return r.chunkSize }
@@ -352,10 +354,10 @@ func (r *SpanReader) Read(p []byte) (int, error) {
 	r.unread = r.unread[n:]
 	// Unlike Reader.Read, no (n == 0 && r.err != nil) guard is needed here:
 	// nextSpanChunk always yields at least one byte. It only runs while
-	// remaining > 0, which implies off < plaintextLen, so the first chunk
-	// holds more plaintext than skipFirst trims, and every later chunk in
-	// the range is non-empty by the stream geometry. (The zero-length range
-	// never gets here — the constructor pre-sets io.EOF.)
+	// remaining > 0, which implies start <= the last plaintext byte, so the
+	// first chunk holds more plaintext than skipFirst trims, and every later
+	// chunk in the range is non-empty by the stream geometry. (An empty
+	// range never gets here — the constructor rejects it with ErrRange.)
 	return n, nil
 }
 
@@ -382,8 +384,8 @@ func (r *SpanReader) nextSpanChunk() error {
 		return r.fail(fmt.Errorf("aesstream: read chunk %d: %w", r.nextChunk, err))
 	}
 
-	nonce := streamNonce(r.base, uint32(r.nextChunk), last)
-	plain, err := r.aead.Open(r.outBuf[:0], nonce[:], r.inBuf[:clen], r.aad)
+	r.nonce = streamNonce(r.base, uint32(r.nextChunk), last)
+	plain, err := r.aead.Open(r.outBuf[:0], r.nonce[:], r.inBuf[:clen], r.aad)
 	if err != nil {
 		return r.fail(ErrCorrupted)
 	}
@@ -416,18 +418,18 @@ func (r *SpanReader) fail(err error) error {
 	return err
 }
 
-// OpenSpan decrypts the plaintext byte range [off, off+length) from a single
-// contiguous ciphertext span and returns exactly those bytes. span carries
-// the ciphertext range CiphertextRange reports for the same arguments (see
-// NewSpanReader); OpenSpan is the one-shot convenience over SpanReader for
-// callers that want the range in one buffer.
+// OpenSpan decrypts the plaintext byte range [start, end] (inclusive) from a
+// single contiguous ciphertext span and returns exactly those bytes. span
+// carries the ciphertext range CiphertextRange reports for the same
+// arguments (see NewSpanReader); OpenSpan is the one-shot convenience over
+// SpanReader for callers that want the range in one buffer.
 //
-// length is clamped to the bytes available from off, and like
-// SpanReader.Read it reports tampering or reordering (ErrCorrupted) or a
-// short span (ErrShortSpan) as a non-nil error, in which case the returned
-// bytes must be discarded.
-func OpenSpan(cfg Config, span io.Reader, ciphertextSize, off, length int64) ([]byte, error) {
-	r, err := NewSpanReader(span, cfg, ciphertextSize, off, length)
+// start/end follow HTTP Range semantics (an over-long end clamps; see
+// ErrRange), and like SpanReader.Read it reports tampering or reordering
+// (ErrCorrupted) or a short span (ErrShortSpan) as a non-nil error, in which
+// case the returned bytes must be discarded.
+func OpenSpan(cfg Config, span io.Reader, ciphertextSize, start, end int64) ([]byte, error) {
+	r, err := NewSpanReader(span, cfg, ciphertextSize, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -439,6 +441,7 @@ func OpenSpan(cfg Config, span io.Reader, ciphertextSize, off, length int64) ([]
 	if r.Len() > math.MaxInt {
 		return nil, fmt.Errorf("aesstream: range of %d bytes is too large to buffer; use NewSpanReader to stream", r.Len())
 	}
+	defer r.Close()
 	buf := make([]byte, r.Len())
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err

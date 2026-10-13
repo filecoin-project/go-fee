@@ -68,7 +68,7 @@ func TestReaderChunkCountGuard(t *testing.T) {
 }
 
 // TestWriterSteadyStateAllocs shows the Writer's per-chunk work does not
-// allocate, so memory stays O(chunk size) regardless of stream length.
+// allocate at all, so memory stays O(chunk size) regardless of stream length.
 func TestWriterSteadyStateAllocs(t *testing.T) {
 	w, err := NewWriter(io.Discard, internalConfig(DefaultChunkSize))
 	require.NoError(t, err)
@@ -83,7 +83,7 @@ func TestWriterSteadyStateAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	require.LessOrEqualf(t, allocs, 1.0, "Writer.Write allocated %.1f times per chunk; want O(1)", allocs)
+	require.LessOrEqualf(t, allocs, 0.0, "Writer.Write allocated %.1f times per chunk; want none", allocs)
 }
 
 // TestReaderSteadyStateAllocs shows the Reader's per-chunk work does not
@@ -105,5 +105,24 @@ func TestReaderSteadyStateAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	require.LessOrEqualf(t, allocs, 1.0, "Reader.Read allocated %.1f times per chunk; want O(1)", allocs)
+	require.LessOrEqualf(t, allocs, 0.0, "Reader.Read allocated %.1f times per chunk; want none", allocs)
+}
+
+// TestEncryptReaderSteadyStateAllocs shows the pull-mode encryptor's
+// per-chunk work does not allocate either.
+func TestEncryptReaderSteadyStateAllocs(t *testing.T) {
+	const cs = MinChunkSize
+	const runs = 50
+	r, err := NewEncryptReader(bytes.NewReader(make([]byte, (runs+5)*cs)), internalConfig(cs))
+	require.NoError(t, err)
+	out := make([]byte, cs+TagSize)
+	_, err = io.ReadFull(r, out) // warm up one chunk
+	require.NoError(t, err)
+	allocs := testing.AllocsPerRun(runs, func() {
+		// Kept as a plain check so the measured path stays allocation-free.
+		if _, err := io.ReadFull(r, out); err != nil {
+			t.Fatal(err)
+		}
+	})
+	require.LessOrEqualf(t, allocs, 0.0, "EncryptReader.Read allocated %.1f times per chunk; want none", allocs)
 }
