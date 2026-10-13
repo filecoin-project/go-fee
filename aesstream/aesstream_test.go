@@ -253,9 +253,19 @@ func TestDecryptFailures(t *testing.T) {
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
 			}
-			// Any bytes released before the error must be a genuine prefix
-			// of the plaintext — the Reader never fabricates output.
-			require.True(t, bytes.HasPrefix(plain, got), "released bytes are not a plaintext prefix")
+			require.Nil(t, got, "Open returned plaintext alongside an error")
+
+			// Any bytes a Reader releases before the error must be a
+			// genuine prefix of the plaintext — it never fabricates output.
+			r, err := aesstream.NewReader(bytes.NewReader(tc.in), dcfg)
+			require.NoError(t, err)
+			defer r.Close()
+			released, err := io.ReadAll(r)
+			require.Error(t, err)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+			}
+			require.True(t, bytes.HasPrefix(plain, released), "released bytes are not a plaintext prefix")
 		})
 	}
 }

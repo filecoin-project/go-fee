@@ -2,14 +2,9 @@ package aesstream
 
 import (
 	"crypto/cipher"
-	"errors"
 	"fmt"
 	"io"
 )
-
-// errReadAfterClose is returned by EncryptReader.Read once Close has been
-// called.
-var errReadAfterClose = errors.New("aesstream: read after close")
 
 // EncryptReader encrypts a plaintext stream into the chunked AES-256-GCM
 // STREAM format and yields the ciphertext through an io.Reader. It is the
@@ -19,15 +14,16 @@ var errReadAfterClose = errors.New("aesstream: read after close")
 // between the two. The bytes it produces are identical to Writer's for the
 // same Config and plaintext.
 //
-// Each chunk is filled straight from the source (one full chunk per
-// io.ReadFull, however small the source's reads are), sealed in place, and
-// served from the sealed buffer. WriteTo hands each sealed chunk to the
+// Each chunk is filled straight from the source (one io.ReadFull per
+// chunk, however small the source's reads are), sealed, and served from
+// the sealed buffer. WriteTo hands each sealed chunk to the
 // destination as one write, so an io.Copy from an EncryptReader delivers
 // ChunkSize+TagSize-byte writes rather than io.Copy's 32 KiB pieces.
 //
 // The final chunk is marked as the source reaches EOF: a full chunk is only
-// known to be the last one once the source has been asked for more, so the
-// reader looks one byte ahead and carries it into the next chunk. A source
+// known to be the last one once the source has been asked for more, so
+// each read asks for one byte past the chunk, and that byte, when it
+// arrives, starts the next chunk. A source
 // read error surfaces from Read (or WriteTo) and ends the stream before its
 // final chunk, so the ciphertext produced so far is truncated and fails to
 // decrypt rather than passing as a complete object.
@@ -40,12 +36,11 @@ type EncryptReader struct {
 	aad       []byte
 	chunkSize int
 
-	buf     []byte // plaintext of the chunk being sealed, cap chunkSize
+	buf     []byte // plaintext of the chunk being sealed plus one look-ahead byte, cap chunkSize+1
 	sealBuf []byte // the sealed chunk, cap chunkSize+TagSize
 	unread  []byte // sealed bytes not yet returned, a slice of sealBuf
 
-	carry    [1]byte // the look-ahead byte that starts the next chunk
-	hasCarry bool
+	hasCarry bool // buf[chunkSize] holds the first byte of the next chunk
 
 	nonce [NonceSize]byte // the current chunk's nonce, built in place
 
@@ -75,7 +70,7 @@ func NewEncryptReader(src io.Reader, cfg Config) (*EncryptReader, error) {
 		src:       src,
 		aad:       append([]byte(nil), cfg.AAD...),
 		chunkSize: chunkSize,
-		buf:       getBuf(chunkSize),
+		buf:       getBuf(chunkSize + 1),
 		sealBuf:   getBuf(chunkSize + TagSize)[:0],
 		maxChunks: MaxChunks,
 	}
@@ -158,36 +153,32 @@ func (r *EncryptReader) ChunkSize() int { return r.chunkSize }
 // nextChunk fills the next plaintext chunk from the source, decides whether
 // it is the last, seals it into r.unread and advances the index. It
 // records io.EOF in r.err once the final chunk is sealed, and any read
-// error as the terminal state.
+// error as the terminal state. Callers drain r.unread first: sealing the
+// next chunk overwrites the sealBuf that r.unread points into.
 func (r *EncryptReader) nextChunk() error {
 	if r.index >= r.maxChunks {
 		return r.fail(ErrTooManyChunks)
 	}
-	buf := r.buf[:r.chunkSize]
+	buf := r.buf[:r.chunkSize+1]
 	n := 0
 	if r.hasCarry {
-		buf[0] = r.carry[0]
+		buf[0] = buf[r.chunkSize]
 		r.hasCarry = false
 		n = 1
 	}
+	// Ask for one byte more than the chunk holds, so a single read both
+	// fills the chunk and shows whether the source has more.
 	m, err := io.ReadFull(r.src, buf[n:])
 	n += m
 
 	var last bool
 	switch err {
 	case nil:
-		// A full chunk. It is the last one only if the source is now at
-		// EOF; otherwise the byte read here starts the next chunk. (The
-		// one-byte buffer lives on the reader so the read does not
-		// allocate per chunk.)
-		switch k, lerr := io.ReadFull(r.src, r.carry[:]); {
-		case k == 1:
-			r.hasCarry = true
-		case lerr == io.EOF:
-			last = true
-		default:
-			return r.fail(fmt.Errorf("aesstream: read plaintext after chunk %d: %w", r.index, lerr))
-		}
+		// A full chunk and one byte more, so it is not the last. The extra
+		// byte stays at buf[chunkSize], outside the sealed range (Seal
+		// writes into sealBuf, not buf), and starts the next chunk.
+		r.hasCarry = true
+		n = r.chunkSize
 	case io.EOF, io.ErrUnexpectedEOF:
 		// The source ran out inside this chunk: it is the (short or empty)
 		// final chunk.

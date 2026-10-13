@@ -54,6 +54,33 @@ func TestEncryptReaderMatchesWriter(t *testing.T) {
 	}
 }
 
+// TestEncryptReaderOneReadPerChunk: a source that fills whatever it is
+// asked for is read once per chunk, plus the read that finds EOF, rather
+// than once for the chunk and again for the look-ahead byte.
+func TestEncryptReaderOneReadPerChunk(t *testing.T) {
+	const cs = aesstream.MinChunkSize
+	for _, n := range []int{0, 1, cs, cs + 1, 3*cs + 17} {
+		src := &readCounter{r: bytes.NewReader(pattern(n))}
+		r, err := aesstream.NewEncryptReader(src, baseConfig(cs))
+		require.NoError(t, err)
+		_, err = r.WriteTo(io.Discard)
+		require.NoError(t, err)
+		chunks := max((n+cs-1)/cs, 1)
+		require.LessOrEqual(t, src.reads, chunks+1, "%d bytes", n)
+	}
+}
+
+// readCounter counts the Read calls made on it.
+type readCounter struct {
+	r     io.Reader
+	reads int
+}
+
+func (c *readCounter) Read(p []byte) (int, error) {
+	c.reads++
+	return c.r.Read(p)
+}
+
 // chunkSink records every write it receives.
 type chunkSink struct {
 	buf    bytes.Buffer
