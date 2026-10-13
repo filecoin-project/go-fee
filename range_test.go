@@ -106,11 +106,10 @@ func sealTrailingEmptyFinalChunk(t *testing.T, plaintext, cek, baseNonce []byte,
 	env := &cose.Envelope{Headers: cose.Headers{
 		Protected: cose.Header{}.
 			Set(cose.HeaderLabelAlg, algChunkedStream).
-			Set(cose.HeaderLabelType, fee.EnvelopeType),
-		Unprotected: cose.Header{}.
-			Set(cose.HeaderLabelIV, baseNonce).
+			Set(cose.HeaderLabelType, fee.EnvelopeType).
 			Set(labelChunkSize, int64(chunkSize)).
 			Set(labelChunkCount, int64(chunks)),
+		Unprotected: cose.Header{}.Set(cose.HeaderLabelIV, baseNonce),
 	}}
 	aad, err := env.EncStructure(nil)
 	require.NoError(t, err)
@@ -902,5 +901,66 @@ func TestDecryptRangeMatchesFullDecrypt(t *testing.T) {
 	} {
 		_, got := decryptRange(t, f.blob, f.unwrapper, rg.start, rg.end)
 		require.Equal(t, full[rg.start:rg.start+int64(len(got))], got)
+	}
+}
+
+// encryptWithCEKBlob seals plaintext under cek with no recipients, declaring
+// its length so the envelope records the chunk count.
+func encryptWithCEKBlob(t *testing.T, plaintext, cek []byte) []byte {
+	t.Helper()
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil,
+		fee.WithChunkSize(rangeChunk), fee.WithContentLength(int64(len(plaintext))))
+	require.NoError(t, err)
+	defer rc.Close()
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	return blob
+}
+
+// TestDecryptRangeForgedChunkCount: the chunk count is authenticated, so a
+// blob cut short by a whole chunk, with its count lowered to match, fails on
+// the first chunk a range reads, even one that is not the final chunk.
+func TestDecryptRangeForgedChunkCount(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(3*rangeChunk+10) // 4 chunks
+	blob := encryptWithCEKBlob(t, plaintext, cek)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	cc, ok := env.Headers.Protected.Int(labelChunkCount)
+	require.True(t, ok)
+	require.Equal(t, int64(4), cc)
+
+	env.Headers.Protected.Set(labelChunkCount, int64(3))
+	env.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+	forged := append(header, ciphertext[:3*(rangeChunk+aesstream.TagSize)]...)
+
+	rr, err := fee.DecryptRangeWithCEK(bytes.NewReader(forged), int64(len(forged)), cek, 0, 15, nil)
+	require.NoError(t, err, "the forged count agrees with the truncated blob's size")
+	defer rr.Close()
+	_, err = io.ReadAll(rr)
+	require.ErrorIs(t, err, aesstream.ErrCorrupted)
+}
+
+// TestDecryptRejectsUnprotectedChunkHeaders: chunk size and count belong in
+// the protected header, and an envelope that carries either one unprotected is
+// malformed rather than read.
+func TestDecryptRejectsUnprotectedChunkHeaders(t *testing.T) {
+	cek := newCEK(t)
+	blob := encryptWithCEKBlob(t, patternBytes(rangeChunk+10), cek)
+
+	for _, label := range []int64{labelChunkSize, labelChunkCount} {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		env.Headers.Unprotected.Set(label, int64(rangeChunk))
+		header, err := env.Encode()
+		require.NoError(t, err)
+		moved := append(header, ciphertext...)
+
+		_, err = fee.DecryptWithCEK(bytes.NewReader(moved), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "label %d", label)
+		_, err = fee.PlaintextSize(bytes.NewReader(moved), int64(len(moved)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "label %d", label)
 	}
 }

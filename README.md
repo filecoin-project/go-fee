@@ -428,8 +428,9 @@ self-delimiting CBOR; everything after it is the STREAM ciphertext.
 ```
 envelope    = 16([ protected, unprotected, null ])              # no recipients
             | 96([ protected, unprotected, null, recipients ])  # with recipients
-protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose" }
-unprotected = { 5: baseNonce(7B), -65790: chunkSize, -65791: chunkCount }
+protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose",
+                -65790: chunkSize, -65791: chunkCount }
+unprotected = { 5: baseNonce(7B) }
 recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 ```
 
@@ -440,8 +441,8 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   Vizár, as used by [age](https://age-encryption.org) and Google Tink) enforces
   chunk order and detects truncation and insertion.
 - **Body AAD** — the COSE `Enc_structure` over the protected header, identical
-  for every chunk, so the algorithm, envelope type and any protected metadata
-  are authenticated into the ciphertext.
+  for every chunk, so the algorithm, envelope type, chunk size, chunk count and
+  any protected metadata are authenticated into the ciphertext.
 - **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
   with the remainder in the final chunk; empty input is one empty chunk. A
   decoder also accepts a stream that ends with an empty final chunk, so a
@@ -449,8 +450,12 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   chunks or `k+1`. Only the ciphertext length distinguishes them
   (`aesstream.ChunkCount`), which is why a declared count must never be checked
   against a count re-derived from the plaintext length.
-- **Chunk count** (label −65791) — advisory metadata for range/seek consumers,
-  emitted only when the plaintext length is known; not required to decrypt.
+- **Chunk size and count** (labels −65790 and −65791) — protected, so every
+  chunk that authenticates also vouches for them. The count is emitted only
+  when the plaintext length is known and is not required to decrypt; a range
+  read that checks it against the blob size detects a truncated blob even when
+  the range avoids the final chunk. An envelope that carries either label in
+  its unprotected header is rejected as `ErrMalformedEnvelope`.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,

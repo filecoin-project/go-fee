@@ -15,8 +15,8 @@
 //	blob        = envelope || ciphertext          (detached payload)
 //	envelope    = 16([protected, unprotected, null])                for no recipients
 //	            | 96([protected, unprotected, null, recipients])    with recipients
-//	protected   = {1: alg, 16: "application/vnd.foc-envelope+cose"}
-//	unprotected = {5: baseNonce, -65790: chunkSize, -65791: chunkCount}
+//	protected   = {1: alg, 16: "application/vnd.foc-envelope+cose", -65790: chunkSize, -65791: chunkCount}
+//	unprotected = {5: baseNonce}
 //	alg         = -65793  (chunked AES-256-GCM-STREAM)
 //	body AAD    = [ context, protected, "" ]      context per RFC 9052 §5.3:
 //	              "Encrypt" for a tag-96 envelope, "Encrypt0" for tag-16

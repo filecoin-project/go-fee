@@ -56,8 +56,9 @@ self-delimiting CBOR; the bytes after it are the STREAM ciphertext.
 ```
 envelope    = 16([ protected, unprotected, null ])              # no recipients
             | 96([ protected, unprotected, null, recipients ])  # with recipients
-protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose" }
-unprotected = { 5: baseNonce(7B), -65790: chunkSize, -65791: chunkCount }
+protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose",
+                -65790: chunkSize, -65791: chunkCount }
+unprotected = { 5: baseNonce(7B) }
 recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 ```
 

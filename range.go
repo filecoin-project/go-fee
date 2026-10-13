@@ -309,10 +309,10 @@ func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkS
 	if err != nil {
 		return 0, err
 	}
-	if !env.Headers.Unprotected.Has(labelChunkCount) {
+	if !env.Headers.Protected.Has(labelChunkCount) {
 		return plainSize, nil
 	}
-	declared, ok := env.Headers.Unprotected.Int(labelChunkCount)
+	declared, ok := env.Headers.Protected.Int(labelChunkCount)
 	if !ok {
 		return 0, fmt.Errorf("%w: chunk-count header is present but not an integer", ErrMalformedEnvelope)
 	}

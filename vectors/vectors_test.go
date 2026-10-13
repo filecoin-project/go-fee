@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"encoding/hex"
+	"io"
 	"os"
 	"testing"
 
+	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aeskw"
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/filecoin-project/go-fee/cose"
@@ -74,6 +76,14 @@ func TestVectors(t *testing.T) {
 			require.Equal(t,
 				aesstream.EncryptedSize(int64(len(f.plaintext)), p.chunkSize),
 				int64(len(p.ciphertext)), "ciphertext framing")
+
+			// The fee package reads the fixture too, so it cannot drift from
+			// the wire format these helpers pin.
+			r, err := fee.DecryptWithCEK(bytes.NewReader(f.blob), cek)
+			require.NoError(t, err, "fee.DecryptWithCEK")
+			viaFee, err := io.ReadAll(r)
+			require.NoError(t, err, "fee.DecryptWithCEK")
+			require.Equal(t, f.plaintext, viaFee, "fee.DecryptWithCEK plaintext")
 
 			// Determinism: a second decrypt yields the same bytes.
 			again, err := decryptFEE(f.blob, cek)

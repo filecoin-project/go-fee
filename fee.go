@@ -108,14 +108,17 @@ const EnvelopeType = "application/vnd.foc-envelope+cose"
 // different body cipher is refused rather than mis-decrypted.
 const algChunkedAES256GCMStream int64 = -65793
 
-// FEE private-use COSE header labels carried in the body unprotected header,
-// matching the foc-encryption reference (src/cose/headers.ts).
+// FEE private-use COSE header labels carried in the body protected header,
+// matching the foc-encryption reference (src/cose/headers.ts). Being
+// protected, both are authenticated by every chunk's AAD. An envelope that
+// carries either one in its unprotected header is malformed.
 const (
 	// labelChunkSize holds the STREAM plaintext chunk size, in bytes.
 	labelChunkSize int64 = -65790
 	// labelChunkCount holds the number of STREAM chunks. It is emitted only when
-	// the plaintext length is known ([WithContentLength]); it is advisory
-	// metadata for range/seek consumers and is not required to decrypt.
+	// the plaintext length is known ([WithContentLength]) and is not required
+	// to decrypt; a range consumer can plan fetches from it, and any chunk that
+	// authenticates vouches for it.
 	labelChunkCount int64 = -65791
 )
 
@@ -314,21 +317,20 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: generating base nonce: %w", err)
 	}
 
-	// The body header is fixed before encryption: the algorithm and envelope
-	// type are protected (authenticated through the Enc_structure AAD); the base
-	// nonce, chunk size and (when the length is known) chunk count ride in the
-	// unprotected header.
-	unprotected := cose.Header{}.
-		Set(cose.HeaderLabelIV, baseNonce).
+	// The body header is fixed before encryption: the algorithm, envelope
+	// type, chunk size and (when the length is known) chunk count are
+	// protected (authenticated through the Enc_structure AAD); the base nonce
+	// rides in the unprotected header.
+	protected := cose.Header{}.
+		Set(cose.HeaderLabelAlg, algChunkedAES256GCMStream).
+		Set(cose.HeaderLabelType, EnvelopeType).
 		Set(labelChunkSize, int64(cfg.chunkSize))
 	if cfg.contentLength >= 0 {
-		unprotected.Set(labelChunkCount, int64(chunkCountFor(cfg.contentLength, int64(cfg.chunkSize))))
+		protected.Set(labelChunkCount, int64(chunkCountFor(cfg.contentLength, int64(cfg.chunkSize))))
 	}
 	headers := cose.Headers{
-		Protected: cose.Header{}.
-			Set(cose.HeaderLabelAlg, algChunkedAES256GCMStream).
-			Set(cose.HeaderLabelType, EnvelopeType),
-		Unprotected: unprotected,
+		Protected:   protected,
+		Unprotected: cose.Header{}.Set(cose.HeaderLabelIV, baseNonce),
 	}
 
 	// Wrap the CEK to each recipient (none → a recipient-less envelope). All the
@@ -615,13 +617,22 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 		return bodyParams{}, fmt.Errorf("%w: missing iv (base nonce)", ErrMalformedEnvelope)
 	}
 
+	// Chunk size and count belong in the protected header, where the AAD
+	// authenticates them. A copy in the unprotected header would be
+	// unauthenticated and ambiguous, so it makes the envelope malformed.
+	for _, label := range []int64{labelChunkSize, labelChunkCount} {
+		if env.Headers.Unprotected.Has(label) {
+			return bodyParams{}, fmt.Errorf("%w: header %d must be protected", ErrMalformedEnvelope, label)
+		}
+	}
+
 	// Self-describing chunk size; an envelope that omits it is read at the FEE
 	// default, but a header present with a non-integer value is a malformed
-	// envelope rather than a silent fallback. (The chunk count, when present, is
-	// advisory and not needed to decrypt.)
+	// envelope rather than a silent fallback. (The chunk count, when present,
+	// is not needed to decrypt.)
 	chunkSize := int64(aesstream.DefaultChunkSize)
-	if env.Headers.Unprotected.Has(labelChunkSize) {
-		n, ok := env.Headers.Unprotected.Int(labelChunkSize)
+	if env.Headers.Protected.Has(labelChunkSize) {
+		n, ok := env.Headers.Protected.Int(labelChunkSize)
 		if !ok {
 			return bodyParams{}, fmt.Errorf("%w: chunk-size header is present but not an integer", ErrMalformedEnvelope)
 		}

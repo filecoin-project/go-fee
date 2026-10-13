@@ -627,7 +627,8 @@ func TestEnvelopeWireConventions(t *testing.T) {
 	env, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 	require.NoError(t, err)
 
-	// Protected header: typ and body algorithm are authenticated via the AAD.
+	// Protected header: typ, body algorithm and chunk size are authenticated
+	// via the AAD.
 	typ, ok := env.Headers.Protected.Text(cose.HeaderLabelType)
 	require.True(t, ok)
 	require.Equal(t, fee.EnvelopeType, typ)
@@ -636,14 +637,16 @@ func TestEnvelopeWireConventions(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, algChunkedStream, alg, "chunked AES-256-GCM-STREAM private-use alg")
 
-	// Unprotected header: base nonce (iv) and chunk size in the private-use label.
+	cs, ok := env.Headers.Protected.Int(labelChunkSize)
+	require.True(t, ok, "chunk size recorded in the protected private-use label")
+	require.Equal(t, int64(chunk), cs)
+
+	// Unprotected header: the base nonce (iv) and nothing else.
 	iv, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
 	require.True(t, ok)
 	require.Len(t, iv, aesstream.BaseNonceSize)
-
-	cs, ok := env.Headers.Unprotected.Int(labelChunkSize)
-	require.True(t, ok, "chunk size recorded in the unprotected private-use label")
-	require.Equal(t, int64(chunk), cs)
+	require.False(t, env.Headers.Unprotected.Has(labelChunkSize))
+	require.False(t, env.Headers.Unprotected.Has(labelChunkCount))
 
 	// Recipient: algorithm, kid, and a self-describing COSE_Key ephemeral key.
 	require.Len(t, env.Recipients, 1)
@@ -707,7 +710,7 @@ func TestContentLengthChunkCount(t *testing.T) {
 
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		cc, ok := env.Headers.Unprotected.Int(labelChunkCount)
+		cc, ok := env.Headers.Protected.Int(labelChunkCount)
 		require.True(t, ok, "chunk count present when content length declared")
 		require.Equal(t, int64(4), cc)
 
@@ -723,7 +726,7 @@ func TestContentLengthChunkCount(t *testing.T) {
 
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		require.False(t, env.Headers.Unprotected.Has(labelChunkCount),
+		require.False(t, env.Headers.Protected.Has(labelChunkCount),
 			"chunk count omitted when content length unknown")
 
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewECDHESUnwrapper(ecdhKID, key)))
@@ -844,15 +847,15 @@ func TestDecryptMalformedChunkSizeHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	// Hand-build an envelope whose chunk-size header (FEE private-use label, in
-	// the unprotected header) is present but holds a string instead of an integer.
+	// the protected header) is present but holds a string instead of an integer.
 	env := &cose.Envelope{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.
 				Set(cose.HeaderLabelAlg, algChunkedStream).
-				Set(cose.HeaderLabelType, fee.EnvelopeType),
-			Unprotected: cose.Header{}.
-				Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)).
+				Set(cose.HeaderLabelType, fee.EnvelopeType).
 				Set(labelChunkSize, "not-an-integer"),
+			Unprotected: cose.Header{}.
+				Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)),
 		},
 		Recipients: []*cose.Recipient{{
 			Headers: cose.Headers{
@@ -897,10 +900,10 @@ func TestDecryptMalformedEphemeralKey(t *testing.T) {
 				Headers: cose.Headers{
 					Protected: cose.Header{}.
 						Set(cose.HeaderLabelAlg, algChunkedStream).
-						Set(cose.HeaderLabelType, fee.EnvelopeType),
-					Unprotected: cose.Header{}.
-						Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)).
+						Set(cose.HeaderLabelType, fee.EnvelopeType).
 						Set(labelChunkSize, int64(aesstream.MinChunkSize)),
+					Unprotected: cose.Header{}.
+						Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)),
 				},
 				Recipients: []*cose.Recipient{{
 					Headers: cose.Headers{

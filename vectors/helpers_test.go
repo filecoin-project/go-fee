@@ -31,7 +31,7 @@ const (
 	// AES-256-GCM-STREAM body cipher. Reference: CHUNKED_AES_256_GCM_STREAM.
 	algChunkedStream = int64(-65793)
 
-	// labelChunkSize and labelChunkCount are the private-use unprotected header
+	// labelChunkSize and labelChunkCount are the private-use protected header
 	// labels carrying the STREAM geometry. Reference: CoseHeaderParam.CHUNK_SIZE
 	// / CHUNK_COUNT.
 	labelChunkSize  = int64(-65790)
@@ -101,11 +101,10 @@ func composeFEE(plaintext, cek, baseNonce []byte, chunkSize int, recipients []*c
 	headers := cose.Headers{
 		Protected: cose.Header{}.
 			Set(cose.HeaderLabelAlg, algChunkedStream).
-			Set(cose.HeaderLabelType, feeTyp),
-		Unprotected: cose.Header{}.
-			Set(cose.HeaderLabelIV, baseNonce).
+			Set(cose.HeaderLabelType, feeTyp).
 			Set(labelChunkSize, int64(chunkSize)).
 			Set(labelChunkCount, int64(chunkCount)),
+		Unprotected: cose.Header{}.Set(cose.HeaderLabelIV, baseNonce),
 	}
 
 	// Recipient presence selects the form: nil/empty -> COSE_Encrypt0 (tag 16),
@@ -225,7 +224,12 @@ func decodeFEE(blob []byte) (*parsedFEE, error) {
 		return nil, fmt.Errorf("missing iv (base nonce)")
 	}
 	out.baseNonce = iv
-	if cs, ok := out.headers.Unprotected.Int(labelChunkSize); ok {
+	for _, label := range []int64{labelChunkSize, labelChunkCount} {
+		if out.headers.Unprotected.Has(label) {
+			return nil, fmt.Errorf("header %d must be protected", label)
+		}
+	}
+	if cs, ok := out.headers.Protected.Int(labelChunkSize); ok {
 		out.chunkSize = int(cs)
 	} else {
 		out.chunkSize = aesstream.DefaultChunkSize
