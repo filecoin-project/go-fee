@@ -145,12 +145,12 @@ func (u *a256kwUnwrapper) unwrap(r *cose.Recipient) ([]byte, error) {
 	return cek, nil
 }
 
-// recipientUnderstoodLabels are the recipient header parameters the unwrappers
-// process, so a recipient may list them as critical: alg, crit, kid, and the
-// ECDH-ES ephemeral key.
+// recipientUnderstoodLabels are the recipient header parameters a recipient
+// may list as critical: alg and kid. crit itself would be circular, and the
+// ECDH-ES ephemeral key is read only from the unprotected header, where crit
+// cannot name it.
 var recipientUnderstoodLabels = map[int64]bool{
-	cose.HeaderLabelAlg: true, cose.HeaderLabelCrit: true,
-	cose.HeaderLabelKID: true, cose.HeaderLabelEphemeralKey: true,
+	cose.HeaderLabelAlg: true, cose.HeaderLabelKID: true,
 }
 
 // recipientAlg returns a recipient's key-wrap algorithm, after processing its

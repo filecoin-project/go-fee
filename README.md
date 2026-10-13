@@ -469,7 +469,8 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
 - **Envelope processing** — every CBOR item, including the serialized protected
   headers, must use definite lengths and shortest-form arguments and contain no
   floats (`cose.WithStrictEncoding`); duplicate labels are rejected. `crit` must
-  be protected and may name only parameters this package processes. A Partial IV
+  be protected and may name only parameters this package processes that are
+  present in the same protected header, never `crit` itself. A Partial IV
   in either content bucket is rejected. Unknown non-critical parameters are
   ignored.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519

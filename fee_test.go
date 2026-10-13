@@ -1069,6 +1069,8 @@ func TestDecryptCrit(t *testing.T) {
 	for name, protected := range map[string]cose.Header{
 		"naming an unknown parameter": bodyHeader().Set(cose.HeaderLabelCrit, []any{int64(-70000)}),
 		"naming a text label":         bodyHeader().Set(cose.HeaderLabelCrit, []any{"x"}),
+		"naming crit itself":          bodyHeader().Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelCrit}),
+		"naming an absent parameter":  bodyHeader().Set(cose.HeaderLabelCrit, []any{labelPlaintextLength}),
 		"empty":                       bodyHeader().Set(cose.HeaderLabelCrit, []any{}),
 		"not an array":                bodyHeader().Set(cose.HeaderLabelCrit, int64(5)),
 	} {
@@ -1128,6 +1130,14 @@ func TestRecipientCrit(t *testing.T) {
 		},
 		"unprotected": func(r *cose.Recipient) {
 			r.Headers.Unprotected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelKID})
+		},
+		"naming the ephemeral key": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelEphemeralKey})
+			r.Headers.RawProtected = nil
+		},
+		"naming a kid the protected header does not carry": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelKID})
+			r.Headers.RawProtected = nil
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -137,9 +137,10 @@ var bodyContentLabels = []int64{
 }
 
 // bodyUnderstoodLabels are the body header parameters this package knows how
-// to process, so an envelope may list them as critical (crit, label 2).
+// to process, so an envelope may list them as critical (crit, label 2). crit
+// itself is excluded: listing it would be circular.
 var bodyUnderstoodLabels = map[int64]bool{
-	cose.HeaderLabelAlg: true, cose.HeaderLabelCrit: true, cose.HeaderLabelContentType: true,
+	cose.HeaderLabelAlg: true, cose.HeaderLabelContentType: true,
 	cose.HeaderLabelIV: true, cose.HeaderLabelType: true,
 	labelChunkSize: true, labelPlaintextLength: true, labelAppMetadata: true,
 }
@@ -154,9 +155,10 @@ var envelopeDecodeOptions = []cose.DecodeOption{
 
 // checkCrit processes a header pair's crit parameter (label 2, RFC 9052 §3.1):
 // it must be protected, it must be a non-empty array of labels, and every label
-// it names must be one the caller understands. An envelope that marks a
-// parameter critical which this package cannot process is malformed rather
-// than read with that parameter ignored.
+// it names must be one the caller understands and must be present in the same
+// protected map. An envelope that marks a parameter critical which this
+// package cannot process is malformed rather than read with that parameter
+// ignored.
 func checkCrit(h cose.Headers, understood map[int64]bool) error {
 	if h.Unprotected.Has(cose.HeaderLabelCrit) {
 		return fmt.Errorf("%w: crit must be protected", ErrMalformedEnvelope)
@@ -173,6 +175,9 @@ func checkCrit(h cose.Headers, understood map[int64]bool) error {
 		n, ok := l.(int64)
 		if !ok || !understood[n] {
 			return fmt.Errorf("%w: crit names header %v, which this package does not understand", ErrMalformedEnvelope, l)
+		}
+		if !h.Protected.Has(n) {
+			return fmt.Errorf("%w: crit names header %d, which the protected header does not carry", ErrMalformedEnvelope, n)
 		}
 	}
 	return nil
