@@ -1710,3 +1710,44 @@ func TestContentTypeEitherBucket(t *testing.T) {
 		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRangeWithCEK, %s", name)
 	}
 }
+
+// TestPlaintextLengthSafeIntegerBound: a declared plaintext length above
+// MaxPlaintextLength (2^53 - 1, which the Synapse SDK rejects) is malformed on
+// every decode path, MaxPlaintextLength itself gets as far as the size check,
+// and WithContentLength refuses to write a larger one.
+func TestPlaintextLengthSafeIntegerBound(t *testing.T) {
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, nil, fee.WithContentLength(100))
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	withLength := func(n int64) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		env.Headers.Protected.Set(labelPlaintextLength, n)
+		env.Headers.RawProtected = nil
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+
+	over := withLength(fee.MaxPlaintextLength + 1)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(over), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+	_, err = fee.PlaintextSize(bytes.NewReader(over), int64(len(over)))
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(over), int64(len(over)), cek, 0, 0, nil)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRangeWithCEK")
+
+	atMax := withLength(fee.MaxPlaintextLength)
+	_, err = fee.PlaintextSize(bytes.NewReader(atMax), int64(len(atMax)))
+	require.ErrorIs(t, err, fee.ErrSizeMismatch, "the bound itself is a valid length")
+
+	_, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithContentLength(fee.MaxPlaintextLength+1))
+	require.Error(t, err, "WithContentLength over the bound")
+	rc, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithContentLength(fee.MaxPlaintextLength))
+	require.NoError(t, err, "WithContentLength at the bound")
+	require.NoError(t, rc.Close())
+}

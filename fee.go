@@ -144,6 +144,12 @@ var bodyUnderstoodLabels = map[int64]bool{
 	labelChunkSize: true, labelPlaintextLength: true, labelAppMetadata: true,
 }
 
+// MaxPlaintextLength is the largest plaintext length an envelope may declare:
+// 2^53 - 1, JavaScript's largest safe integer. The Synapse SDK rejects a larger
+// declared length, so a decoder rejects one as malformed and [WithContentLength]
+// refuses to write one. It is about 8 PiB, far beyond any real object.
+const MaxPlaintextLength = 1<<53 - 1
+
 // MaxEnvelopeSize is the largest encoded envelope, outer tag included, that
 // any decrypt path accepts: 1 MiB, the Synapse SDK's limit. Reading stops once
 // this much input has failed to complete an envelope, which fails with an
@@ -273,6 +279,9 @@ func WithChunkSize(n int) EncryptOption {
 // reader fails with [ErrContentLengthMismatch] if the plaintext turns out to be
 // a different length.
 //
+// n must be at most [MaxPlaintextLength]; a larger n fails the encrypt call
+// before any plaintext is read.
+//
 // A negative n is treated as "unknown", identical to not calling this option: a
 // caller propagating an unknown HTTP Content-Length as -1 gets the unset
 // behavior (no recorded length, no mismatch check) rather than an error. When
@@ -394,6 +403,9 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		// decode-side classification). Surface aesstream.ErrChunkSize, the same
 		// sentinel aesstream.NewWriter would return for this size.
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
+	}
+	if cfg.contentLength > MaxPlaintextLength {
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: content length %d exceeds MaxPlaintextLength (%d)", cfg.contentLength, int64(MaxPlaintextLength))
 	}
 
 	baseNonce, err := aesstream.NewBaseNonce()
@@ -810,8 +822,8 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	plaintextLength := int64(-1)
 	if env.Headers.Protected.Has(labelPlaintextLength) {
 		n, ok := env.Headers.Protected.Int(labelPlaintextLength)
-		if !ok || n < 0 {
-			return bodyParams{}, fmt.Errorf("%w: plaintext-length header is not a non-negative integer", ErrMalformedEnvelope)
+		if !ok || n < 0 || n > MaxPlaintextLength {
+			return bodyParams{}, fmt.Errorf("%w: plaintext-length header is not an integer from 0 to %d", ErrMalformedEnvelope, int64(MaxPlaintextLength))
 		}
 		plaintextLength = n
 	}
