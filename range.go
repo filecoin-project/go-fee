@@ -177,14 +177,15 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 // envelope-derived metadata can pass it as desc to skip that header read
 // entirely; the only bytes then fetched from blob are the ciphertext chunks the
 // range overlaps. The descriptor is cloned before use, so later caller mutation
-// cannot affect the decryptor built from it. A malformed descriptor is rejected
-// up front with [ErrInvalidDescriptor]; a well-formed but stale or wrong one
-// fails when read as [aesstream.ErrCorrupted], not as plausible plaintext.
+// cannot affect the decryptor built from it. A malformed descriptor, or one
+// whose AAD disagrees with its other fields, is rejected up front with
+// [ErrInvalidDescriptor]; a well-formed but stale or wrong one fails when read
+// as [aesstream.ErrCorrupted], not as plausible plaintext.
 //
 // blobSize is the size of the whole stored blob, envelope included, exactly as
-// for [DecryptRange]. When desc is non-nil there is no envelope to consult, so
-// this path cannot perform the plaintext-length cross-check that reports
-// [ErrSizeMismatch] on the envelope-backed paths.
+// for [DecryptRange]. When desc is non-nil, the plaintext length declared in
+// the protected header it caches in AAD is checked against blobSize exactly as
+// on the envelope-backed paths, failing with [ErrSizeMismatch].
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.
@@ -200,12 +201,16 @@ func DecryptRangeWithCEK(blob io.ReaderAt, blobSize int64, cek []byte, start, en
 	if desc != nil {
 		// Validate the cached descriptor and derive plaintext size without
 		// reading the envelope.
-		var d BodyDescriptor = desc.clone()
-		plainSize, err := d.PlaintextSize(blobSize)
+		d := desc.clone()
+		body, err := d.params()
 		if err != nil {
 			return nil, err
 		}
-		return spanRangeReader(blob, blobSize, d.HeaderLen, d.bodyParams(), d.aad(), plainSize, cek, start, end)
+		plainSize, err := checkedPlaintextSize(blobSize, d.HeaderLen, body)
+		if err != nil {
+			return nil, err
+		}
+		return spanRangeReader(blob, blobSize, d.HeaderLen, body, d.AAD, plainSize, cek, start, end)
 	}
 
 	env, headerLen, err := decodeHeaderAt(blob, blobSize)
@@ -231,7 +236,7 @@ func PlaintextSize(blob io.ReaderAt, blobSize int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return envelopePlaintextSize(env, blobSize, headerLen, body.chunkSize)
+	return checkedPlaintextSize(blobSize, headerLen, body)
 }
 
 // newRangeReader is the shared core of DecryptRange and the envelope-decoding
@@ -250,7 +255,7 @@ func newRangeReader(env *cose.Envelope, blob io.ReaderAt, blobSize, headerLen in
 		return nil, err
 	}
 
-	plainSize, err := envelopePlaintextSize(env, blobSize, headerLen, body.chunkSize)
+	plainSize, err := checkedPlaintextSize(blobSize, headerLen, body)
 	if err != nil {
 		return nil, err
 	}
@@ -288,27 +293,20 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 	return &RangeReader{sr: sr, len: plainLen, size: plainSize, spanStart: headerLen + ctStart, spanEnd: headerLen + ctEnd}, nil
 }
 
-// envelopePlaintextSize is [plaintextSizeFrom] for a blob whose parameters came
-// from its envelope rather than from a caller's cache: it adds the cross-check of
-// the envelope's declared plaintext length against the length the ciphertext
-// actually holds, when a length is declared, catching a blob size that describes
-// a different object than the envelope does. Each plaintext length has exactly
-// one valid ciphertext length, so the comparison is exact.
-func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkSize int) (int64, error) {
-	plainSize, err := plaintextSizeFrom(blobSize, headerLen, chunkSize)
+// checkedPlaintextSize is [plaintextSizeFrom] with the cross-check of the
+// declared plaintext length, when body carries one, against the length the
+// ciphertext actually holds. It catches a blob size that describes a different
+// object than the protected header does. Each plaintext length has exactly one
+// valid ciphertext length, so the comparison is exact. The envelope-backed paths
+// and the cached-descriptor path share it, so they report the same errors.
+func checkedPlaintextSize(blobSize, headerLen int64, body bodyParams) (int64, error) {
+	plainSize, err := plaintextSizeFrom(blobSize, headerLen, body.chunkSize)
 	if err != nil {
 		return 0, err
 	}
-	if !env.Headers.Protected.Has(labelPlaintextLength) {
-		return plainSize, nil
-	}
-	declared, ok := env.Headers.Protected.Int(labelPlaintextLength)
-	if !ok || declared < 0 {
-		return 0, fmt.Errorf("%w: plaintext-length header is not a non-negative integer", ErrMalformedEnvelope)
-	}
-	if declared != plainSize {
+	if body.plaintextLength >= 0 && body.plaintextLength != plainSize {
 		return 0, fmt.Errorf("%w: envelope declares %d plaintext bytes, the ciphertext holds %d",
-			ErrSizeMismatch, declared, plainSize)
+			ErrSizeMismatch, body.plaintextLength, plainSize)
 	}
 	return plainSize, nil
 }

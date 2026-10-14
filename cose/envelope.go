@@ -158,3 +158,50 @@ func (h Headers) ProtectedBytes() ([]byte, error) {
 	}
 	return encodeMap(h.Protected)
 }
+
+// ParseEncStructure decodes an encoded Enc_structure (RFC 9052 §5.3), as built
+// by [Envelope.EncStructure], and returns its context ("Encrypt" or
+// "Encrypt0"), the decoded protected header and the external AAD. It holds the
+// structure to the same rules as a decoded envelope under [WithStrictEncoding]:
+// one definite-length, shortest-form item with no floats, tags or unexpected
+// simple values, in the structure itself and in the protected header it
+// carries. Any other input fails with ErrMalformed.
+//
+// A caller that cached an envelope's Enc_structure uses it to recover the
+// protected header the AAD authenticates.
+func ParseEncStructure(data []byte) (context string, protected Header, externalAAD []byte, err error) {
+	if err := checkStrictEncoding(data, false); err != nil {
+		return "", nil, nil, fmt.Errorf("Enc_structure: %w", err)
+	}
+	var arr []cbor.RawMessage
+	if err := decMode.Unmarshal(data, &arr); err != nil {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure: %v", ErrMalformed, err)
+	}
+	if len(arr) != 3 {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure has %d elements, want 3", ErrMalformed, len(arr))
+	}
+	if err := decMode.Unmarshal(arr[0], &context); err != nil {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure context is not a text string", ErrMalformed)
+	}
+	if context != contextEncrypt && context != contextEncrypt0 {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure context %q is not %q or %q", ErrMalformed, context, contextEncrypt, contextEncrypt0)
+	}
+	if cborMajor(arr[2]) != majorByteString {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure external AAD is not a byte string", ErrMalformed)
+	}
+	if err := decMode.Unmarshal(arr[2], &externalAAD); err != nil {
+		return "", nil, nil, fmt.Errorf("%w: Enc_structure external AAD: %v", ErrMalformed, err)
+	}
+	// decodeHeaders checks the protected element exactly as for an envelope.
+	// The Enc_structure has no unprotected header, so an empty map stands in.
+	headers, err := decodeHeaders(arr[1], []byte{0xa0})
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("Enc_structure: %w", err)
+	}
+	if len(headers.RawProtected) > 0 {
+		if err := checkStrictEncoding(headers.RawProtected, false); err != nil {
+			return "", nil, nil, fmt.Errorf("Enc_structure protected header: %w", err)
+		}
+	}
+	return context, headers.Protected, externalAAD, nil
+}

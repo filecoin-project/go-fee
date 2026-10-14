@@ -226,3 +226,38 @@ func TestDecodeWithMaxSizeNotPositive(t *testing.T) {
 		require.Zero(t, r.read, "DecodeReader read input, limit %d", n)
 	}
 }
+
+// TestParseEncStructure: an Enc_structure built by EncStructure parses back to
+// its context, protected header and external AAD, for both envelope forms, and
+// anything else is malformed.
+func TestParseEncStructure(t *testing.T) {
+	env := sampleEnvelope()
+	for name, e := range map[string]*Envelope{
+		"Encrypt":  env,
+		"Encrypt0": {Headers: env.Headers},
+	} {
+		aad, err := e.EncStructure([]byte("external"))
+		require.NoError(t, err)
+		context, protected, external, err := ParseEncStructure(aad)
+		require.NoError(t, err, name)
+		require.Equal(t, name, context)
+		require.Equal(t, env.Headers.Protected, protected, name)
+		require.Equal(t, []byte("external"), external, name)
+	}
+
+	malformed := map[string]string{
+		"not an array":                   "a0",
+		"two elements":                   "82674572637279707440",
+		"unknown context":                "8363666f6f4040",
+		"context not text":               "83014040",
+		"protected not a byte string":    "8367456e637279707401" + "40",
+		"protected not a map":            "8367456e637279707441" + "01" + "40",
+		"external aad not a byte string": "8367456e63727970744001",
+		"non-minimal length":             "8367456e6372797074" + "5800" + "40",
+		"trailing bytes":                 "8367456e63727970744040" + "00",
+	}
+	for name, h := range malformed {
+		_, _, _, err := ParseEncStructure(hexDec(t, h))
+		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+}

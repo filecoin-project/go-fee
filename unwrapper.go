@@ -265,16 +265,23 @@ func validateRecipients(recipients []*cose.Recipient) error {
 	return nil
 }
 
-// validateRecipient checks one recipient's headers: crit is processed (only
-// alg and kid may be named); no label appears in both buckets; kid, wherever it
-// is, is a byte string; alg is present, as an integer or a text string. For
-// the algorithms FEE profiles it also checks placement: an A256KW recipient's
-// protected header is empty (RFC 9053 §6.2.1), so its alg is unprotected, and
-// its wrapped key is exactly 40 bytes; an ECDH-ES+A256KW recipient's alg is
-// protected, since those bytes feed its key derivation, it carries a valid
-// X25519 ephemeral key, and its wrapped key is exactly 40 bytes too. A recipient that passes can fail to unwrap only by
-// being wrapped under a different key.
+// validateRecipient checks one recipient. Its ciphertext is a byte string. In
+// its headers, crit is processed (only alg and kid may be named), no label
+// appears in both buckets, kid, wherever it is, is a byte string, and alg is
+// present, as an integer or a text string. For the algorithms FEE profiles it
+// also checks placement and size. An A256KW recipient's protected header is
+// empty (RFC 9053 §6.2.1), so its alg is unprotected. An ECDH-ES+A256KW
+// recipient's alg is protected, since those bytes feed its key derivation, and
+// it carries a valid X25519 ephemeral key. Both wrap the CEK to exactly 40
+// bytes. A recipient that passes can fail to unwrap only by being wrapped under
+// a different key.
 func validateRecipient(r *cose.Recipient) error {
+	// COSE allows a null recipient ciphertext, but every FEE recipient carries
+	// a wrapped key, so it must be a byte string whatever the algorithm. cose
+	// decodes null as a nil slice and an empty byte string as an empty one.
+	if r.Ciphertext == nil {
+		return fmt.Errorf("%w: recipient ciphertext is null, want a byte string", ErrMalformedEnvelope)
+	}
 	h := r.Headers
 	if err := checkCrit(h, recipientUnderstoodLabels); err != nil {
 		return err

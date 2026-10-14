@@ -48,8 +48,8 @@ function repeatTo(label: string, n: number): Uint8Array {
   return new Uint8Array(bytes)
 }
 
-// through pipes bytes through one of the reference's transform pairs and
-// collects the output.
+// Pipes input through one of the reference's transform pairs and collects the
+// output.
 async function through(input: Uint8Array, pair: ReadableWritablePair<Uint8Array, Uint8Array>): Promise<Uint8Array> {
   const source = new ReadableStream<Uint8Array>({
     start(controller) {

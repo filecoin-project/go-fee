@@ -426,10 +426,10 @@ directly.
 
 The envelope is a fixed prefix of every stored object, so a store that keeps its
 own metadata beside the blob can record what a range decrypt needs from it and
-skip the header read as well. `fee.Encrypt` reports those four values alongside
-the reader: envelope length, base nonce, chunk size, and the `Enc_structure` AAD.
-They are complete before any plaintext is read, so a writer can store them while
-the upload is still streaming:
+skip the header read as well. `fee.Encrypt` reports those two values alongside
+the reader: the envelope length and the `Enc_structure` AAD. They are complete
+before any plaintext is read, so a writer can store them while the upload is
+still streaming:
 
 ```go
 // d goes alongside the blob's location and size.
@@ -442,17 +442,19 @@ ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a
 `HEAD` or resolves a suffix range from the stored record alone, reading
 nothing.
 
-Every field is non-secret — all four are already in the clear at the front of the
+Both values are non-secret — they are already in the clear at the front of the
 blob — and the CEK is deliberately not among them. Store the AAD rather than the
-protected header it contains: the `Enc_structure`'s context string differs between
-a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the protected
-header alone would need a companion flag recording which form was written. A stale
-or corrupted record cannot serve wrong plaintext, since all four values are bound
-into every chunk's GCM tag or decide which bytes are read; it fails with
-`aesstream.ErrCorrupted` instead. The one check it gives up is `ErrSizeMismatch`:
-with no envelope to consult, nothing cross-checks `blobSize` against the declared
-plaintext length, so a caller that stores the size should compare it with the
-store's own before trusting a range.
+protected header it contains: the `Enc_structure`'s context string differs
+between a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the
+protected header alone would need a companion flag recording which form was
+written. The base nonce, chunk size and any declared plaintext length are read
+from the protected header in the AAD (`d.ChunkSize()` and `d.BaseNonce()`
+report the first two), so a cached record gets the same checks as the
+envelope: a declared plaintext length is checked against `blobSize`
+(`ErrSizeMismatch`), even for a range that never reads the final chunk. A stale
+or corrupted record cannot serve wrong plaintext, since the AAD is bound into
+every chunk's GCM tag and the envelope length decides which bytes are read; it
+fails with `aesstream.ErrCorrupted` instead.
 
 ## Wire format
 

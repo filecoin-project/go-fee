@@ -1377,6 +1377,10 @@ func TestDecryptValidatesEveryRecipient(t *testing.T) {
 			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
 			r.Headers.RawProtected = nil
 		},
+		"null ciphertext, unknown algorithm": func(r *cose.Recipient) {
+			r.Headers.Unprotected.Set(cose.HeaderLabelAlg, int64(-65536))
+			r.Ciphertext = nil
+		},
 		"short ECDH-ES+A256KW wrapped key": func(r *cose.Recipient) {
 			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
 			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)

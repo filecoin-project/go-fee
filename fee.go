@@ -476,8 +476,6 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	// were built from.
 	descriptor := BodyDescriptor{
 		HeaderLen: int64(len(header)),
-		BaseNonce: baseNonce,
-		ChunkSize: cfg.chunkSize,
 		AAD:       aad,
 	}.clone()
 	return &encryptReader{header: header, body: body}, descriptor, nil
