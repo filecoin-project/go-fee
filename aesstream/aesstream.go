@@ -36,6 +36,12 @@
 // empty plaintext is encoded as a single empty final chunk (just the
 // 16-byte tag), so the ciphertext stream is never zero-length.
 //
+// Each plaintext length has exactly one encoding. A plaintext that is an
+// exact multiple of ChunkSize ends in a full final chunk, never in a full
+// chunk followed by an empty one; an empty final chunk is valid only as
+// the sole chunk of an empty plaintext, and decoders reject it anywhere
+// else (ErrCiphertextSize).
+//
 // The chunk index is a 4-byte counter, so a single stream holds at most
 // MaxChunks chunks (~1 PiB at the default chunk size); exceeding that is
 // an error rather than a silent counter wrap.
@@ -95,9 +101,10 @@ const (
 	MinChunkSize = 4 * 1024
 	MaxChunkSize = 16 * 1024 * 1024
 
-	// MaxChunks is the number of chunks a single stream may contain. The
-	// chunk index is a uint32, so valid indices run 0 .. MaxChunks-1.
-	MaxChunks = 1 << 32
+	// MaxChunks is the number of chunks a single stream may contain, per the
+	// FEE spec: 2^32 − 1, so the uint32 chunk index runs 0 .. MaxChunks-1 and
+	// never reaches its last value.
+	MaxChunks = 1<<32 - 1
 )
 
 // last-chunk flag values for the final nonce byte.

@@ -23,9 +23,11 @@ number of recipients — **ECDH-ES+A256KW** to an X25519 public key,
 **A256KW** under a pre-shared symmetric key, or managed entirely out of band —
 without re-encrypting the data.
 
-The wire format's source of truth is the TypeScript reference implementation,
-[`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo); this repo is
-pinned to it by [cross-implementation test vectors](./vectors/README.md).
+The wire format follows FIP-1253 with the amendments FilOz's TypeScript
+implementation, `@filoz/filecoin-encryption-envelope` in
+[`synapse-sdk`](https://github.com/FilOzone/synapse-sdk), adopts; this repo is
+pinned to that implementation by
+[cross-implementation test vectors](./vectors/README.md).
 
 ## Install
 
@@ -122,8 +124,8 @@ func main() {
 ### Multiple recipients, mixed algorithms
 
 The same CEK is wrapped to every recipient, so any one of them can recover the
-object. Wrap algorithms may be mixed in one envelope; on decrypt the recipient
-is selected by kid and the algorithm comes from its COSE header — the caller
+object. Wrap algorithms may be mixed in one envelope; on decrypt a recipient is
+found by its kid and the algorithm comes from its COSE header — the caller
 never chooses it.
 
 ```go
@@ -150,6 +152,34 @@ func decryptWithKEK(blob, kek []byte) ([]byte, error) {
     return io.ReadAll(r)
 }
 ```
+
+### Recipients without a kid
+
+A kid is optional. Pass `nil` and the recipient is written without one; a
+decryptor then finds it by trying its keys, since a wrong key fails the
+key-wrap integrity check. An unwrapper built with a `nil` kid is likewise tried
+against every recipient of its algorithm. To try several keys in one decrypt,
+combine them with `MultiUnwrapper`:
+
+```go
+func decryptWithAnyKEK(blob []byte, keks [][]byte) ([]byte, error) {
+    var keys []fee.RecipientUnwrapper
+    for _, kek := range keks {
+        keys = append(keys, fee.NewA256KWUnwrapper(nil, kek))
+    }
+    r, err := fee.Decrypt(bytes.NewReader(blob), fee.MultiUnwrapper(keys...))
+    if err != nil {
+        return nil, err
+    }
+    return io.ReadAll(r)
+}
+```
+
+A recipient with a kid is tried first with the keys that share it, then with
+the keys that have none, and never with a key whose kid differs. A recipient
+without a kid is tried with every key, in order. One decrypt attempts at most
+`MaxUnwrapAttempts` (64) unwraps, so pass a kid wherever a decryptor may hold
+more than one key.
 
 ### Streaming
 
@@ -179,10 +209,10 @@ func encryptFile(src, dst string, recipients []fee.Recipient) error {
         return err
     }
 
-    // WithContentLength is optional: it records the chunk count in the
-    // envelope (useful to range/seek consumers) and fails the stream if the
-    // plaintext turns out to be a different length.
-    r, _, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
+    // WithPlaintextLength is optional: it records the plaintext length in the
+    // envelope, so readers detect a truncated blob from its size, and fails
+    // the stream if the plaintext turns out to be a different length.
+    r, _, err := fee.Encrypt(in, recipients, fee.WithPlaintextLength(info.Size()))
     if err != nil {
         return err
     }
@@ -325,6 +355,10 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 > catastrophic. `fee.Encrypt` draws a fresh CEK every call; with
 > `EncryptWithCEK` this is the caller's obligation.
 
+A CEK must be 32 bytes and not all zeros. Every entry point that takes one
+rejects any other key with `fee.ErrInvalidCEK`, and so does decryption when a
+recipient unwraps to one.
+
 ### Range (seekable) decryption
 
 Because chunks are sealed independently, any plaintext byte range can be
@@ -392,10 +426,10 @@ directly.
 
 The envelope is a fixed prefix of every stored object, so a store that keeps its
 own metadata beside the blob can record what a range decrypt needs from it and
-skip the header read as well. `fee.Encrypt` reports those four values alongside
-the reader: envelope length, base nonce, chunk size, and the `Enc_structure` AAD.
-They are complete before any plaintext is read, so a writer can store them while
-the upload is still streaming:
+skip the header read as well. `fee.Encrypt` reports those two values alongside
+the reader: the envelope length and the `Enc_structure` AAD. They are complete
+before any plaintext is read, so a writer can store them while the upload is
+still streaming:
 
 ```go
 // d goes alongside the blob's location and size.
@@ -408,17 +442,56 @@ ciphertext chunks the range overlaps. `d.PlaintextSize(blobSize)` answers a
 `HEAD` or resolves a suffix range from the stored record alone, reading
 nothing.
 
-Every field is non-secret — all four are already in the clear at the front of the
+Both values are non-secret — they are already in the clear at the front of the
 blob — and the CEK is deliberately not among them. Store the AAD rather than the
-protected header it contains: the `Enc_structure`'s context string differs between
-a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the protected
-header alone would need a companion flag recording which form was written. A stale
-or corrupted record cannot serve wrong plaintext, since all four values are bound
-into every chunk's GCM tag or decide which bytes are read; it fails with
-`aesstream.ErrCorrupted` instead. The one check it gives up is `ErrSizeMismatch`:
-with no envelope to consult, nothing cross-checks `blobSize` against the declared
-chunk count, so a caller that stores the size should compare it with the store's
-own before trusting a range.
+protected header it contains: the `Enc_structure`'s context string differs
+between a `COSE_Encrypt` and a recipient-less `COSE_Encrypt0`, so caching the
+protected header alone would need a companion flag recording which form was
+written. The base nonce, chunk size and any declared plaintext length are read
+from the protected header in the AAD (`d.ChunkSize()` and `d.BaseNonce()`
+report the first two), so a cached record gets the same checks as the
+envelope: a declared plaintext length is checked against `blobSize`
+(`ErrSizeMismatch`), even for a range that never reads the final chunk. A stale
+or corrupted record cannot serve wrong plaintext, since the AAD is bound into
+every chunk's GCM tag and the envelope length decides which bytes are read; it
+fails with `aesstream.ErrCorrupted` instead.
+
+## Upgrading from v0.2
+
+**Envelopes written by v0.2 do not decrypt with this version.** The wire format
+now follows the Synapse SDK (see [Wire format](#wire-format)): a new `typ`,
+every body parameter protected, the chunk size at label `-1`, a plaintext
+length in place of the chunk count, and an empty protected header on A256KW
+recipients. Decrypt existing objects with v0.2 and re-encrypt them with this
+version.
+
+API changes:
+
+- `BodyDescriptor` holds only `HeaderLen` and `AAD`. The base nonce and chunk
+  size are read from the protected header in the AAD, through the new
+  `ChunkSize()` and `BaseNonce()` methods. A store that persists descriptors
+  keeps those two values.
+- `Decrypt` and `DecryptRange` find a recipient by trying keys (see
+  [Recipients without a kid](#recipients-without-a-kid)), so a `kid` is now
+  optional when encrypting and decrypting. New: `MultiUnwrapper`,
+  `MaxUnwrapAttempts` and `ErrUnwrapAttemptLimit`.
+- `ErrNoMatchingRecipient` now means no recipient could be unwrapped. When a
+  key was tried and failed it also wraps `aeskw.ErrIntegrity`, which a wrong
+  KEK used to return on its own. `ErrUnsupportedRecipientAlg` is removed: a key
+  is only tried against recipients of its own algorithm.
+- `WithContentLength` is renamed `WithPlaintextLength`, and
+  `ErrContentLengthMismatch` is renamed `ErrPlaintextLengthMismatch`. The option
+  records the plaintext length rather than a chunk count, and must be at most
+  `MaxPlaintextLength`. `ErrSizeMismatch` now compares the blob size with that
+  length, on every range path, cached descriptors included.
+- Every decode path limits the envelope to `MaxEnvelopeSize` (1 MiB), and
+  `Encrypt` refuses to write a larger one (`cose.ErrTooLarge`).
+- A failure to decode an envelope also matches `ErrMalformedEnvelope`. A
+  failure to read it from its source wraps the source's error instead.
+- An all-zero CEK is rejected (`ErrInvalidCEK`), whether supplied or
+  recovered by unwrapping.
+- `cose` adds `WithStrictEncoding`, `WithMaxSize` and `ParseEncStructure`.
+  `aesstream.MaxChunks` is 2^32 − 1.
 
 ## Wire format
 
@@ -428,9 +501,12 @@ self-delimiting CBOR; everything after it is the STREAM ciphertext.
 ```
 envelope    = 16([ protected, unprotected, null ])              # no recipients
             | 96([ protected, unprotected, null, recipients ])  # with recipients
-protected   = { 1: -65793, 16: "application/vnd.foc-envelope+cose" }
-unprotected = { 5: baseNonce(7B), -65790: chunkSize, -65791: chunkCount }
-recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
+protected   = { 1: -65793, 16: "application/vnd.filecoin-encryption+cose",
+                5: baseNonce(7B), -1: chunkSize,
+                ? -65789: plaintextLength, ? -65792: appMetadata }
+unprotected = { }
+recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
+            | [ { 1: -31 },   { ? 4: kid, -1: ephemeralKey }, wrappedKey ]  # ECDH-ES+A256KW
 ```
 
 - **Body cipher** — chunked AES-256-GCM-STREAM (private-use COSE algorithm
@@ -440,17 +516,40 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
   Vizár, as used by [age](https://age-encryption.org) and Google Tink) enforces
   chunk order and detects truncation and insertion.
 - **Body AAD** — the COSE `Enc_structure` over the protected header, identical
-  for every chunk, so the algorithm, envelope type and any protected metadata
-  are authenticated into the ciphertext.
-- **Chunking** — a producer writes `ceil(len / chunkSize)` chunks, minimum 1,
-  with the remainder in the final chunk; empty input is one empty chunk. A
-  decoder also accepts a stream that ends with an empty final chunk, so a
-  plaintext of exactly `k × chunkSize` bytes is a valid stream of either `k`
-  chunks or `k+1`. Only the ciphertext length distinguishes them
-  (`aesstream.ChunkCount`), which is why a declared count must never be checked
-  against a count re-derived from the plaintext length.
-- **Chunk count** (label −65791) — advisory metadata for range/seek consumers,
-  emitted only when the plaintext length is known; not required to decrypt.
+  for every chunk. Every FEE body parameter is protected, so the algorithm,
+  envelope type, base nonce, chunk size, plaintext length and application
+  metadata are all authenticated into the ciphertext. The body unprotected
+  header is empty, and an envelope that carries any FEE parameter there is
+  rejected as `ErrMalformedEnvelope`.
+- **Chunking** — a producer writes `max(1, ceil(len / chunkSize))` chunks, with
+  the remainder in the final chunk; empty input is one empty chunk. Each
+  plaintext length has exactly one encoding: a plaintext of exactly
+  `k × chunkSize` bytes ends in a full final chunk, and a stream that ends in an
+  empty chunk after full ones is rejected (`aesstream.ErrCiphertextSize`).
+- **Chunk size** (label −1) — required. FIP-1253 places it in COSE's
+  algorithm-scoped label range (RFC 9052 §3.1).
+- **Plaintext length** (label −65789) — emitted only when the length is known
+  before encryption, and not required to decrypt. Because each length has one
+  encoding, a reader checks it exactly against the blob size and detects any
+  truncation, including one inside the final chunk, even when a range never
+  reads that chunk (`ErrSizeMismatch`).
+- **Application metadata** (label −65792) — accepted and ignored; this package
+  does not write it.
+- **A256KW recipients** (alg −5) — the protected header is empty (`h''`) and
+  `alg` is unprotected, as RFC 9053 §6.2.1 requires. For both recipient
+  algorithms the wrapped CEK is exactly 40 bytes.
+- **Envelope processing** — every CBOR item, including the serialized protected
+  headers, must use definite lengths and shortest-form arguments, and may
+  contain no floats, no tags besides the envelope's own, and no simple values
+  other than `false`, `true` and `null` (`cose.WithStrictEncoding`). Duplicate
+  labels are rejected, as is any integer outside ±(2^53 − 1), which the Synapse
+  SDK cannot represent. `crit` must be protected and may name only parameters
+  this package processes that are present in the same protected header, never
+  `crit` itself. A Partial IV in either content bucket is rejected, as is any
+  label in both the protected and unprotected header, for the body and for
+  each recipient. Every recipient is checked when the envelope is read,
+  whether or not it is used. Unknown non-critical parameters are ignored. See
+  [Security notes](#security-notes) for the parser's size limits.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
@@ -472,19 +571,29 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 - **CEK uniqueness.** `Encrypt` generates a fresh CEK per envelope. With
   `EncryptWithCEK`, reusing a CEK across envelopes erodes the 7-byte base
   nonce's birthday bound (see above).
-- **Recipient matching is exact.** `Decrypt` selects the recipient whose kid
-  byte-for-byte equals the unwrapper's key id; no unwrap is attempted
-  otherwise.
+- **Recipient matching.** A key is tried only against recipients of its own
+  algorithm whose kid, in either header bucket, byte-for-byte equals its own,
+  or where the key or the recipient has no kid. A wrong key fails the AES key
+  wrap integrity check, so trying one is safe, and one decrypt tries at most
+  `MaxUnwrapAttempts` keys. The recipient array is not authenticated by the
+  body, so anyone can add recipients; this bounds the work they can cause.
+- **Parser limits.** The envelope is parsed before anything is authenticated,
+  so every decrypt path limits it: at most `MaxEnvelopeSize` (1 MiB, as in the
+  Synapse SDK) is read looking for its end, nesting is limited to 256 levels,
+  and an array or map may hold at most 131,072 entries. A larger envelope fails
+  with `cose.ErrTooLarge`, and `Encrypt` refuses to write one.
 - **Envelope type pinning.** Encrypt writes, and Decrypt requires, the COSE
-  `typ` `application/vnd.foc-envelope+cose`, so non-FEE blobs are rejected
+  `typ` `application/vnd.filecoin-encryption+cose`, so non-FEE blobs are rejected
   before any key material is touched.
 
 ## Specifications and related work
 
 - [FIP discussion #1253 — Filecoin Encryption Envelope](https://github.com/filecoin-project/FIPs/discussions/1253)
-- [`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo) — TypeScript
-  reference implementation (wire-format source of truth); see
+- [`@filoz/filecoin-encryption-envelope`](https://github.com/FilOzone/synapse-sdk/tree/master/packages/filecoin-encryption-envelope)
+  — TypeScript implementation and its implementation guide; see
   [`vectors/`](./vectors/README.md) for the cross-implementation fixtures
+- [`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo) — the
+  original TypeScript demo of the envelope
 - [RFC 9052](https://www.rfc-editor.org/rfc/rfc9052) COSE structure,
   [RFC 9053](https://www.rfc-editor.org/rfc/rfc9053) COSE algorithms,
   [RFC 9596](https://www.rfc-editor.org/rfc/rfc9596) COSE `typ` header,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"errors"
 	"io"
 	"strconv"
 	"testing"
@@ -18,14 +19,15 @@ import (
 )
 
 // FEE wire constants mirrored for white-box assertions. They MUST match the
-// unexported values in fee.go (and the foc-encryption reference): the body
-// algorithm and the private-use unprotected header labels carrying the STREAM
-// geometry. Tests read them straight off a produced envelope with the cose
+// unexported values in fee.go (and FIP-1253): the body algorithm and the
+// protected header labels carrying the STREAM geometry and application
+// metadata. Tests read them straight off a produced envelope with the cose
 // package, so a drift in either place surfaces here.
 const (
-	algChunkedStream = int64(-65793)
-	labelChunkSize   = int64(-65790)
-	labelChunkCount  = int64(-65791)
+	algChunkedStream     = int64(-65793)
+	labelChunkSize       = int64(-1)
+	labelPlaintextLength = int64(-65789)
+	labelAppMetadata     = int64(-65792)
 )
 
 // COSE_Key parameter labels/values for the X25519 ephemeral key (RFC 9053 §7.1),
@@ -191,8 +193,8 @@ func encryptAndRecoverCEK(t *testing.T, key *ecdh.PrivateKey, plaintext []byte) 
 	require.NoError(t, err)
 
 	var ok bool
-	baseNonce, ok = env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
-	require.True(t, ok, "base nonce present in the unprotected header")
+	baseNonce, ok = env.Headers.Protected.Bytes(cose.HeaderLabelIV)
+	require.True(t, ok, "base nonce present in the protected header")
 
 	require.Len(t, env.Recipients, 1)
 	rcpt := env.Recipients[0]
@@ -410,7 +412,8 @@ func TestEncryptReaderCloseReleases(t *testing.T) {
 
 // TestDecryptKidMismatch covers the explicit acceptance criterion: an unwrapper
 // whose key id matches no recipient yields ErrNoMatchingRecipient rather than a
-// panic or a silent failure. It checks both recipient kinds.
+// panic or a silent failure, without trying the key. It checks both recipient
+// kinds.
 func TestDecryptKidMismatch(t *testing.T) {
 	plaintext := patternBytes(5000)
 
@@ -435,15 +438,18 @@ func TestDecryptKidMismatch(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		// The KEK is right, but a key with a different kid is never tried.
 		r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper([]byte("kid-b"), kek))
 		require.Nil(t, r)
 		require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+		require.NotErrorIs(t, err, aeskw.ErrIntegrity)
 	})
 }
 
 // TestDecryptWrongECDHKey confirms that when the kid matches but the private key
-// is wrong, the ECDH-ES unwrap fails with the AES-KW integrity error and no
-// plaintext reader is produced — decryption is never reached.
+// is wrong, the ECDH-ES unwrap fails the AES-KW integrity check, so no
+// recipient can be unwrapped, and no plaintext reader is produced — decryption
+// is never reached.
 func TestDecryptWrongECDHKey(t *testing.T) {
 	key := newX25519Key(t)
 	blob, err := encrypt(t, patternBytes(9000),
@@ -457,13 +463,14 @@ func TestDecryptWrongECDHKey(t *testing.T) {
 	wrong := newX25519Key(t)
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewECDHESUnwrapper(ecdhKID, wrong))
 	require.Nil(t, r)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity)
 	require.NotErrorIs(t, err, aesstream.ErrCorrupted, "STREAM decryption must not be attempted")
 }
 
 // TestDecryptWrongA256KWKEK confirms that when the kid matches but the KEK is
-// wrong, the unwrap fails with the AES-KW integrity error and no plaintext
-// reader is produced — decryption is never reached.
+// wrong, the unwrap fails the AES-KW integrity check, so no recipient can be
+// unwrapped, and no plaintext reader is produced — decryption is never reached.
 func TestDecryptWrongA256KWKEK(t *testing.T) {
 	blob, err := encrypt(t, patternBytes(9000),
 		[]fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))},
@@ -473,14 +480,14 @@ func TestDecryptWrongA256KWKEK(t *testing.T) {
 
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
 	require.Nil(t, r)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity)
 	require.NotErrorIs(t, err, aesstream.ErrCorrupted, "STREAM decryption must not be attempted")
 }
 
-// TestDecryptAlgMismatch confirms the unwrapper rejects a matched recipient whose
-// key-wrap algorithm is not the one it handles. An A256KW unwrapper is pointed at
-// an ECDH-ES recipient by reusing its kid, so the entry matches by kid but
-// carries ECDH-ES+A256KW, not A256KW.
+// TestDecryptAlgMismatch confirms a key is never tried against a recipient of
+// another key-wrap algorithm. An A256KW unwrapper is pointed at an ECDH-ES
+// recipient by reusing its kid, so the kids match but the algorithms do not.
 func TestDecryptAlgMismatch(t *testing.T) {
 	key := newX25519Key(t)
 	blob, err := encrypt(t, patternBytes(5000),
@@ -492,7 +499,8 @@ func TestDecryptAlgMismatch(t *testing.T) {
 	// Same kid as the ECDH-ES entry, but an A256KW unwrapper.
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper(ecdhKID, newKEK(t)))
 	require.Nil(t, r)
-	require.ErrorIs(t, err, fee.ErrUnsupportedRecipientAlg)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+	require.NotErrorIs(t, err, aeskw.ErrIntegrity)
 }
 
 // TestDecryptCorruptedProtectedHeader confirms that flipping a byte in the
@@ -609,11 +617,11 @@ func TestDecryptNilArgs(t *testing.T) {
 }
 
 // TestEnvelopeWireConventions decodes a produced envelope with the cose package
-// directly and asserts the FEE wire conventions matching the foc-encryption
-// reference: the protected header pins the envelope type and the STREAM body
-// algorithm; the unprotected header carries the base nonce in the iv and the
-// chunk size in the private-use label; and the recipient entry carries the
-// expected algorithm, kid and a self-describing COSE_Key ephemeral key.
+// directly and asserts the FEE wire conventions of FIP-1253: the protected
+// header carries the envelope type, the STREAM body algorithm, the base nonce
+// in the iv and the chunk size at label -1; the unprotected header is empty;
+// and the recipient entry carries the expected algorithm, kid and a
+// self-describing COSE_Key ephemeral key.
 func TestEnvelopeWireConventions(t *testing.T) {
 	key := newX25519Key(t)
 	const chunk = aesstream.MinChunkSize
@@ -627,23 +635,24 @@ func TestEnvelopeWireConventions(t *testing.T) {
 	env, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 	require.NoError(t, err)
 
-	// Protected header: typ and body algorithm are authenticated via the AAD.
+	// Protected header: every FEE parameter is authenticated via the AAD.
 	typ, ok := env.Headers.Protected.Text(cose.HeaderLabelType)
 	require.True(t, ok)
-	require.Equal(t, fee.EnvelopeType, typ)
+	require.Equal(t, "application/vnd.filecoin-encryption+cose", typ)
 
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	require.True(t, ok)
 	require.Equal(t, algChunkedStream, alg, "chunked AES-256-GCM-STREAM private-use alg")
 
-	// Unprotected header: base nonce (iv) and chunk size in the private-use label.
-	iv, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
-	require.True(t, ok)
+	cs, ok := env.Headers.Protected.Int(labelChunkSize)
+	require.True(t, ok, "chunk size recorded at protected label -1")
+	require.Equal(t, int64(chunk), cs)
+
+	iv, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
+	require.True(t, ok, "base nonce recorded in the protected iv")
 	require.Len(t, iv, aesstream.BaseNonceSize)
 
-	cs, ok := env.Headers.Unprotected.Int(labelChunkSize)
-	require.True(t, ok, "chunk size recorded in the unprotected private-use label")
-	require.Equal(t, int64(chunk), cs)
+	require.Empty(t, env.Headers.Unprotected, "the body unprotected header is empty")
 
 	// Recipient: algorithm, kid, and a self-describing COSE_Key ephemeral key.
 	require.Len(t, env.Recipients, 1)
@@ -690,31 +699,31 @@ func TestECDHRecipientProtectedBytes(t *testing.T) {
 	require.Equal(t, []byte{0xa1, 0x01, 0x38, 0x1e}, got, "recipient protected header")
 }
 
-// TestContentLengthChunkCount confirms the chunk count is written to the
-// unprotected header only when the plaintext length is declared, matching the
-// reference's advisory chunkCount, and that the envelope decrypts either way.
-func TestContentLengthChunkCount(t *testing.T) {
+// TestPlaintextLengthWritten confirms the plaintext length is written to
+// the protected header only when it is declared, and that the envelope
+// decrypts either way.
+func TestPlaintextLengthWritten(t *testing.T) {
 	key := newX25519Key(t)
 	const chunk = aesstream.MinChunkSize
 	plaintext := patternBytes(3*chunk + 10) // 4 chunks
 
-	t.Run("present and correct when content length declared", func(t *testing.T) {
+	t.Run("present and correct when the length is declared", func(t *testing.T) {
 		blob, err := encrypt(t, plaintext,
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
-			fee.WithChunkSize(chunk), fee.WithContentLength(int64(len(plaintext))),
+			fee.WithChunkSize(chunk), fee.WithPlaintextLength(int64(len(plaintext))),
 		)
 		require.NoError(t, err)
 
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		cc, ok := env.Headers.Unprotected.Int(labelChunkCount)
-		require.True(t, ok, "chunk count present when content length declared")
-		require.Equal(t, int64(4), cc)
+		n, ok := env.Headers.Protected.Int(labelPlaintextLength)
+		require.True(t, ok, "plaintext length present when declared")
+		require.Equal(t, int64(len(plaintext)), n)
 
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewECDHESUnwrapper(ecdhKID, key)))
 	})
 
-	t.Run("omitted when content length unknown", func(t *testing.T) {
+	t.Run("omitted when the length is unknown", func(t *testing.T) {
 		blob, err := encrypt(t, plaintext,
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 			fee.WithChunkSize(chunk),
@@ -723,17 +732,18 @@ func TestContentLengthChunkCount(t *testing.T) {
 
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		require.False(t, env.Headers.Unprotected.Has(labelChunkCount),
-			"chunk count omitted when content length unknown")
+		require.False(t, env.Headers.Protected.Has(labelPlaintextLength),
+			"plaintext length omitted when unknown")
 
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewECDHESUnwrapper(ecdhKID, key)))
 	})
 }
 
-// TestContentLengthMismatch confirms that when the declared content length does
+// TestPlaintextLengthMismatch confirms that when the declared plaintext length does
 // not match the plaintext actually streamed, the returned reader surfaces
-// ErrContentLengthMismatch (the already-written chunk count cannot be trusted).
-func TestContentLengthMismatch(t *testing.T) {
+// ErrPlaintextLengthMismatch (the already-written plaintext length cannot be
+// trusted).
+func TestPlaintextLengthMismatch(t *testing.T) {
 	key := newX25519Key(t)
 	// Multiple chunks, so some full chunks are emitted before the final chunk is
 	// withheld on the mismatch.
@@ -742,14 +752,14 @@ func TestContentLengthMismatch(t *testing.T) {
 	enc, _, err := fee.Encrypt(bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize),
-		fee.WithContentLength(int64(len(plaintext)+1)), // declare one byte too many
+		fee.WithPlaintextLength(int64(len(plaintext)+1)), // declare one byte too many
 	)
 	require.NoError(t, err)
 	defer enc.Close()
 
 	// The mismatch surfaces as a non-EOF error from the reader...
 	blob, err := io.ReadAll(enc)
-	require.ErrorIs(t, err, fee.ErrContentLengthMismatch)
+	require.ErrorIs(t, err, fee.ErrPlaintextLengthMismatch)
 
 	// ...and because the final chunk was withheld, the bytes produced so far do
 	// not decrypt cleanly: a caller that ignored the error and stored the blob
@@ -810,20 +820,9 @@ func TestDecryptStreamsIncrementally(t *testing.T) {
 // TestEncryptInvalidRecipient confirms a malformed recipient is rejected up
 // front (before the plaintext is sealed), not deep inside the wrap step.
 func TestEncryptInvalidRecipient(t *testing.T) {
-	key := newX25519Key(t)
 	t.Run("ECDH-ES nil public key", func(t *testing.T) {
 		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, nil)})
-		require.Error(t, err)
-	})
-	t.Run("ECDH-ES empty kid", func(t *testing.T) {
-		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
-			[]fee.Recipient{fee.NewECDHESRecipient(nil, key.PublicKey())})
-		require.Error(t, err)
-	})
-	t.Run("A256KW empty kid", func(t *testing.T) {
-		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
-			[]fee.Recipient{fee.NewA256KWRecipient(nil, newKEK(t))})
 		require.Error(t, err)
 	})
 	t.Run("A256KW wrong KEK length", func(t *testing.T) {
@@ -844,20 +843,21 @@ func TestDecryptMalformedChunkSizeHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	// Hand-build an envelope whose chunk-size header (FEE private-use label, in
-	// the unprotected header) is present but holds a string instead of an integer.
+	// the protected header) is present but holds a string instead of an integer.
 	env := &cose.Envelope{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.
 				Set(cose.HeaderLabelAlg, algChunkedStream).
-				Set(cose.HeaderLabelType, fee.EnvelopeType),
-			Unprotected: cose.Header{}.
+				Set(cose.HeaderLabelType, fee.EnvelopeType).
 				Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)).
 				Set(labelChunkSize, "not-an-integer"),
+			Unprotected: cose.Header{},
 		},
 		Recipients: []*cose.Recipient{{
 			Headers: cose.Headers{
-				Protected:   cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW),
-				Unprotected: cose.Header{}.Set(cose.HeaderLabelKID, a256kwKID),
+				Unprotected: cose.Header{}.
+					Set(cose.HeaderLabelAlg, cose.AlgA256KW).
+					Set(cose.HeaderLabelKID, a256kwKID),
 			},
 			Ciphertext: wrappedCEK,
 		}},
@@ -897,10 +897,10 @@ func TestDecryptMalformedEphemeralKey(t *testing.T) {
 				Headers: cose.Headers{
 					Protected: cose.Header{}.
 						Set(cose.HeaderLabelAlg, algChunkedStream).
-						Set(cose.HeaderLabelType, fee.EnvelopeType),
-					Unprotected: cose.Header{}.
+						Set(cose.HeaderLabelType, fee.EnvelopeType).
 						Set(cose.HeaderLabelIV, make([]byte, aesstream.BaseNonceSize)).
 						Set(labelChunkSize, int64(aesstream.MinChunkSize)),
+					Unprotected: cose.Header{},
 				},
 				Recipients: []*cose.Recipient{{
 					Headers: cose.Headers{
@@ -928,4 +928,936 @@ func name(n int) string {
 		return "empty"
 	}
 	return "n=" + strconv.Itoa(n)
+}
+
+// TestA256KWRecipientWire pins the A256KW recipient layout RFC 9053 §6.2.1
+// requires: an empty protected header, encoded as a zero-length byte string,
+// with the algorithm in the unprotected header beside the kid.
+func TestA256KWRecipientWire(t *testing.T) {
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+
+	env, _, err := cose.Decode(blob)
+	require.NoError(t, err)
+	require.Len(t, env.Recipients, 1)
+	rcpt := env.Recipients[0]
+
+	prot, err := rcpt.Headers.ProtectedBytes()
+	require.NoError(t, err)
+	require.Empty(t, prot, "protected header is a zero-length byte string")
+	alg, ok := rcpt.Headers.Unprotected.Int(cose.HeaderLabelAlg)
+	require.True(t, ok)
+	require.Equal(t, cose.AlgA256KW, alg)
+
+	require.Equal(t, patternBytes(100), decryptAll(t, blob, fee.NewA256KWUnwrapper(a256kwKID, kek)))
+}
+
+// TestA256KWRecipientProtectedAlgRejected: an A256KW recipient whose algorithm
+// sits in a non-empty protected header breaks RFC 9053 §6.2.1 and is rejected
+// as malformed rather than unwrapped.
+func TestA256KWRecipientProtectedAlgRejected(t *testing.T) {
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	rcpt := env.Recipients[0]
+	rcpt.Headers.Unprotected = cose.Header{}.Set(cose.HeaderLabelKID, a256kwKID)
+	rcpt.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW)
+	rcpt.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	r, err := fee.Decrypt(bytes.NewReader(append(header, ciphertext...)), fee.NewA256KWUnwrapper(a256kwKID, kek))
+	require.Nil(t, r)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+}
+
+// sealEnvelope seals plaintext under cek behind a hand-built body header, with
+// the envelope's own Enc_structure as AAD, so a test can exercise a header the
+// encoder never writes.
+func sealEnvelope(t *testing.T, protected cose.Header, plaintext, cek []byte) []byte {
+	t.Helper()
+	env := &cose.Envelope{Headers: cose.Headers{Protected: protected, Unprotected: cose.Header{}}}
+	aad, err := env.EncStructure(nil)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	baseNonce, ok := protected.Bytes(cose.HeaderLabelIV)
+	require.True(t, ok)
+	chunkSize, ok := protected.Int(labelChunkSize)
+	require.True(t, ok)
+	body, err := aesstream.Seal(aesstream.Config{Key: cek, BaseNonce: baseNonce, AAD: aad, ChunkSize: int(chunkSize)}, plaintext)
+	require.NoError(t, err)
+	return append(header, body...)
+}
+
+// bodyHeader is a valid FEE body protected header for a test to adjust.
+func bodyHeader() cose.Header {
+	return cose.Header{}.
+		Set(cose.HeaderLabelAlg, algChunkedStream).
+		Set(cose.HeaderLabelType, fee.EnvelopeType).
+		Set(cose.HeaderLabelIV, bytes.Repeat([]byte{0x5a}, aesstream.BaseNonceSize)).
+		Set(labelChunkSize, int64(aesstream.MinChunkSize))
+}
+
+// TestDecryptIgnoresProtectedAppMetadata: application metadata in the
+// protected header is authenticated with the rest of it and otherwise ignored.
+func TestDecryptIgnoresProtectedAppMetadata(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(3*aesstream.MinChunkSize+7)
+	blob := sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[string]any{"cid": []byte{0x01, 0x55}}), plaintext, cek)
+
+	r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+}
+
+// TestDecryptRequiresChunkSize: the chunk size is required, so an envelope
+// without one is malformed rather than read at a default size.
+func TestDecryptRequiresChunkSize(t *testing.T) {
+	cek := newCEK(t)
+	h := bodyHeader()
+	blob := sealEnvelope(t, h, patternBytes(100), cek)
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	delete(env.Headers.Protected, labelChunkSize)
+	env.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	_, err = fee.DecryptWithCEK(bytes.NewReader(append(header, ciphertext...)), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+}
+
+// TestDecryptDeclaredLengthMismatch: an envelope whose authenticated plaintext
+// length disagrees with its ciphertext (only a faulty encoder can produce one)
+// is refused the same way by the whole-object and range paths.
+func TestDecryptDeclaredLengthMismatch(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(2*aesstream.MinChunkSize+7)
+	blob := sealEnvelope(t, bodyHeader().Set(labelPlaintextLength, int64(len(plaintext)+1)), plaintext, cek)
+
+	r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.NoError(t, err)
+	_, err = io.ReadAll(r)
+	require.ErrorIs(t, err, fee.ErrSizeMismatch)
+
+	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+	require.ErrorIs(t, err, fee.ErrSizeMismatch)
+}
+
+// TestDecryptCrit: crit must be protected, must be a non-empty array, and may
+// name only body parameters this package processes.
+func TestDecryptCrit(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(aesstream.MinChunkSize+9)
+
+	t.Run("naming understood parameters decrypts", func(t *testing.T) {
+		blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelCrit, []any{labelChunkSize, cose.HeaderLabelIV}), plaintext, cek)
+		r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+		require.NoError(t, err)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+		require.Equal(t, plaintext, got)
+	})
+
+	for name, protected := range map[string]cose.Header{
+		"naming an unknown parameter": bodyHeader().Set(cose.HeaderLabelCrit, []any{int64(-70000)}),
+		"naming a text label":         bodyHeader().Set(cose.HeaderLabelCrit, []any{"x"}),
+		"naming crit itself":          bodyHeader().Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelCrit}),
+		"naming an absent parameter":  bodyHeader().Set(cose.HeaderLabelCrit, []any{labelPlaintextLength}),
+		"empty":                       bodyHeader().Set(cose.HeaderLabelCrit, []any{}),
+		"not an array":                bodyHeader().Set(cose.HeaderLabelCrit, int64(5)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, protected, plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+
+	t.Run("unprotected", func(t *testing.T) {
+		blob := sealEnvelope(t, bodyHeader(), plaintext, cek)
+		moved := withUnprotected(t, blob, cose.HeaderLabelCrit, []any{labelChunkSize})
+		_, err := fee.DecryptWithCEK(bytes.NewReader(moved), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+	})
+}
+
+// TestDecryptRejectsPartialIV: the nonce comes from the iv alone, so a Partial
+// IV in either bucket is refused rather than ignored.
+func TestDecryptRejectsPartialIV(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+
+	blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelPartialIV, []byte{1}), plaintext, cek)
+	_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "protected")
+
+	moved := withUnprotected(t, sealEnvelope(t, bodyHeader(), plaintext, cek), cose.HeaderLabelPartialIV, []byte{1})
+	_, err = fee.DecryptWithCEK(bytes.NewReader(moved), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "unprotected")
+}
+
+// TestDecryptRequiresStrictEncoding: envelopes are decoded under the strict
+// CBOR profile, so a float anywhere, even in an otherwise ignored unprotected
+// parameter, is refused.
+func TestDecryptRequiresStrictEncoding(t *testing.T) {
+	cek := newCEK(t)
+	blob := withUnprotected(t, sealEnvelope(t, bodyHeader(), patternBytes(100), cek), int64(99), 1.5)
+
+	_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, cose.ErrMalformed)
+	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+	require.ErrorIs(t, err, cose.ErrMalformed)
+}
+
+// TestRecipientCrit: a recipient's crit is processed before its unwrap, and
+// naming a parameter the unwrapper does not understand is malformed.
+func TestRecipientCrit(t *testing.T) {
+	key := newX25519Key(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+
+	for name, mutate := range map[string]func(*cose.Recipient){
+		"naming an unknown parameter": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{int64(-70000)})
+			r.Headers.RawProtected = nil
+		},
+		"unprotected": func(r *cose.Recipient) {
+			r.Headers.Unprotected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelKID})
+		},
+		"naming the ephemeral key": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelEphemeralKey})
+			r.Headers.RawProtected = nil
+		},
+		"naming a kid the protected header does not carry": func(r *cose.Recipient) {
+			r.Headers.Protected.Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelKID})
+			r.Headers.RawProtected = nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, ciphertext, err := cose.Decode(blob)
+			require.NoError(t, err)
+			mutate(env.Recipients[0])
+			header, err := env.Encode()
+			require.NoError(t, err)
+
+			_, err = fee.Decrypt(bytes.NewReader(append(header, ciphertext...)), fee.NewECDHESUnwrapper(ecdhKID, key))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// withUnprotected re-encodes blob with label set to value in its body
+// unprotected header, leaving the protected header and ciphertext alone.
+func withUnprotected(t *testing.T, blob []byte, label, value any) []byte {
+	t.Helper()
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Headers.Unprotected.Set(label, value)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	return append(header, ciphertext...)
+}
+
+// TestDecryptReaderCloses: the plaintext reader closes whether or not the
+// envelope declares a plaintext length, so a caller abandoning a partial read
+// still returns its chunk buffers.
+func TestDecryptReaderCloses(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(3*aesstream.MinChunkSize)
+	for name, opts := range map[string][]fee.EncryptOption{
+		"declared length": {fee.WithChunkSize(aesstream.MinChunkSize), fee.WithPlaintextLength(int64(len(plaintext)))},
+		"no length":       {fee.WithChunkSize(aesstream.MinChunkSize)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil, opts...)
+			require.NoError(t, err)
+			blob, err := io.ReadAll(rc)
+			require.NoError(t, err)
+			require.NoError(t, rc.Close())
+
+			r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.NoError(t, err)
+			_, err = io.ReadFull(r, make([]byte, 10))
+			require.NoError(t, err)
+
+			c, ok := r.(io.Closer)
+			require.True(t, ok, "the plaintext reader implements io.Closer")
+			require.NoError(t, c.Close())
+			_, err = r.Read(make([]byte, 10))
+			require.Error(t, err, "reads after Close fail")
+		})
+	}
+}
+
+// TestECDHESRecipientUnprotectedAlgRejected: an ECDH-ES recipient's protected
+// header feeds its key derivation and is fixed at {1: -31}, so one whose alg
+// is unprotected is malformed rather than unwrapped.
+func TestECDHESRecipientUnprotectedAlgRejected(t *testing.T) {
+	key := newX25519Key(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	r := env.Recipients[0]
+	r.Headers.Unprotected.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+	r.Headers.Protected = cose.Header{}
+	r.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	_, err = fee.Decrypt(bytes.NewReader(append(header, ciphertext...)), fee.NewECDHESUnwrapper(ecdhKID, key))
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+}
+
+// TestDecryptRejectsMalformedAppMetadata: app_metadata must be a map with
+// text-string keys.
+func TestDecryptRejectsMalformedAppMetadata(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	for name, value := range map[string]any{
+		"not a map":   int64(7),
+		"integer key": map[any]any{"ok": "x", int64(1): "y"},
+		"boolean key": map[any]any{"ok": "x", true: "y"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(labelAppMetadata, value), plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// TestDecryptContentType: content_type must be a text string or a
+// non-negative integer, and an envelope may mark a present one critical.
+func TestDecryptContentType(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+
+	for name, protected := range map[string]cose.Header{
+		"text":                  bodyHeader().Set(cose.HeaderLabelContentType, "application/pdf"),
+		"integer":               bodyHeader().Set(cose.HeaderLabelContentType, int64(50)),
+		"text, marked critical": bodyHeader().Set(cose.HeaderLabelContentType, "text/plain").Set(cose.HeaderLabelCrit, []any{cose.HeaderLabelContentType}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, err := fee.DecryptWithCEK(bytes.NewReader(sealEnvelope(t, protected, plaintext, cek)), cek)
+			require.NoError(t, err)
+			got, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, got)
+		})
+	}
+
+	for name, value := range map[string]any{
+		"negative integer": int64(-1),
+		"byte string":      []byte("text/plain"),
+		"boolean":          true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(cose.HeaderLabelContentType, value), plaintext, cek)
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// TestBaseNonceLength: an iv that is not a 7-byte base nonce is malformed on
+// every path, including the header-only PlaintextSize, which builds no cipher.
+func TestBaseNonceLength(t *testing.T) {
+	cek := newCEK(t)
+	for _, n := range []int{aesstream.BaseNonceSize - 1, aesstream.BaseNonceSize + 1} {
+		env := &cose.Envelope{Headers: cose.Headers{
+			Protected:   bodyHeader().Set(cose.HeaderLabelIV, bytes.Repeat([]byte{0x5a}, n)),
+			Unprotected: cose.Header{},
+		}}
+		header, err := env.Encode()
+		require.NoError(t, err)
+		blob := append(header, make([]byte, 100+aesstream.TagSize)...)
+
+		_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %d-byte iv", n)
+		_, err = fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %d-byte iv", n)
+	}
+}
+
+// TestAllZeroCEKRejected: an all-zero CEK is refused wherever one enters,
+// including when a recipient unwraps to one.
+func TestAllZeroCEKRejected(t *testing.T) {
+	zeroCEK := make([]byte, aesstream.KeySize)
+
+	_, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), zeroCEK, nil)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "EncryptWithCEK")
+
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(100), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(blob), zeroCEK)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptWithCEK")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), zeroCEK, 0, 9, nil)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptRangeWithCEK")
+
+	// A recipient whose wrapped key unwraps to all zeros.
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Recipients[0].Ciphertext, err = aeskw.Wrap(kek, zeroCEK)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	forged := append(header, ciphertext...)
+
+	_, err = fee.Decrypt(bytes.NewReader(forged), fee.NewA256KWUnwrapper(a256kwKID, kek))
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "Decrypt")
+	_, err = fee.DecryptRange(bytes.NewReader(forged), int64(len(forged)), fee.NewA256KWUnwrapper(a256kwKID, kek), 0, 9)
+	require.ErrorIs(t, err, fee.ErrInvalidCEK, "DecryptRange")
+}
+
+// TestAppMetadataNesting: application metadata may nest up to 256 levels
+// deep, the TypeScript implementation's limit, and no deeper.
+func TestAppMetadataNesting(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	nested := func(depth int) any {
+		var v any = int64(1)
+		for range depth {
+			v = []any{v}
+		}
+		return v
+	}
+
+	blob := sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[any]any{"x": nested(200)}), plaintext, cek)
+	r, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.NoError(t, err, "200 levels decode")
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+
+	blob = sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[any]any{"x": nested(300)}), plaintext, cek)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+	require.ErrorIs(t, err, cose.ErrMalformed, "300 levels are refused")
+}
+
+// TestDecryptRejectsBodyLabelOverlap: no label may appear in both the body's
+// protected and unprotected headers, including ones FEE does not define.
+func TestDecryptRejectsBodyLabelOverlap(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	for name, label := range map[string]any{
+		"content_type":  cose.HeaderLabelContentType,
+		"unknown label": int64(99),
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(label, "x"), plaintext, cek)
+			blob = withUnprotected(t, blob, label, "y")
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// TestDecryptValidatesEveryRecipient: a malformed recipient fails the whole
+// envelope on every path, even when the recipient the caller uses is sound and
+// even when no recipient is used at all.
+func TestDecryptValidatesEveryRecipient(t *testing.T) {
+	kek1, kek2 := newKEK(t), newKEK(t)
+	ephX := newX25519Key(t).PublicKey().Bytes()
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{
+		fee.NewA256KWRecipient([]byte("kek-1"), kek1),
+		fee.NewA256KWRecipient([]byte("kek-2"), kek2),
+	})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	for name, mutate := range map[string]func(*cose.Recipient){
+		"short A256KW wrapped key": func(r *cose.Recipient) { r.Ciphertext = r.Ciphertext[:39] },
+		"no algorithm":             func(r *cose.Recipient) { delete(r.Headers.Unprotected, cose.HeaderLabelAlg) },
+		"kid not a byte string":    func(r *cose.Recipient) { r.Headers.Unprotected.Set(cose.HeaderLabelKID, "kek-2") },
+		"ECDH-ES recipient without an ephemeral key": func(r *cose.Recipient) {
+			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+			r.Headers.RawProtected = nil
+		},
+		"null ciphertext, unknown algorithm": func(r *cose.Recipient) {
+			r.Headers.Unprotected.Set(cose.HeaderLabelAlg, int64(-65536))
+			r.Ciphertext = nil
+		},
+		"short ECDH-ES+A256KW wrapped key": func(r *cose.Recipient) {
+			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+			r.Headers.RawProtected = nil
+			r.Headers.Unprotected.Set(cose.HeaderLabelEphemeralKey, map[any]any{
+				coseKeyKty: coseKtyOKP, coseKeyCrv: coseCrvX25519, coseKeyX: ephX,
+			})
+			r.Ciphertext = r.Ciphertext[:39]
+		},
+		"kid in both buckets": func(r *cose.Recipient) {
+			// A256KW must keep its protected header empty, so this second
+			// recipient becomes an unknown algorithm to carry a protected kid.
+			r.Headers.Unprotected.Set(cose.HeaderLabelAlg, int64(-65536))
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelKID, []byte("kek-2"))
+			r.Headers.RawProtected = nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, ciphertext, err := cose.Decode(blob)
+			require.NoError(t, err)
+			mutate(env.Recipients[1])
+			header, err := env.Encode()
+			require.NoError(t, err)
+			bad := append(header, ciphertext...)
+
+			_, err = fee.Decrypt(bytes.NewReader(bad), fee.NewA256KWUnwrapper([]byte("kek-1"), kek1))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt with the sound recipient")
+			_, err = fee.DecryptWithCEK(bytes.NewReader(bad), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+			_, err = fee.PlaintextSize(bytes.NewReader(bad), int64(len(bad)))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize")
+		})
+	}
+}
+
+// TestDecryptMatchesProtectedKID: a recipient's kid is read from the protected
+// header as well as the unprotected one. The ECDH-ES recipient here was wrapped
+// with its kid protected, since the protected header feeds the key derivation.
+func TestDecryptMatchesProtectedKID(t *testing.T) {
+	key := newX25519Key(t)
+	cek, plaintext := newCEK(t), patternBytes(100)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	protected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW).Set(cose.HeaderLabelKID, ecdhKID)
+	protectedBytes, err := cose.Headers{Protected: protected}.ProtectedBytes()
+	require.NoError(t, err)
+	w, err := ecdhkw.Wrap(key.PublicKey(), cek, protectedBytes)
+	require.NoError(t, err)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Recipients[0] = &cose.Recipient{
+		Headers: cose.Headers{
+			Protected: protected,
+			Unprotected: cose.Header{}.Set(cose.HeaderLabelEphemeralKey, map[any]any{
+				coseKeyKty: coseKtyOKP, coseKeyCrv: coseCrvX25519, coseKeyX: w.EphemeralPublicKey.Bytes(),
+			}),
+		},
+		Ciphertext: w.WrappedCEK,
+	}
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	require.Equal(t, plaintext, decryptAll(t, append(header, ciphertext...), fee.NewECDHESUnwrapper(ecdhKID, key)))
+}
+
+// TestKidlessRecipients: a recipient written without a kid leaves the label
+// out, and is unwrapped by trying keys: a key with a kid and a key without one
+// both recover it, through Decrypt and DecryptRange alike.
+func TestKidlessRecipients(t *testing.T) {
+	plaintext := patternBytes(3*aesstream.MinChunkSize + 7)
+	priv, kek := newX25519Key(t), newKEK(t)
+
+	for name, tc := range map[string]struct {
+		recipient fee.Recipient
+		keyed     fee.RecipientUnwrapper
+		kidless   fee.RecipientUnwrapper
+	}{
+		"ECDH-ES": {fee.NewECDHESRecipient(nil, priv.PublicKey()), fee.NewECDHESUnwrapper(ecdhKID, priv), fee.NewECDHESUnwrapper(nil, priv)},
+		"A256KW":  {fee.NewA256KWRecipient(nil, kek), fee.NewA256KWUnwrapper(a256kwKID, kek), fee.NewA256KWUnwrapper(nil, kek)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob, err := encrypt(t, plaintext, []fee.Recipient{tc.recipient}, fee.WithChunkSize(aesstream.MinChunkSize))
+			require.NoError(t, err)
+
+			env, _, err := cose.Decode(blob)
+			require.NoError(t, err)
+			r := env.Recipients[0].Headers
+			require.False(t, r.Protected.Has(cose.HeaderLabelKID), "no protected kid")
+			require.False(t, r.Unprotected.Has(cose.HeaderLabelKID), "no unprotected kid")
+
+			for uname, u := range map[string]fee.RecipientUnwrapper{"key with a kid": tc.keyed, "key without a kid": tc.kidless} {
+				require.Equal(t, plaintext, decryptAll(t, blob, u), uname)
+
+				rr, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, 100, 199)
+				require.NoError(t, err, uname)
+				got, err := io.ReadAll(rr)
+				require.NoError(t, err, uname)
+				require.Equal(t, plaintext[100:200], got, uname)
+			}
+		})
+	}
+}
+
+// TestKidlessKeyTriesKeyedRecipient: a key without a kid is tried against a
+// recipient that has one.
+func TestKidlessKeyTriesKeyedRecipient(t *testing.T) {
+	plaintext, kek := patternBytes(100), newKEK(t)
+	blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	require.Equal(t, plaintext, decryptAll(t, blob, fee.NewA256KWUnwrapper(nil, kek)))
+}
+
+// TestDecryptTriesNextCandidate: a key that fails the integrity check is not an
+// error while another candidate remains, whether the next candidate is a later
+// recipient or a later key.
+func TestDecryptTriesNextCandidate(t *testing.T) {
+	plaintext := patternBytes(100)
+	kek1, kek2 := newKEK(t), newKEK(t)
+
+	t.Run("later recipient", func(t *testing.T) {
+		blob, err := encrypt(t, plaintext, []fee.Recipient{
+			fee.NewA256KWRecipient(nil, kek1),
+			fee.NewA256KWRecipient(nil, kek2),
+		})
+		require.NoError(t, err)
+		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewA256KWUnwrapper(nil, kek2)))
+	})
+
+	t.Run("later key", func(t *testing.T) {
+		blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(nil, kek2)})
+		require.NoError(t, err)
+		u := fee.MultiUnwrapper(fee.NewA256KWUnwrapper(nil, kek1), fee.NewA256KWUnwrapper(nil, kek2))
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+
+	t.Run("matching kid first", func(t *testing.T) {
+		// MaxUnwrapAttempts kid-less wrong keys come before the key whose kid
+		// matches, so only trying the matching key first stays within the limit.
+		blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek2)})
+		require.NoError(t, err)
+		var keys []fee.RecipientUnwrapper
+		for range fee.MaxUnwrapAttempts {
+			keys = append(keys, fee.NewA256KWUnwrapper(nil, newKEK(t)))
+		}
+		u := fee.MultiUnwrapper(append(keys, fee.NewA256KWUnwrapper(a256kwKID, kek2))...)
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+
+	t.Run("mixed algorithms", func(t *testing.T) {
+		priv := newX25519Key(t)
+		blob, err := encrypt(t, plaintext, []fee.Recipient{
+			fee.NewA256KWRecipient(nil, kek1),
+			fee.NewECDHESRecipient(nil, priv.PublicKey()),
+		})
+		require.NoError(t, err)
+		u := fee.MultiUnwrapper(fee.NewA256KWUnwrapper(nil, kek2), fee.NewECDHESUnwrapper(nil, priv))
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+}
+
+// TestDecryptUnwrapAttemptLimit: at most MaxUnwrapAttempts unwraps are tried.
+// One wrong key against MaxUnwrapAttempts kid-less recipients fails as no
+// match; one more recipient trips the limit, on both decrypt paths.
+func TestDecryptUnwrapAttemptLimit(t *testing.T) {
+	envelope := func(n int) []byte {
+		recipients := make([]fee.Recipient, n)
+		for i := range recipients {
+			recipients[i] = fee.NewA256KWRecipient(nil, newKEK(t))
+		}
+		blob, err := encrypt(t, patternBytes(10), recipients)
+		require.NoError(t, err)
+		return blob
+	}
+	wrong := fee.NewA256KWUnwrapper(nil, newKEK(t))
+
+	atLimit := envelope(fee.MaxUnwrapAttempts)
+	_, err := fee.Decrypt(bytes.NewReader(atLimit), wrong)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+	require.ErrorIs(t, err, aeskw.ErrIntegrity)
+
+	over := envelope(fee.MaxUnwrapAttempts + 1)
+	_, err = fee.Decrypt(bytes.NewReader(over), wrong)
+	require.ErrorIs(t, err, fee.ErrUnwrapAttemptLimit)
+	_, err = fee.DecryptRange(bytes.NewReader(over), int64(len(over)), wrong, 0, 0)
+	require.ErrorIs(t, err, fee.ErrUnwrapAttemptLimit)
+}
+
+// TestMultiUnwrapperNil: a MultiUnwrapper with no keys, or with a nil entry,
+// is a nil unwrapper.
+func TestMultiUnwrapperNil(t *testing.T) {
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(10), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	for name, u := range map[string]fee.RecipientUnwrapper{
+		"empty":     fee.MultiUnwrapper(),
+		"nil entry": fee.MultiUnwrapper(fee.NewA256KWUnwrapper(a256kwKID, kek), nil),
+	} {
+		_, err := fee.Decrypt(bytes.NewReader(blob), u)
+		require.ErrorIs(t, err, fee.ErrNilUnwrapper, name)
+	}
+}
+
+// zeroStream yields n zero bytes and records how many were read.
+type zeroStream struct{ n, read int64 }
+
+func (z *zeroStream) Read(p []byte) (int, error) {
+	if z.read >= z.n {
+		return 0, io.EOF
+	}
+	k := min(int64(len(p)), z.n-z.read)
+	clear(p[:k])
+	z.read += k
+	return int(k), nil
+}
+
+// TestDecryptEnvelopeSizeLimit: an envelope declaring a 64 MiB protected
+// header is refused as cose.ErrTooLarge on every decrypt path, and the
+// streaming paths read no more than MaxEnvelopeSize bytes of it.
+func TestDecryptEnvelopeSizeLimit(t *testing.T) {
+	const declared = 64 << 20
+	// 96([ h'<declared bytes>' ...
+	head := []byte{0xd8, 0x60, 0x84, 0x5a, byte(declared >> 24), 0, 0, 0}
+
+	stream := func() (io.Reader, *zeroStream) {
+		z := &zeroStream{n: declared}
+		return io.MultiReader(bytes.NewReader(head), z), z
+	}
+	r, z := stream()
+	_, err := fee.Decrypt(r, fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "Decrypt")
+	require.LessOrEqual(t, int64(len(head))+z.read, int64(fee.MaxEnvelopeSize), "Decrypt read")
+
+	r, z = stream()
+	_, err = fee.DecryptWithCEK(r, newCEK(t))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptWithCEK")
+	require.LessOrEqual(t, int64(len(head))+z.read, int64(fee.MaxEnvelopeSize), "DecryptWithCEK read")
+
+	blob := append(append([]byte{}, head...), make([]byte, 2*fee.MaxEnvelopeSize)...)
+	_, err = fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)), 0, 0)
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptRange")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), newCEK(t), 0, 0, nil)
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptRangeWithCEK")
+	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "PlaintextSize")
+}
+
+// TestEncryptEnvelopeSizeLimit: Encrypt refuses an envelope larger than
+// MaxEnvelopeSize, which no decrypt path would accept, and an envelope just
+// under it round-trips on every path.
+func TestEncryptEnvelopeSizeLimit(t *testing.T) {
+	kek := newKEK(t)
+	// A distinct 1000-byte kid per recipient, so each encodes to 1051 bytes.
+	kid := func(i int) []byte {
+		k := make([]byte, 1000)
+		k[0], k[1] = byte(i>>8), byte(i)
+		return k
+	}
+	recipients := func(n int) []fee.Recipient {
+		rs := make([]fee.Recipient, n)
+		for i := range rs {
+			rs[i] = fee.NewA256KWRecipient(kid(i), kek)
+		}
+		return rs
+	}
+
+	_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), recipients(1000))
+	require.ErrorIs(t, err, cose.ErrTooLarge)
+
+	plaintext := patternBytes(100)
+	blob, err := encrypt(t, plaintext, recipients(990))
+	require.NoError(t, err)
+	env, _, err := cose.Decode(blob)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	require.Greater(t, len(header), fee.MaxEnvelopeSize-16<<10, "the envelope is close to the limit")
+
+	u := fee.NewA256KWUnwrapper(kid(989), kek)
+	require.Equal(t, plaintext, decryptAll(t, blob, u))
+	rr, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, 0, 9)
+	require.NoError(t, err)
+	got, err := io.ReadAll(rr)
+	require.NoError(t, err)
+	require.Equal(t, plaintext[:10], got)
+}
+
+// TestContentTypeEitherBucket: content_type may be unprotected, and is held to
+// the same type rules there: a text string or non-negative integer decrypts,
+// anything else is malformed on every path.
+func TestContentTypeEitherBucket(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil)
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	withContentType := func(v any) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		env.Headers.Unprotected.Set(cose.HeaderLabelContentType, v)
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+
+	for name, v := range map[string]any{"text": "application/pdf", "integer": int64(50)} {
+		r, err := fee.DecryptWithCEK(bytes.NewReader(withContentType(v)), cek)
+		require.NoError(t, err, name)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err, name)
+		require.Equal(t, plaintext, got, name)
+	}
+
+	for name, v := range map[string]any{"negative integer": int64(-1), "byte string": []byte("application/pdf")} {
+		bad := withContentType(v)
+		_, err := fee.DecryptWithCEK(bytes.NewReader(bad), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(bad), int64(len(bad)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+		_, err = fee.DecryptRangeWithCEK(bytes.NewReader(bad), int64(len(bad)), cek, 0, 0, nil)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRangeWithCEK, %s", name)
+	}
+}
+
+// TestPlaintextLengthSafeIntegerBound: a declared plaintext length above
+// MaxPlaintextLength (2^53 - 1, which the Synapse SDK rejects) is malformed on
+// every decode path, MaxPlaintextLength itself gets as far as the size check,
+// and WithPlaintextLength refuses to write a larger one.
+func TestPlaintextLengthSafeIntegerBound(t *testing.T) {
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, nil, fee.WithPlaintextLength(100))
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	withLength := func(n int64) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		env.Headers.Protected.Set(labelPlaintextLength, n)
+		env.Headers.RawProtected = nil
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+
+	over := withLength(fee.MaxPlaintextLength + 1)
+	_, err = fee.DecryptWithCEK(bytes.NewReader(over), cek)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+	_, err = fee.PlaintextSize(bytes.NewReader(over), int64(len(over)))
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(over), int64(len(over)), cek, 0, 0, nil)
+	require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRangeWithCEK")
+
+	atMax := withLength(fee.MaxPlaintextLength)
+	_, err = fee.PlaintextSize(bytes.NewReader(atMax), int64(len(atMax)))
+	require.ErrorIs(t, err, fee.ErrSizeMismatch, "the bound itself is a valid length")
+
+	_, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithPlaintextLength(fee.MaxPlaintextLength+1))
+	require.Error(t, err, "WithPlaintextLength over the bound")
+	rc, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithPlaintextLength(fee.MaxPlaintextLength))
+	require.NoError(t, err, "WithPlaintextLength at the bound")
+	require.NoError(t, rc.Close())
+}
+
+// TestEnvelopeErrorClassification: an envelope whose bytes are not a valid FEE
+// envelope is ErrMalformedEnvelope on every path, alongside the cose sentinel,
+// while a source that fails partway through the envelope keeps its own error
+// and is not reported as malformed.
+func TestEnvelopeErrorClassification(t *testing.T) {
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Headers.Protected.Set(cose.HeaderLabelType, "application/cose")
+	env.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+	wrongTyp := append(header, ciphertext...)
+
+	for name, tc := range map[string]struct {
+		blob []byte
+		also error
+	}{
+		"not CBOR":           {[]byte{0xff, 0xff, 0xff}, cose.ErrMalformed},
+		"not a COSE_Encrypt": {[]byte{0x01}, cose.ErrNotEncrypt},
+		"wrong typ":          {wrongTyp, cose.ErrUnexpectedType},
+		"oversized":          {append([]byte{0xd8, 0x60, 0x84, 0x5a, 0x01, 0, 0, 0}, make([]byte, fee.MaxEnvelopeSize)...), cose.ErrTooLarge},
+	} {
+		u := fee.NewA256KWUnwrapper(a256kwKID, newKEK(t))
+		_, err := fee.Decrypt(bytes.NewReader(tc.blob), u)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt, %s", name)
+		require.ErrorIs(t, err, tc.also, "Decrypt, %s", name)
+		_, err = fee.DecryptWithCEK(bytes.NewReader(tc.blob), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.DecryptRange(bytes.NewReader(tc.blob), int64(len(tc.blob)), u, 0, 0)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRange, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(tc.blob), int64(len(tc.blob)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+	}
+
+	boom := errors.New("connection reset")
+	failing := func() io.Reader { return io.MultiReader(bytes.NewReader(blob[:20]), iotest.ErrReader(boom)) }
+	_, err = fee.Decrypt(failing(), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
+	require.ErrorIs(t, err, boom, "Decrypt")
+	require.NotErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt")
+	_, err = fee.DecryptWithCEK(failing(), cek)
+	require.ErrorIs(t, err, boom, "DecryptWithCEK")
+	require.NotErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+}
+
+// TestSafeIntegersOnly: an integer outside ±(2^53 - 1) anywhere in the
+// envelope's headers is malformed, as the Synapse SDK requires, wherever it
+// sits; integers at the bound are accepted.
+func TestSafeIntegersOnly(t *testing.T) {
+	const maxSafe = int64(1)<<53 - 1
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	edited := func(edit func(*cose.Envelope)) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		edit(env)
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+	unprotected := func(label, v any) []byte {
+		return edited(func(e *cose.Envelope) { e.Headers.Unprotected.Set(label, v) })
+	}
+
+	for name, b := range map[string][]byte{
+		"unprotected value above": unprotected(int64(99), maxSafe+1),
+		"unprotected value below": unprotected(int64(99), -maxSafe-1),
+		"unsigned beyond int64":   unprotected(int64(99), uint64(1)<<63),
+		"label above":             unprotected(maxSafe+1, int64(1)),
+		"nested in an array":      unprotected(int64(99), []any{int64(1), maxSafe + 1}),
+		"nested map key":          unprotected(int64(99), map[any]any{maxSafe + 1: "x"}),
+		"protected app_metadata": edited(func(e *cose.Envelope) {
+			e.Headers.Protected.Set(labelAppMetadata, map[any]any{"n": maxSafe + 1})
+			e.Headers.RawProtected = nil
+		}),
+		"recipient header": edited(func(e *cose.Envelope) {
+			e.Recipients[0].Headers.Unprotected.Set(int64(99), maxSafe+1)
+		}),
+	} {
+		_, err := fee.DecryptWithCEK(bytes.NewReader(b), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(b), int64(len(b)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+	}
+
+	for name, b := range map[string][]byte{
+		"unprotected value at the bound": unprotected(int64(99), maxSafe),
+		"negative value at the bound":    unprotected(int64(99), -maxSafe),
+		"label at the bound":             unprotected(maxSafe, int64(1)),
+	} {
+		r, err := fee.DecryptWithCEK(bytes.NewReader(b), cek)
+		require.NoError(t, err, name)
+		_, err = io.ReadAll(r)
+		require.NoError(t, err, name)
+	}
 }

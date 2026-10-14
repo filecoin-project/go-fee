@@ -27,11 +27,8 @@ type blobLocationRow struct {
 	regionKeyVersion   string
 	tenantRecipientKID string
 
-	// Body descriptor. chunkSize is int64 rather than int because a SQL bigint is
-	// what a store round-trips, so the conversion is part of what is tested.
+	// Body descriptor.
 	headerLen int64
-	baseNonce []byte
-	chunkSize int64
 	aad       []byte
 
 	// Location.
@@ -43,8 +40,6 @@ type blobLocationRow struct {
 func (r blobLocationRow) descriptor() fee.BodyDescriptor {
 	return fee.BodyDescriptor{
 		HeaderLen: r.headerLen,
-		BaseNonce: r.baseNonce,
-		ChunkSize: int(r.chunkSize),
 		AAD:       r.aad,
 	}
 }
@@ -93,7 +88,7 @@ func TestIngotWriteReadFlow(t *testing.T) {
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, tenantKey.PublicKey())},
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	// The writer's copy of the CEK is done with; only the wrapped form persists.
 	clear(cek)
@@ -103,8 +98,6 @@ func TestIngotWriteReadFlow(t *testing.T) {
 		regionKeyVersion:   "region-key-v1",
 		tenantRecipientKID: string(ecdhKID),
 		headerLen:          desc.HeaderLen,
-		baseNonce:          desc.BaseNonce,
-		chunkSize:          int64(desc.ChunkSize),
 		aad:                desc.AAD,
 		size:               int64(len(blob)),
 	}
@@ -114,7 +107,7 @@ func TestIngotWriteReadFlow(t *testing.T) {
 		// on the encrypt side cannot hide behind a self-consistent round trip.
 		env, rest, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
-		iv, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+		iv, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
 		require.True(t, ok)
 		aad, err := env.EncStructure(nil)
 		require.NoError(t, err)
@@ -123,10 +116,16 @@ func TestIngotWriteReadFlow(t *testing.T) {
 		// cannot go unchecked here.
 		require.Equal(t, fee.BodyDescriptor{
 			HeaderLen: int64(len(blob) - len(rest)),
-			BaseNonce: iv,
-			ChunkSize: rangeChunk,
 			AAD:       aad,
 		}, desc)
+
+		// The body parameters read from the AAD match the envelope's.
+		chunkSize, err := desc.ChunkSize()
+		require.NoError(t, err)
+		require.Equal(t, rangeChunk, chunkSize)
+		baseNonce, err := desc.BaseNonce()
+		require.NoError(t, err)
+		require.Equal(t, iv, baseNonce)
 	})
 
 	t.Run("plaintext size from the row alone", func(t *testing.T) {
@@ -199,11 +198,8 @@ func TestEncryptDescriptorDoesNotAliasTheStream(t *testing.T) {
 	// values a store would have persisted.
 	kept := fee.BodyDescriptor{
 		HeaderLen: desc.HeaderLen,
-		BaseNonce: bytes.Clone(desc.BaseNonce),
-		ChunkSize: desc.ChunkSize,
 		AAD:       bytes.Clone(desc.AAD),
 	}
-	desc.BaseNonce[0] ^= 0xff
 	desc.AAD[0] ^= 0xff
 
 	blob, err := io.ReadAll(rc)
@@ -229,7 +225,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorEncrypt0(t *testing.T) {
 	cek := newCEK(t)
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	// It really is the recipient-less form.
 	tag, err := cose.PeekTag(blob)
@@ -257,7 +253,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath(t *testing.T) {
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, tenantKey.PublicKey())},
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 	unwrapper := fee.NewECDHESUnwrapper(ecdhKID, tenantKey)
 
 	for _, start := range []int64{0, 1, rangeChunk - 1, rangeChunk, 2 * rangeChunk, size - 7} {
@@ -277,35 +273,66 @@ func TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath(t *testing.T) {
 // persisting a row: a partial record is refused rather than written and
 // discovered unusable on some later read.
 func TestBodyDescriptorValidate(t *testing.T) {
-	good := fee.BodyDescriptor{
-		HeaderLen: 128,
-		BaseNonce: make([]byte, aesstream.BaseNonceSize),
-		ChunkSize: rangeChunk,
-		AAD:       []byte("enc-structure"),
-	}
+	_, good := encryptWithDescriptor(t, patternBytes(100), newCEK(t), nil, fee.WithChunkSize(rangeChunk))
 	require.NoError(t, good.Validate())
 
+	// aadWith re-encodes good's AAD with its protected header changed by edit.
+	aadWith := func(edit func(cose.Header)) []byte {
+		_, protected, _, err := cose.ParseEncStructure(good.AAD)
+		require.NoError(t, err)
+		edit(protected)
+		aad, err := (&cose.Envelope{Headers: cose.Headers{Protected: protected}}).EncStructure(nil)
+		require.NoError(t, err)
+		return aad
+	}
+
 	for name, mutate := range map[string]func(*fee.BodyDescriptor){
-		"zero value":          func(m *fee.BodyDescriptor) { *m = fee.BodyDescriptor{} },
-		"no header length":    func(m *fee.BodyDescriptor) { m.HeaderLen = 0 },
-		"negative header":     func(m *fee.BodyDescriptor) { m.HeaderLen = -1 },
-		"no base nonce":       func(m *fee.BodyDescriptor) { m.BaseNonce = nil },
-		"short base nonce":    func(m *fee.BodyDescriptor) { m.BaseNonce = make([]byte, 3) },
-		"no chunk size":       func(m *fee.BodyDescriptor) { m.ChunkSize = 0 },
-		"chunk size tiny":     func(m *fee.BodyDescriptor) { m.ChunkSize = aesstream.MinChunkSize - 1 },
-		"chunk size huge":     func(m *fee.BodyDescriptor) { m.ChunkSize = aesstream.MaxChunkSize + 1 },
-		"no aad":              func(m *fee.BodyDescriptor) { m.AAD = nil },
-		"empty (not nil) aad": func(m *fee.BodyDescriptor) { m.AAD = []byte{} },
+		"zero value":               func(m *fee.BodyDescriptor) { *m = fee.BodyDescriptor{} },
+		"no header length":         func(m *fee.BodyDescriptor) { m.HeaderLen = 0 },
+		"negative header":          func(m *fee.BodyDescriptor) { m.HeaderLen = -1 },
+		"no aad":                   func(m *fee.BodyDescriptor) { m.AAD = nil },
+		"empty (not nil) aad":      func(m *fee.BodyDescriptor) { m.AAD = []byte{} },
+		"aad not an Enc_structure": func(m *fee.BodyDescriptor) { m.AAD = []byte("enc-structure") },
+		"aad with trailing bytes":  func(m *fee.BodyDescriptor) { m.AAD = append(bytes.Clone(m.AAD), 0) },
+		"aad with a short base nonce": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { h.Set(cose.HeaderLabelIV, make([]byte, 3)) })
+		},
+		"aad with no chunk size": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { delete(h, labelChunkSize) })
+		},
+		"aad with a tiny chunk size": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { h.Set(labelChunkSize, int64(aesstream.MinChunkSize-1)) })
+		},
+		"aad with the wrong typ": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { h.Set(cose.HeaderLabelType, "application/cose") })
+		},
+		"aad with the wrong algorithm": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { h.Set(cose.HeaderLabelAlg, int64(3)) })
+		},
+		"aad with a negative plaintext length": func(m *fee.BodyDescriptor) {
+			m.AAD = aadWith(func(h cose.Header) { h.Set(labelPlaintextLength, int64(-1)) })
+		},
+		"aad with external aad": func(m *fee.BodyDescriptor) {
+			_, protected, _, err := cose.ParseEncStructure(m.AAD)
+			require.NoError(t, err)
+			aad, err := (&cose.Envelope{Headers: cose.Headers{Protected: protected}}).EncStructure([]byte("extra"))
+			require.NoError(t, err)
+			m.AAD = aad
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := good
 			mutate(&m)
 			require.ErrorIs(t, m.Validate(), fee.ErrInvalidDescriptor)
+			_, err := m.ChunkSize()
+			require.ErrorIs(t, err, fee.ErrInvalidDescriptor, "ChunkSize")
+			_, err = m.BaseNonce()
+			require.ErrorIs(t, err, fee.ErrInvalidDescriptor, "BaseNonce")
 
 			// The range entry point rejects it up front for the same reason,
 			// rather than letting it fail as an authentication error later.
-			_, err := fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
-				make([]byte, aesstream.KeySize), 0, 9, &m)
+			_, err = fee.DecryptRangeWithCEK(bytes.NewReader([]byte("blob")), 4096,
+				bytes.Repeat([]byte{1}, aesstream.KeySize), 0, 9, &m)
 			require.ErrorIs(t, err, fee.ErrInvalidDescriptor)
 		})
 	}
@@ -322,19 +349,20 @@ func TestDecryptRangeWithCEKAndBodyDescriptorPoisoned(t *testing.T) {
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	for name, mutate := range map[string]func(m *fee.BodyDescriptor){
 		"header length off by one": func(m *fee.BodyDescriptor) { m.HeaderLen++ },
-		"wrong base nonce": func(m *fee.BodyDescriptor) {
-			m.BaseNonce = bytes.Clone(m.BaseNonce)
-			m.BaseNonce[0] ^= 0xff
+		"aad from another object": func(m *fee.BodyDescriptor) {
+			// Well formed and the same shape, but a different base nonce.
+			_, other := encryptWithDescriptor(t, plaintext, cek, nil,
+				fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
+			m.AAD = other.AAD
 		},
 		"tampered aad": func(m *fee.BodyDescriptor) {
 			m.AAD = bytes.Clone(m.AAD)
 			m.AAD[len(m.AAD)-1] ^= 0xff
 		},
-		"wrong chunk size": func(m *fee.BodyDescriptor) { m.ChunkSize = rangeChunk * 2 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			poisoned := desc
@@ -358,7 +386,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 	blobSize := int64(len(blob))
 
 	t.Run("short cek", func(t *testing.T) {
@@ -385,4 +413,46 @@ func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 		_, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), blobSize, cek, -1, 8, &desc)
 		require.ErrorIs(t, err, aesstream.ErrRange)
 	})
+}
+
+// TestBodyDescriptorChecksDeclaredLength: the plaintext length the protected
+// header declares is read from the cached AAD, so the descriptor path rejects a
+// truncated or padded blob with ErrSizeMismatch, exactly as the envelope-backed
+// paths do, even for a range that never reads the final chunk, and even when
+// the truncated length is not a valid FEE layout.
+func TestBodyDescriptorChecksDeclaredLength(t *testing.T) {
+	const size = 3*rangeChunk + 100
+	plaintext := patternBytes(size)
+	cek := newCEK(t)
+	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
+
+	got, err := desc.PlaintextSize(int64(len(blob)))
+	require.NoError(t, err)
+	require.Equal(t, int64(size), got)
+
+	for name, b := range map[string][]byte{
+		"truncated in the final chunk": blob[:len(blob)-10],
+		// The final chunk holds 100 plaintext bytes, so 116 of ciphertext.
+		// Cutting 110 leaves 6, which no FEE layout allows.
+		"truncated to a final chunk under 16 bytes": blob[:len(blob)-110],
+		"truncated to a chunk boundary":             blob[:len(blob)-116],
+		"padded in the final chunk":                 append(bytes.Clone(blob), make([]byte, 10)...),
+	} {
+		_, err := desc.PlaintextSize(int64(len(b)))
+		require.ErrorIs(t, err, fee.ErrSizeMismatch, "PlaintextSize, %s", name)
+		_, err = fee.DecryptRangeWithCEK(bytes.NewReader(b), int64(len(b)), cek, 0, 99, &desc)
+		require.ErrorIs(t, err, fee.ErrSizeMismatch, "DecryptRangeWithCEK, %s", name)
+		_, err = fee.DecryptRangeWithCEK(bytes.NewReader(b), int64(len(b)), cek, 0, 99, nil)
+		require.ErrorIs(t, err, fee.ErrSizeMismatch, "DecryptRangeWithCEK without a descriptor, %s", name)
+	}
+
+	// Without a declared length there is nothing to check against: the
+	// descriptor still serves ranges, as before.
+	blob, desc = encryptWithDescriptor(t, plaintext, cek, nil, fee.WithChunkSize(rangeChunk))
+	r, err := fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), cek, 0, 99, &desc)
+	require.NoError(t, err)
+	gotRange, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, plaintext[:100], gotRange)
 }

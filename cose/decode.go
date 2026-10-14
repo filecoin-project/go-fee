@@ -13,6 +13,9 @@ import (
 type decodeConfig struct {
 	checkType    bool
 	expectedType string
+	strict       bool
+	limitSize    bool
+	maxSize      int64
 }
 
 // DecodeOption configures [Decode] and [DecodeReader].
@@ -28,6 +31,86 @@ func WithExpectedType(typ string) DecodeOption {
 		c.checkType = true
 		c.expectedType = typ
 	}
+}
+
+// WithStrictEncoding requires every CBOR item in the envelope, including the
+// serialized protected headers it carries, to use definite lengths and
+// shortest-form arguments, and to contain no floating-point values, no simple
+// values other than false, true and null, and no tags other than the
+// envelope's own; otherwise decoding fails with ErrMalformed. It lets a profile give each envelope one
+// accepted encoding. Duplicate map labels are rejected with or without it.
+func WithStrictEncoding() DecodeOption {
+	return func(c *decodeConfig) { c.strict = true }
+}
+
+// WithMaxSize limits the encoded envelope, outer tag included, to at most n
+// bytes. Decoding reads no more than n bytes looking for the end of the
+// envelope, so an envelope that declares a huge item cannot make it buffer an
+// unbounded amount of input. A larger envelope fails with an error matching
+// both ErrMalformed and ErrTooLarge. n must be positive: with a smaller n,
+// every decode fails with ErrInvalidMaxSize before reading any input, rather
+// than going unlimited. Without this option the envelope size is not limited.
+func WithMaxSize(n int64) DecodeOption {
+	return func(c *decodeConfig) {
+		c.limitSize = true
+		c.maxSize = n
+	}
+}
+
+// readItem reads the single CBOR item at the front of r, reading at most
+// cfg.maxSize bytes when a limit is set, and returns the item with the decoder
+// that read it, whose buffer may hold bytes read past the item.
+func (cfg decodeConfig) readItem(r io.Reader) (cbor.RawMessage, *cbor.Decoder, error) {
+	// Watch r for a read error, so a failing source is reported as one rather
+	// than as a malformed envelope.
+	watched := &errReader{r: r}
+	r = watched
+	var limited *io.LimitedReader
+	if cfg.limitSize {
+		if cfg.maxSize <= 0 {
+			return nil, nil, fmt.Errorf("%w: got %d", ErrInvalidMaxSize, cfg.maxSize)
+		}
+		limited = &io.LimitedReader{R: r, N: cfg.maxSize}
+		r = limited
+	}
+	dec := decMode.NewDecoder(r)
+	var item cbor.RawMessage
+	if err := dec.Decode(&item); err != nil {
+		if watched.err != nil {
+			return nil, nil, fmt.Errorf("cose: reading envelope: %w", watched.err)
+		}
+		// The limit was used up before the item ended, so the envelope is
+		// larger than it, whether or not more input followed.
+		if limited != nil && limited.N == 0 && errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, nil, fmt.Errorf("%w: %w: larger than %d bytes", ErrMalformed, ErrTooLarge, cfg.maxSize)
+		}
+		return nil, nil, malformedItem(err)
+	}
+	return item, dec, nil
+}
+
+// checkStrict enforces WithStrictEncoding against the envelope item and the
+// protected headers nested inside it as byte strings.
+func (cfg decodeConfig) checkStrict(item []byte, env *Envelope) error {
+	if !cfg.strict {
+		return nil
+	}
+	if err := checkStrictEncoding(item, true); err != nil {
+		return err
+	}
+	protected := [][]byte{env.Headers.RawProtected}
+	for _, r := range env.Recipients {
+		protected = append(protected, r.Headers.RawProtected)
+	}
+	for _, p := range protected {
+		if len(p) == 0 {
+			continue
+		}
+		if err := checkStrictEncoding(p, false); err != nil {
+			return fmt.Errorf("protected header: %w", err)
+		}
+	}
+	return nil
 }
 
 func newDecodeConfig(opts []DecodeOption) decodeConfig {
@@ -66,10 +149,10 @@ func (cfg decodeConfig) checkTyp(protected Header) error {
 // tag; [Envelope] relies on exactly that invariant.
 func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err error) {
 	// Read exactly one CBOR item; the remainder is the detached payload.
-	dec := decMode.NewDecoder(bytes.NewReader(data))
-	var first cbor.RawMessage
-	if err := dec.Decode(&first); err != nil {
-		return nil, nil, malformedItem(err)
+	cfg := newDecodeConfig(opts)
+	first, dec, err := cfg.readItem(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, err
 	}
 	rest = data[dec.NumBytesRead():]
 
@@ -81,10 +164,28 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := newDecodeConfig(opts).checkTyp(env.Headers.Protected); err != nil {
+	if err := cfg.checkStrict(first, env); err != nil {
+		return nil, nil, err
+	}
+	if err := cfg.checkTyp(env.Headers.Protected); err != nil {
 		return nil, nil, err
 	}
 	return env, rest, nil
+}
+
+// errReader passes reads through to r and records the first error r returns
+// other than io.EOF.
+type errReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // malformedItem reports a failure to read the single leading CBOR item as
@@ -189,14 +290,17 @@ func PeekTag(data []byte) (uint64, error) {
 // as strict — both share the decodeEnvelope validation core: a byte-string
 // protected header, map headers without duplicate labels, a null detached body,
 // and, for tag 96, at least one well-formed 3-element recipient. Any deviation
-// returns an error (wrapping a package sentinel) and a nil envelope.
+// returns an error (wrapping a package sentinel) and a nil envelope. If r
+// itself fails while the envelope is read, that error is returned wrapped,
+// and is not reported as ErrMalformed.
 func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Reader, err error) {
 	// Read exactly one CBOR item. Whatever the decoder buffered past that item,
-	// followed by the unread remainder of r, is the detached payload.
-	dec := decMode.NewDecoder(r)
-	var first cbor.RawMessage
-	if err := dec.Decode(&first); err != nil {
-		return nil, nil, malformedItem(err)
+	// followed by the unread remainder of r, is the detached payload. The size
+	// limit applies only to that read: rest draws on r directly.
+	cfg := newDecodeConfig(opts)
+	first, dec, err := cfg.readItem(r)
+	if err != nil {
+		return nil, nil, err
 	}
 	rest = io.MultiReader(dec.Buffered(), r)
 
@@ -208,7 +312,10 @@ func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Rea
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := newDecodeConfig(opts).checkTyp(env.Headers.Protected); err != nil {
+	if err := cfg.checkStrict(first, env); err != nil {
+		return nil, nil, err
+	}
+	if err := cfg.checkTyp(env.Headers.Protected); err != nil {
 		return nil, nil, err
 	}
 	return env, rest, nil

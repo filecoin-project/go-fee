@@ -125,6 +125,12 @@ func (r *Reader) nextChunk() error {
 		// Too few bytes to even hold the tag: a malformed/truncated chunk.
 		return r.fail(ErrCorrupted)
 	}
+	if mustBeLast && n == TagSize && r.index > 0 {
+		// An empty final chunk after full ones: the previous full chunk
+		// should have been the final chunk. Only an empty plaintext ends in
+		// an empty chunk, as its only chunk.
+		return r.fail(ErrCiphertextSize)
+	}
 
 	plaintext, wasLast, err := r.openChunk(r.index, r.inBuf[:n], mustBeLast)
 	if err != nil {

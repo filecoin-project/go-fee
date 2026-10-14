@@ -17,25 +17,23 @@ import (
 	"github.com/filecoin-project/go-fee/ecdhkw"
 )
 
-// FEE wire constants. These MUST match the foc-encryption reference
-// (packages/foc-encryption/src/cose/headers.ts at the pinned commit — see
-// pull-foc-encryption.sh). They are the values this issue reconciled the Go
-// side to; the private-use labels are FEE-specific and live here (the caller),
-// not in the FEE-agnostic cose package.
+// FEE wire constants, per FIP-1253. The FEE-specific labels live here (the
+// caller), not in the FEE-agnostic cose package.
 const (
 	// feeTyp is the COSE protected "typ" (label 16) that pins the envelope
-	// profile. Reference: FOC_ENVELOPE_TYPE.
-	feeTyp = "application/vnd.foc-envelope+cose"
+	// profile.
+	feeTyp = "application/vnd.filecoin-encryption+cose"
 
 	// algChunkedStream is the private-use COSE algorithm id for the chunked
-	// AES-256-GCM-STREAM body cipher. Reference: CHUNKED_AES_256_GCM_STREAM.
+	// AES-256-GCM-STREAM body cipher.
 	algChunkedStream = int64(-65793)
 
-	// labelChunkSize and labelChunkCount are the private-use unprotected header
-	// labels carrying the STREAM geometry. Reference: CoseHeaderParam.CHUNK_SIZE
-	// / CHUNK_COUNT.
-	labelChunkSize  = int64(-65790)
-	labelChunkCount = int64(-65791)
+	// labelChunkSize and labelPlaintextLength are the protected header labels
+	// carrying the STREAM geometry: the chunk size (required) at the
+	// algorithm-scoped label -1, and the exact plaintext length (optional) at a
+	// private-use label.
+	labelChunkSize       = int64(-1)
+	labelPlaintextLength = int64(-65789)
 
 	// vectorChunkSize is the plaintext chunk size used by the Go-produced
 	// fixtures. aesstream requires >= 4 KiB (MinChunkSize); the reference
@@ -101,11 +99,11 @@ func composeFEE(plaintext, cek, baseNonce []byte, chunkSize int, recipients []*c
 	headers := cose.Headers{
 		Protected: cose.Header{}.
 			Set(cose.HeaderLabelAlg, algChunkedStream).
-			Set(cose.HeaderLabelType, feeTyp),
-		Unprotected: cose.Header{}.
+			Set(cose.HeaderLabelType, feeTyp).
 			Set(cose.HeaderLabelIV, baseNonce).
 			Set(labelChunkSize, int64(chunkSize)).
-			Set(labelChunkCount, int64(chunkCount)),
+			Set(labelPlaintextLength, int64(len(plaintext))),
+		Unprotected: cose.Header{},
 	}
 
 	// Recipient presence selects the form: nil/empty -> COSE_Encrypt0 (tag 16),
@@ -173,17 +171,20 @@ func ecdhESRecipient(cek []byte) (*cose.Recipient, error) {
 }
 
 // a256kwRecipient wraps cek under the fixed region KEK via A256KW and returns
-// the COSE_Recipient entry (alg -5, a symmetric kid, wrapped CEK as ciphertext).
-func a256kwRecipient(cek []byte) (*cose.Recipient, error) {
+// the COSE_Recipient entry (alg -5, kid if non-empty, wrapped CEK as
+// ciphertext). An empty kid leaves the label out.
+func a256kwRecipient(cek []byte, kid string) (*cose.Recipient, error) {
 	wrapped, err := aeskw.Wrap(testA256KWKEK(), cek)
 	if err != nil {
 		return nil, err
 	}
+	// RFC 9053 §6.2.1: the protected header MUST be empty, so alg is unprotected.
+	unprotected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW)
+	if kid != "" {
+		unprotected.Set(cose.HeaderLabelKID, []byte(kid))
+	}
 	return &cose.Recipient{
-		Headers: cose.Headers{
-			Protected:   cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW),
-			Unprotected: cose.Header{}.Set(cose.HeaderLabelKID, []byte(a256kwKid)),
-		},
+		Headers:    cose.Headers{Unprotected: unprotected},
 		Ciphertext: wrapped,
 	}, nil
 }
@@ -216,19 +217,33 @@ func decodeFEE(blob []byte) (*parsedFEE, error) {
 		return nil, fmt.Errorf("enc_structure: %w", err)
 	}
 
+	for _, label := range []int64{cose.HeaderLabelAlg, cose.HeaderLabelType, cose.HeaderLabelIV, labelChunkSize, labelPlaintextLength} {
+		if out.headers.Unprotected.Has(label) {
+			return nil, fmt.Errorf("header %d must be protected", label)
+		}
+	}
 	alg, ok := out.headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok || alg != algChunkedStream {
 		return nil, fmt.Errorf("unexpected body algorithm %d (want %d)", alg, algChunkedStream)
 	}
-	iv, ok := out.headers.Unprotected.Bytes(cose.HeaderLabelIV)
+	iv, ok := out.headers.Protected.Bytes(cose.HeaderLabelIV)
 	if !ok {
 		return nil, fmt.Errorf("missing iv (base nonce)")
 	}
 	out.baseNonce = iv
-	if cs, ok := out.headers.Unprotected.Int(labelChunkSize); ok {
-		out.chunkSize = int(cs)
-	} else {
-		out.chunkSize = aesstream.DefaultChunkSize
+	cs, ok := out.headers.Protected.Int(labelChunkSize)
+	if !ok {
+		return nil, fmt.Errorf("missing chunk size")
+	}
+	out.chunkSize = int(cs)
+	if n, ok := out.headers.Protected.Int(labelPlaintextLength); ok {
+		got, err := aesstream.DecryptedSize(int64(len(out.ciphertext)), out.chunkSize)
+		if err != nil {
+			return nil, err
+		}
+		if got != n {
+			return nil, fmt.Errorf("declared plaintext length %d, ciphertext holds %d", n, got)
+		}
 	}
 	return out, nil
 }
@@ -254,8 +269,8 @@ func decryptFEE(blob, cek []byte) ([]byte, error) {
 
 type recipientMeta struct {
 	Algorithm           int64  `json:"algorithm"`
-	Kind                string `json:"kind"` // "ecdh-es-a256kw" | "a256kw"
-	KidHex              string `json:"kid_hex"`
+	Kind                string `json:"kind"`              // "ecdh-es-a256kw" | "a256kw"
+	KidHex              string `json:"kid_hex,omitempty"` // empty: the recipient has no kid
 	TenantX25519PrivHex string `json:"tenant_x25519_priv_hex,omitempty"`
 	A256KWKEKHex        string `json:"a256kw_kek_hex,omitempty"`
 }

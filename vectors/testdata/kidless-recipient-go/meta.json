@@ -1,0 +1,19 @@
+{
+  "name": "kidless-recipient-go",
+  "producer": "go",
+  "description": "A256KW recipient without a kid, encrypted in Go; filecoin-encryption-envelope unwraps it by trying its key.",
+  "tag": 96,
+  "algorithm": -65793,
+  "typ": "application/vnd.filecoin-encryption+cose",
+  "chunk_size": 4096,
+  "chunk_count": 1,
+  "cek_hex": "b4be32efb6bf97ca95898c453ecb1a2bba1b24fb8452da8096a568baa74a9ca4",
+  "base_nonce_hex": "baf5c82a5faa4c",
+  "recipients": [
+    {
+      "algorithm": -5,
+      "kind": "a256kw",
+      "a256kw_kek_hex": "6dce8af0793c3db3a251fbcf8a63a24a396da70a4c33f0684f50ef0d95fa1271"
+    }
+  ]
+}

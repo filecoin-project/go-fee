@@ -1,6 +1,5 @@
-# The pinned foc-encryption source is fetched on demand by
-# ../pull-foc-encryption.sh, never committed.
+# The pinned TypeScript reference source is fetched on demand by
+# ../pull-synapse-fee.sh, never committed.
 vendor/
 node_modules/
-bun.lock
-bun.lockb
+package-lock.json

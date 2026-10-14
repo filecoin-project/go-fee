@@ -28,8 +28,8 @@
 // decryptor.
 //
 // A CEK can be carried in the envelope as one or more COSE_Recipient entries
-// (a COSE_Encrypt, tag 96), each keyed by a caller-supplied key id (kid —
-// opaque to this package, e.g. a DID verification method ID). Two wrap
+// (a COSE_Encrypt, tag 96), each normally named by a caller-supplied key id
+// (kid — opaque to this package, e.g. a DID verification method ID). Two wrap
 // algorithms are available and may be mixed in one envelope; on decrypt the
 // caller never selects the algorithm, the recipient's COSE header does:
 //
@@ -47,12 +47,12 @@
 //
 // The blob is the detached-payload convention: the encoded COSE envelope
 // immediately followed by the STREAM ciphertext (envelope || ciphertext). The
-// body protected header pins the FEE envelope type ([EnvelopeType]) and the body
-// algorithm (chunked AES-256-GCM-STREAM); the body unprotected header carries the
-// STREAM base nonce in the COSE iv parameter, the plaintext chunk size, and —
-// when the plaintext length is known — the chunk count. These conventions and
-// their private-use label values match the foc-encryption reference and the FEE
-// cross-implementation vectors (see fee/vectors).
+// body protected header carries every FEE content parameter, so the envelope AAD
+// authenticates all of them: the envelope type ([EnvelopeType]), the body
+// algorithm (chunked AES-256-GCM-STREAM), the STREAM base nonce in the COSE iv
+// parameter, the plaintext chunk size and — when the plaintext length is known —
+// the plaintext length. The body unprotected header is empty. These conventions
+// follow FIP-1253 and the FEE cross-implementation vectors (see fee/vectors).
 //
 // # Streaming
 //
@@ -85,11 +85,11 @@
 package fee
 
 import (
-	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/filecoin-project/go-fee/cose"
@@ -98,9 +98,9 @@ import (
 // EnvelopeType is the COSE "typ" (RFC 9596, header label 16) that every FEE
 // envelope is pinned to. [Encrypt] writes it into the body protected header and
 // [Decrypt] requires it on decode, so a blob that is not a FEE envelope is
-// rejected before any key material is touched. Its value matches the
-// foc-encryption reference.
-const EnvelopeType = "application/vnd.foc-envelope+cose"
+// rejected before any key material is touched. Its value is the one FIP-1253
+// defines.
+const EnvelopeType = "application/vnd.filecoin-encryption+cose"
 
 // algChunkedAES256GCMStream is the FEE private-use COSE algorithm id for the
 // chunked AES-256-GCM-STREAM body cipher (fee/aesstream). It is the body
@@ -108,16 +108,168 @@ const EnvelopeType = "application/vnd.foc-envelope+cose"
 // different body cipher is refused rather than mis-decrypted.
 const algChunkedAES256GCMStream int64 = -65793
 
-// FEE private-use COSE header labels carried in the body unprotected header,
-// matching the foc-encryption reference (src/cose/headers.ts).
+// FEE body header labels. All of them belong in the body protected header,
+// where every chunk's AAD authenticates them; an envelope that carries any of
+// them, or the iv, in its unprotected header is malformed.
 const (
-	// labelChunkSize holds the STREAM plaintext chunk size, in bytes.
-	labelChunkSize int64 = -65790
-	// labelChunkCount holds the number of STREAM chunks. It is emitted only when
-	// the plaintext length is known ([WithContentLength]); it is advisory
-	// metadata for range/seek consumers and is not required to decrypt.
-	labelChunkCount int64 = -65791
+	// labelChunkSize holds the STREAM plaintext chunk size, in bytes. It is
+	// required. FIP-1253 places it at -1, a label whose meaning COSE scopes to
+	// the algorithm (RFC 9052 §3.1), here chunked AES-256-GCM-STREAM.
+	labelChunkSize int64 = -1
+	// labelPlaintextLength holds the exact plaintext length, in bytes. It is
+	// emitted only when the length is known before encryption
+	// ([WithPlaintextLength]) and is not required to decrypt. Each plaintext
+	// length has one valid ciphertext length, so a reader checks it against
+	// the blob size and detects any truncation, even a range that never reads
+	// the final chunk.
+	labelPlaintextLength int64 = -65789
+	// labelAppMetadata holds application metadata: a string-keyed map that
+	// this package carries authenticated but neither writes nor interprets.
+	labelAppMetadata int64 = -65792
 )
+
+// bodyContentLabels are the body header parameters FEE requires to be
+// protected; [validateBodyParams] rejects any of them in the unprotected
+// header.
+var bodyContentLabels = []int64{
+	cose.HeaderLabelAlg, cose.HeaderLabelType, cose.HeaderLabelIV,
+	labelChunkSize, labelPlaintextLength, labelAppMetadata,
+}
+
+// bodyUnderstoodLabels are the body header parameters this package knows how
+// to process, so an envelope may list them as critical (crit, label 2). crit
+// itself is excluded: listing it would be circular.
+var bodyUnderstoodLabels = map[int64]bool{
+	cose.HeaderLabelAlg: true, cose.HeaderLabelContentType: true,
+	cose.HeaderLabelIV: true, cose.HeaderLabelType: true,
+	labelChunkSize: true, labelPlaintextLength: true, labelAppMetadata: true,
+}
+
+// MaxPlaintextLength is the largest plaintext length an envelope may declare:
+// 2^53 - 1, JavaScript's largest safe integer. The Synapse SDK rejects a larger
+// declared length, so a decoder rejects one as malformed and [WithPlaintextLength]
+// refuses to write one. It is about 8 PiB, far beyond any real object.
+const MaxPlaintextLength = maxSafeInteger
+
+// maxSafeInteger is JavaScript's largest safe integer, 2^53 - 1. The Synapse
+// SDK rejects any envelope with an integer outside ±maxSafeInteger anywhere in
+// its headers, so a decoder here does too (see checkSafeIntegers).
+const maxSafeInteger = 1<<53 - 1
+
+// MaxEnvelopeSize is the largest encoded envelope, outer tag included, that
+// any decrypt path accepts: 1 MiB, the Synapse SDK's limit. Reading stops once
+// this much input has failed to complete an envelope, which fails with an
+// error matching cose.ErrTooLarge. It still admits thousands of recipients (a
+// recipient entry is a couple of hundred bytes).
+const MaxEnvelopeSize = 1 << 20
+
+// envelopeDecodeOptions are the cose decode rules every FEE envelope is held
+// to: the FEE envelope type, one accepted CBOR encoding (definite lengths,
+// shortest-form arguments, no floats), and at most MaxEnvelopeSize bytes.
+var envelopeDecodeOptions = []cose.DecodeOption{
+	cose.WithExpectedType(EnvelopeType),
+	cose.WithStrictEncoding(),
+	cose.WithMaxSize(MaxEnvelopeSize),
+}
+
+// checkSafeIntegers rejects a header holding an integer outside
+// ±maxSafeInteger anywhere in it: as a label, a value, or nested in an array
+// or map, map keys included. COSE allows any 64-bit integer, but the Synapse
+// SDK rejects these, so an envelope that carries one cannot be read by both
+// libraries. where names the header in the error.
+func checkSafeIntegers(h cose.Header, where string) error {
+	if err := checkSafeValue(map[any]any(h)); err != nil {
+		return fmt.Errorf("%w: %s header: %w", ErrMalformedEnvelope, where, err)
+	}
+	return nil
+}
+
+// checkSafeValue reports the first integer in v outside ±maxSafeInteger. The
+// CBOR decoder bounds how deeply v nests.
+func checkSafeValue(v any) error {
+	switch x := v.(type) {
+	case int64:
+		if x > maxSafeInteger || x < -maxSafeInteger {
+			return fmt.Errorf("integer %d is outside ±(2^53 - 1)", x)
+		}
+	case uint64, big.Int, *big.Int:
+		return fmt.Errorf("integer %v is outside ±(2^53 - 1)", x)
+	case []any:
+		for _, e := range x {
+			if err := checkSafeValue(e); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		for k, e := range x {
+			if err := checkSafeValue(k); err != nil {
+				return err
+			}
+			if err := checkSafeValue(e); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// envelopeDecodeError reports a cose decode failure. One caused by the
+// envelope's bytes is also [ErrMalformedEnvelope]; one caused by reading them,
+// or by a caller error, keeps only its own classification.
+func envelopeDecodeError(err error) error {
+	for _, malformed := range []error{
+		cose.ErrMalformed, cose.ErrNotEncrypt, cose.ErrUnexpectedType,
+		cose.ErrDetachedPayload, cose.ErrNoRecipients, cose.ErrInvalidLabel,
+	} {
+		if errors.Is(err, malformed) {
+			return fmt.Errorf("%w: decoding envelope: %w", ErrMalformedEnvelope, err)
+		}
+	}
+	return fmt.Errorf("fee: decoding envelope: %w", err)
+}
+
+// checkDisjoint rejects a header pair that carries any label in both its
+// protected and unprotected maps. RFC 9052 §3 would let a reader prefer the
+// protected copy; refusing the overlap instead leaves every reader one value to
+// read.
+func checkDisjoint(h cose.Headers) error {
+	for label := range h.Protected {
+		if h.Unprotected.Has(label) {
+			return fmt.Errorf("%w: header %v is in both the protected and unprotected maps", ErrMalformedEnvelope, label)
+		}
+	}
+	return nil
+}
+
+// checkCrit processes a header pair's crit parameter (label 2, RFC 9052 §3.1):
+// it must be protected, it must be a non-empty array of labels, and every label
+// it names must be one the caller understands and must be present in the same
+// protected map. An envelope that marks a parameter critical which this
+// package cannot process is malformed rather than read with that parameter
+// ignored.
+func checkCrit(h cose.Headers, understood map[int64]bool) error {
+	if h.Unprotected.Has(cose.HeaderLabelCrit) {
+		return fmt.Errorf("%w: crit must be protected", ErrMalformedEnvelope)
+	}
+	v, ok := h.Protected.Get(cose.HeaderLabelCrit)
+	if !ok {
+		return nil
+	}
+	labels, ok := v.([]any)
+	if !ok || len(labels) == 0 {
+		return fmt.Errorf("%w: crit must be a non-empty array of labels", ErrMalformedEnvelope)
+	}
+	for _, l := range labels {
+		n, ok := l.(int64)
+		if !ok || !understood[n] {
+			return fmt.Errorf("%w: crit names header %v, which this package does not understand", ErrMalformedEnvelope, l)
+		}
+		if !h.Protected.Has(n) {
+			return fmt.Errorf("%w: crit names header %d, which the protected header does not carry", ErrMalformedEnvelope, n)
+		}
+	}
+	return nil
+}
 
 // Sentinel errors. Decrypt failures that originate in a sub-package are wrapped
 // rather than replaced, so errors.Is still matches the sub-package sentinel
@@ -129,10 +281,15 @@ var (
 	// recoverable; use EncryptWithCEK for a recipient-less (external-CEK) envelope.
 	ErrNoRecipients = errors.New("fee: at least one recipient is required")
 
-	// ErrNoMatchingRecipient means no recipient entry in the envelope carries a
-	// kid equal to the unwrapper's key id, so there is no wrapped CEK for this
-	// unwrapper to recover.
-	ErrNoMatchingRecipient = errors.New("fee: no envelope recipient matches the unwrapper's key id")
+	// ErrNoMatchingRecipient means no recipient in the envelope could be
+	// unwrapped with the unwrapper's keys: none was a candidate for any key, or
+	// every candidate failed the key-wrap integrity check, in which case the
+	// error also wraps aeskw.ErrIntegrity.
+	ErrNoMatchingRecipient = errors.New("fee: no envelope recipient could be unwrapped with the unwrapper's keys")
+
+	// ErrUnwrapAttemptLimit means Decrypt or DecryptRange gave up after
+	// MaxUnwrapAttempts failed recipient unwraps.
+	ErrUnwrapAttemptLimit = errors.New("fee: recipient unwrap attempt limit reached")
 
 	// ErrNoRecipientsInEnvelope means Decrypt was given a recipient-less
 	// COSE_Encrypt0 (tag 16) envelope; recover it with DecryptWithCEK instead.
@@ -142,33 +299,33 @@ var (
 	// or is not the FEE chunked AES-256-GCM-STREAM cipher.
 	ErrUnsupportedBodyAlg = errors.New("fee: unsupported body algorithm")
 
-	// ErrUnsupportedRecipientAlg means a matched recipient's key-wrap algorithm
-	// header does not match the unwrapper that was asked to recover it (e.g. an
-	// ECDH-ES unwrapper matched against an A256KW recipient).
-	ErrUnsupportedRecipientAlg = errors.New("fee: unsupported recipient key-wrap algorithm")
-
-	// ErrMalformedEnvelope means a required body header was missing or had the
-	// wrong type, or a declared parameter was out of range.
+	// ErrMalformedEnvelope means the envelope's bytes are not a valid FEE
+	// envelope: they do not decode as one (the error also wraps the cose
+	// sentinel, such as cose.ErrMalformed or cose.ErrUnexpectedType), a
+	// required body header was missing or had the wrong type, or a declared
+	// parameter was out of range. A failure to read the envelope from its
+	// source is not reported as ErrMalformedEnvelope.
 	ErrMalformedEnvelope = errors.New("fee: malformed FEE envelope")
 
 	// ErrNilUnwrapper means Decrypt was given a nil RecipientUnwrapper.
 	ErrNilUnwrapper = errors.New("fee: nil recipient unwrapper")
 
-	// ErrInvalidCEK means a caller-provided content-encryption key (see
-	// EncryptWithCEK / DecryptWithCEK) was not the required AES-256 key length.
-	ErrInvalidCEK = errors.New("fee: content-encryption key must be 32 bytes")
+	// ErrInvalidCEK means a content-encryption key, whether caller-provided (see
+	// EncryptWithCEK / DecryptWithCEK) or recovered by unwrapping a recipient,
+	// was not 32 bytes or was all zeros.
+	ErrInvalidCEK = errors.New("fee: content-encryption key must be 32 bytes and not all zeros")
 
-	// ErrContentLengthMismatch means the plaintext length declared via
-	// WithContentLength did not match the number of bytes actually read; it
-	// surfaces from the returned reader, and the envelope's chunk count (already
-	// written) is not to be trusted.
-	ErrContentLengthMismatch = errors.New("fee: plaintext length did not match the declared content length")
+	// ErrPlaintextLengthMismatch means the plaintext length declared via
+	// WithPlaintextLength did not match the number of bytes actually read; it
+	// surfaces from the returned reader, and the envelope's declared length
+	// (already written) is not to be trusted.
+	ErrPlaintextLengthMismatch = errors.New("fee: plaintext did not match the declared plaintext length")
 )
 
 // encryptConfig holds the resolved, optional Encrypt parameters.
 type encryptConfig struct {
-	chunkSize     int
-	contentLength int64 // < 0 means unknown (chunk count omitted)
+	chunkSize       int
+	plaintextLength int64 // < 0 means unknown (plaintext length omitted)
 }
 
 // EncryptOption configures [Encrypt] and [EncryptWithCEK].
@@ -182,19 +339,23 @@ func WithChunkSize(n int) EncryptOption {
 	return func(c *encryptConfig) { c.chunkSize = n }
 }
 
-// WithContentLength declares the total plaintext length in bytes. When set to a
-// non-negative value, the envelope records the chunk count (advisory metadata
-// that lets a range/seek consumer plan fetches from the header alone), and the
-// returned reader fails with [ErrContentLengthMismatch] if the plaintext turns
-// out to be a different length.
+// WithPlaintextLength declares the total plaintext length in bytes, such as
+// the Content-Length of an upload being encrypted. When set to a non-negative
+// value, the envelope records it in the protected header, which lets a reader
+// detect a truncated blob from its size alone, and the returned reader fails
+// with [ErrPlaintextLengthMismatch] if the plaintext turns out to be a
+// different length.
+//
+// n must be at most [MaxPlaintextLength]; a larger n fails the encrypt call
+// before any plaintext is read.
 //
 // A negative n is treated as "unknown", identical to not calling this option: a
 // caller propagating an unknown HTTP Content-Length as -1 gets the unset
-// behavior (no recorded chunk count, no mismatch check) rather than an error.
-// When unknown, the chunk count is omitted — the object still decrypts, and
-// range decryption derives the geometry from the ciphertext length instead.
-func WithContentLength(n int64) EncryptOption {
-	return func(c *encryptConfig) { c.contentLength = n }
+// behavior (no recorded length, no mismatch check) rather than an error. When
+// unknown, the length is omitted — the object still decrypts, and range
+// decryption derives the geometry from the ciphertext length alone.
+func WithPlaintextLength(n int64) EncryptOption {
+	return func(c *encryptConfig) { c.plaintextLength = n }
 }
 
 // Encrypt seals plaintext into a FEE envelope (a COSE_Encrypt, tag 96) addressed
@@ -207,8 +368,10 @@ func WithContentLength(n int64) EncryptOption {
 // O(chunk size) memory. The same CEK is wrapped to every recipient, so any one
 // of them can recover the object. recipients must be non-empty (the generated
 // CEK would otherwise be unrecoverable); a nil or invalid recipient is reported
-// before any plaintext is read. To seal under a CEK you already hold, or a
-// recipient-less envelope, use [EncryptWithCEK].
+// before any plaintext is read, as is an envelope larger than
+// [MaxEnvelopeSize] (cose.ErrTooLarge), which no decrypt path would accept. To
+// seal under a CEK you already hold, or a recipient-less envelope, use
+// [EncryptWithCEK].
 //
 // The plaintext is pulled through the body cipher as the returned reader is
 // read (no goroutine or pipe stands between them), and the reader implements
@@ -240,7 +403,7 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // EncryptWithCEK is [Encrypt] with a caller-provided content-encryption key
 // instead of a freshly generated one — for when the CEK is managed out of band
 // (derived deterministically, or issued by a custody service). cek must be 32
-// bytes (AES-256).
+// bytes (AES-256) and not all zeros, or the call fails with [ErrInvalidCEK].
 //
 // With one or more recipients it produces a COSE_Encrypt (tag 96) that also
 // carries the wrapped CEK; with no recipients it produces a recipient-less
@@ -294,7 +457,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		}
 	}
 
-	cfg := encryptConfig{chunkSize: aesstream.DefaultChunkSize, contentLength: -1}
+	cfg := encryptConfig{chunkSize: aesstream.DefaultChunkSize, plaintextLength: -1}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -308,27 +471,30 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		// sentinel aesstream.NewWriter would return for this size.
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
 	}
+	if cfg.plaintextLength > MaxPlaintextLength {
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: plaintext length %d exceeds MaxPlaintextLength (%d)", cfg.plaintextLength, int64(MaxPlaintextLength))
+	}
 
 	baseNonce, err := aesstream.NewBaseNonce()
 	if err != nil {
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: generating base nonce: %w", err)
 	}
 
-	// The body header is fixed before encryption: the algorithm and envelope
-	// type are protected (authenticated through the Enc_structure AAD); the base
-	// nonce, chunk size and (when the length is known) chunk count ride in the
-	// unprotected header.
-	unprotected := cose.Header{}.
+	// The body header is fixed before encryption, and every parameter in it is
+	// protected (authenticated through the Enc_structure AAD): the algorithm,
+	// envelope type, base nonce, chunk size and, when the length is known, the
+	// plaintext length. The unprotected header is empty.
+	protected := cose.Header{}.
+		Set(cose.HeaderLabelAlg, algChunkedAES256GCMStream).
+		Set(cose.HeaderLabelType, EnvelopeType).
 		Set(cose.HeaderLabelIV, baseNonce).
 		Set(labelChunkSize, int64(cfg.chunkSize))
-	if cfg.contentLength >= 0 {
-		unprotected.Set(labelChunkCount, int64(chunkCountFor(cfg.contentLength, int64(cfg.chunkSize))))
+	if cfg.plaintextLength >= 0 {
+		protected.Set(labelPlaintextLength, cfg.plaintextLength)
 	}
 	headers := cose.Headers{
-		Protected: cose.Header{}.
-			Set(cose.HeaderLabelAlg, algChunkedAES256GCMStream).
-			Set(cose.HeaderLabelType, EnvelopeType),
-		Unprotected: unprotected,
+		Protected:   protected,
+		Unprotected: cose.Header{},
 	}
 
 	// Wrap the CEK to each recipient (none → a recipient-less envelope). All the
@@ -358,6 +524,11 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	if err != nil {
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: encoding envelope: %w", err)
 	}
+	// An envelope no decrypt path would accept is refused here, before any
+	// plaintext is read.
+	if len(header) > MaxEnvelopeSize {
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: envelope is %d bytes, over the %d-byte limit: %w", len(header), MaxEnvelopeSize, cose.ErrTooLarge)
+	}
 
 	// Every fallible step above has succeeded, so the body cipher can be
 	// built; NewEncryptReader's own validation (key, base nonce, chunk size) is
@@ -365,8 +536,8 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	// is read: no goroutine, no pipe, and each sealed chunk reaches the consumer
 	// in one piece (see aesstream.EncryptReader).
 	src := plaintext
-	if cfg.contentLength >= 0 {
-		src = &lengthCheckedReader{r: plaintext, declared: cfg.contentLength}
+	if cfg.plaintextLength >= 0 {
+		src = &lengthCheckedReader{r: plaintext, declared: cfg.plaintextLength}
 	}
 	body, err := aesstream.NewEncryptReader(src, aesstream.Config{
 		Key:       cek,
@@ -384,30 +555,13 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	// were built from.
 	descriptor := BodyDescriptor{
 		HeaderLen: int64(len(header)),
-		BaseNonce: baseNonce,
-		ChunkSize: cfg.chunkSize,
 		AAD:       aad,
 	}.clone()
 	return &encryptReader{header: header, body: body}, descriptor, nil
 }
 
-// chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
-// produces at the given chunk size. Empty input is one (empty) final chunk.
-//
-// This is the producer's rule, matching the reference implementation, and it is
-// only for writing the chunk-count header. It is not a decoder's rule: a stream
-// whose plaintext is an exact multiple of the chunk size may legitimately carry
-// one more chunk than this (an empty final chunk), so a count read off the wire
-// is checked against [aesstream.ChunkCount] instead.
-func chunkCountFor(nPlain, chunkSize int64) int64 {
-	if nPlain <= 0 {
-		return 1
-	}
-	return (nPlain + chunkSize - 1) / chunkSize
-}
-
-// lengthCheckedReader enforces [WithContentLength]: it passes plaintext
-// through and turns the source's EOF into [ErrContentLengthMismatch] when the
+// lengthCheckedReader enforces [WithPlaintextLength]: it passes plaintext
+// through and turns the source's EOF into [ErrPlaintextLengthMismatch] when the
 // byte count differs from the declared length (and fails as soon as the
 // count exceeds it). The body cipher sees a read error, not EOF, so it never
 // seals the final chunk: the ciphertext produced so far is truncated and
@@ -423,10 +577,10 @@ func (l *lengthCheckedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	l.n += int64(n)
 	if l.n > l.declared {
-		return n, fmt.Errorf("%w: declared %d, got more", ErrContentLengthMismatch, l.declared)
+		return n, fmt.Errorf("%w: declared %d, got more", ErrPlaintextLengthMismatch, l.declared)
 	}
 	if err == io.EOF && l.n != l.declared {
-		return n, fmt.Errorf("%w: declared %d, got %d", ErrContentLengthMismatch, l.declared, l.n)
+		return n, fmt.Errorf("%w: declared %d, got %d", ErrPlaintextLengthMismatch, l.declared, l.n)
 	}
 	return n, err
 }
@@ -474,21 +628,25 @@ func (e *encryptReader) Close() error { return e.body.Close() }
 // Decrypt recovers the plaintext from a FEE COSE_Encrypt (tag 96) envelope read
 // from src.
 //
-// It decodes the envelope header from src (requiring the FEE typ), finds the
-// recipient whose kid matches unwrap's key id, recovers the CEK through unwrap,
-// and returns a streaming reader over the decrypted plaintext. Only the header
+// It decodes the envelope header from src (requiring the FEE typ), recovers
+// the CEK from a recipient with one of unwrap's keys (see [RecipientUnwrapper]
+// for the order they are tried in), and returns a streaming reader over the decrypted plaintext. Only the header
 // is read up front; the detached ciphertext is streamed from src on demand.
 //
 // Decryption is streaming: a non-EOF error from the returned reader (see
 // fee/aesstream) means the plaintext is incomplete and must be discarded. The
-// reader is an [*aesstream.Reader]; a caller that closes it once done lets its
-// chunk buffers be reused by the next stream.
+// reader also implements io.Closer; a caller that closes it once done, or on
+// abandoning a partial read, lets its chunk buffers be reused by the next
+// stream.
 //
 // If the envelope carries no recipients (a COSE_Encrypt0), Decrypt returns
-// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient kid matches
-// unwrap, it returns [ErrNoMatchingRecipient] without attempting an unwrap. If
-// the matched recipient's wrapped CEK cannot be recovered (e.g. the wrong key),
-// the unwrap error is returned and no plaintext reader is produced.
+// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. An envelope larger than
+// [MaxEnvelopeSize] fails with an error matching cose.ErrTooLarge after at most
+// that many bytes are read. If no recipient can be
+// unwrapped with unwrap's keys, it returns [ErrNoMatchingRecipient] (wrapping
+// aeskw.ErrIntegrity if a candidate was tried and failed), or
+// [ErrUnwrapAttemptLimit] after [MaxUnwrapAttempts] failures, and no plaintext
+// reader is produced.
 func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 	if src == nil {
 		return nil, errors.New("fee: nil envelope reader")
@@ -497,25 +655,29 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 		return nil, ErrNilUnwrapper
 	}
 
-	env, ciphertext, err := cose.DecodeReader(src, cose.WithExpectedType(EnvelopeType))
+	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
+		return nil, envelopeDecodeError(err)
 	}
 	if len(env.Recipients) == 0 {
 		return nil, ErrNoRecipientsInEnvelope
 	}
-
-	match, err := matchRecipient(env.Recipients, unwrap.keyID())
-	if err != nil {
+	// The whole envelope, every recipient included, is checked before any key
+	// is used.
+	if _, err := validateBodyParams(env); err != nil {
 		return nil, err
 	}
-	cek, err := unwrap.unwrap(match)
+
+	cek, err := recoverCEK(env.Recipients, unwrap)
 	if err != nil {
 		return nil, err
 	}
 	// The recovered CEK is ours; wipe it once openStream has copied it into the
 	// body cipher (synchronously, before it returns).
 	defer zero(cek)
+	if err := checkCEK(cek); err != nil {
+		return nil, err
+	}
 
 	return openStream(env, ciphertext, cek)
 }
@@ -524,7 +686,9 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 // instead of one recovered from an in-envelope recipient — for when the CEK was
 // obtained out of band (e.g. unwrapped by a custody service). It accepts either
 // a COSE_Encrypt (tag 96) or a recipient-less COSE_Encrypt0 (tag 16); any
-// recipients are ignored. cek must be 32 bytes (AES-256).
+// recipients are validated but not used. cek must be 32 bytes (AES-256) and
+// not all zeros, or the call fails with [ErrInvalidCEK]. The envelope is held
+// to the same rules as for Decrypt, [MaxEnvelopeSize] included.
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.
@@ -535,9 +699,9 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 	if err := checkCEK(cek); err != nil {
 		return nil, err
 	}
-	env, ciphertext, err := cose.DecodeReader(src, cose.WithExpectedType(EnvelopeType))
+	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
+		return nil, envelopeDecodeError(err)
 	}
 	return openStream(env, ciphertext, cek)
 }
@@ -560,7 +724,36 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 	if err != nil {
 		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
+	if body.plaintextLength >= 0 {
+		return &declaredLengthReader{r: r, declared: body.plaintextLength}, nil
+	}
 	return r, nil
+}
+
+// declaredLengthReader holds a whole-object read to the envelope's declared
+// plaintext length, so it accepts exactly the blobs the range path does: a
+// stream that authenticates to its end but yields a different length fails
+// with [ErrSizeMismatch] instead of a clean EOF.
+type declaredLengthReader struct {
+	r        *aesstream.Reader
+	declared int64
+	n        int64
+}
+
+// Close releases the underlying reader's chunk buffers (see
+// aesstream.Reader.Close).
+func (d *declaredLengthReader) Close() error { return d.r.Close() }
+
+func (d *declaredLengthReader) Read(p []byte) (int, error) {
+	n, err := d.r.Read(p)
+	d.n += int64(n)
+	if d.n > d.declared {
+		return n, fmt.Errorf("%w: envelope declares %d plaintext bytes, the stream holds more", ErrSizeMismatch, d.declared)
+	}
+	if err == io.EOF && d.n != d.declared {
+		return n, fmt.Errorf("%w: envelope declares %d plaintext bytes, the stream holds %d", ErrSizeMismatch, d.declared, d.n)
+	}
+	return n, err
 }
 
 // bodyParams is the validated STREAM configuration a FEE envelope's body header
@@ -577,6 +770,9 @@ func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader
 type bodyParams struct {
 	baseNonce []byte
 	chunkSize int
+	// plaintextLength is the declared plaintext length, or -1 when the
+	// envelope does not declare one.
+	plaintextLength int64
 }
 
 // streamConfig returns the fee/aesstream configuration for decrypting a body
@@ -593,15 +789,49 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 	}
 }
 
-// validateBodyParams checks a decoded envelope's FEE body headers — the
+// validateBodyParams checks a decoded envelope's headers — every recipient is
+// well formed (see [validateRecipient]), no body label is in both buckets,
+// every integer is within ±(2^53 - 1), every FEE parameter is protected, the
 // algorithm is the chunked AES-256-GCM-STREAM cipher, the base nonce (iv) is
-// present, and the self-describing chunk size is in range.
+// present and 7 bytes, the chunk size is present and in range, content_type
+// and app_metadata have the types the wire format allows, and a declared
+// plaintext length is from 0 to [MaxPlaintextLength].
 //
 // It is shared by the whole-object path's AAD-building resolution
 // ([buildBodyParamsWithAAD]) and the header-only sizing path ([PlaintextSize]),
 // so both accept exactly the same envelopes and report the same errors for a
 // body header they cannot honour.
 func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
+	if err := checkCrit(env.Headers, bodyUnderstoodLabels); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkDisjoint(env.Headers); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkSafeIntegers(env.Headers.Protected, "protected"); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkSafeIntegers(env.Headers.Unprotected, "unprotected"); err != nil {
+		return bodyParams{}, err
+	}
+	if err := validateRecipients(env.Recipients); err != nil {
+		return bodyParams{}, err
+	}
+	// The nonce is the iv, never rebuilt from a Partial IV, so a Partial IV in
+	// either bucket would be a second, conflicting instruction for it.
+	if env.Headers.Protected.Has(cose.HeaderLabelPartialIV) || env.Headers.Unprotected.Has(cose.HeaderLabelPartialIV) {
+		return bodyParams{}, fmt.Errorf("%w: Partial IV is not supported", ErrMalformedEnvelope)
+	}
+
+	// Every FEE parameter belongs in the protected header, where the AAD
+	// authenticates it. A copy in the unprotected header would be
+	// unauthenticated and ambiguous, so it makes the envelope malformed.
+	for _, label := range bodyContentLabels {
+		if env.Headers.Unprotected.Has(label) {
+			return bodyParams{}, fmt.Errorf("%w: header %d must be protected", ErrMalformedEnvelope, label)
+		}
+	}
+
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: body algorithm header missing or not an integer", ErrUnsupportedBodyAlg)
@@ -610,29 +840,69 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 		return bodyParams{}, fmt.Errorf("%w: body algorithm %d is not chunked AES-256-GCM-STREAM", ErrUnsupportedBodyAlg, alg)
 	}
 
-	baseNonce, ok := env.Headers.Unprotected.Bytes(cose.HeaderLabelIV)
+	baseNonce, ok := env.Headers.Protected.Bytes(cose.HeaderLabelIV)
 	if !ok {
 		return bodyParams{}, fmt.Errorf("%w: missing iv (base nonce)", ErrMalformedEnvelope)
 	}
+	// Checked here rather than left to the cipher, so the header-only sizing
+	// path refuses the same envelopes as the decrypting ones.
+	if len(baseNonce) != aesstream.BaseNonceSize {
+		return bodyParams{}, fmt.Errorf("%w: iv (base nonce) is %d bytes, want %d", ErrMalformedEnvelope, len(baseNonce), aesstream.BaseNonceSize)
+	}
 
-	// Self-describing chunk size; an envelope that omits it is read at the FEE
-	// default, but a header present with a non-integer value is a malformed
-	// envelope rather than a silent fallback. (The chunk count, when present, is
-	// advisory and not needed to decrypt.)
-	chunkSize := int64(aesstream.DefaultChunkSize)
-	if env.Headers.Unprotected.Has(labelChunkSize) {
-		n, ok := env.Headers.Unprotected.Int(labelChunkSize)
-		if !ok {
-			return bodyParams{}, fmt.Errorf("%w: chunk-size header is present but not an integer", ErrMalformedEnvelope)
+	// content_type is informational and otherwise ignored, but its type is
+	// part of the wire format: a text string or a non-negative integer. It
+	// may be in either bucket, and checkDisjoint has ensured it is in at most
+	// one.
+	contentType, ok := env.Headers.Protected.Get(cose.HeaderLabelContentType)
+	if !ok {
+		contentType, ok = env.Headers.Unprotected.Get(cose.HeaderLabelContentType)
+	}
+	if ok {
+		switch ct := contentType.(type) {
+		case string:
+		case int64:
+			if ct < 0 {
+				return bodyParams{}, fmt.Errorf("%w: content_type %d is negative", ErrMalformedEnvelope, ct)
+			}
+		default:
+			return bodyParams{}, fmt.Errorf("%w: content_type is neither a text string nor a non-negative integer", ErrMalformedEnvelope)
 		}
-		chunkSize = n
+	}
+
+	chunkSize, ok := env.Headers.Protected.Int(labelChunkSize)
+	if !ok {
+		return bodyParams{}, fmt.Errorf("%w: chunk-size header missing or not an integer", ErrMalformedEnvelope)
 	}
 	if chunkSize < int64(aesstream.MinChunkSize) || chunkSize > int64(aesstream.MaxChunkSize) {
 		return bodyParams{}, fmt.Errorf("%w: declared chunk size %d out of range [%d, %d]",
 			ErrMalformedEnvelope, chunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
 	}
 
-	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize)}, nil
+	// app_metadata is carried authenticated and otherwise ignored, but its shape
+	// is part of the wire format: a map with text-string keys.
+	if v, ok := env.Headers.Protected.Get(labelAppMetadata); ok {
+		m, ok := v.(map[any]any)
+		if !ok {
+			return bodyParams{}, fmt.Errorf("%w: app_metadata is not a map", ErrMalformedEnvelope)
+		}
+		for k := range m {
+			if _, ok := k.(string); !ok {
+				return bodyParams{}, fmt.Errorf("%w: app_metadata key %v is not a text string", ErrMalformedEnvelope, k)
+			}
+		}
+	}
+
+	plaintextLength := int64(-1)
+	if env.Headers.Protected.Has(labelPlaintextLength) {
+		n, ok := env.Headers.Protected.Int(labelPlaintextLength)
+		if !ok || n < 0 || n > MaxPlaintextLength {
+			return bodyParams{}, fmt.Errorf("%w: plaintext-length header is not an integer from 0 to %d", ErrMalformedEnvelope, int64(MaxPlaintextLength))
+		}
+		plaintextLength = n
+	}
+
+	return bodyParams{baseNonce: baseNonce, chunkSize: int(chunkSize), plaintextLength: plaintextLength}, nil
 }
 
 // buildBodyParamsWithAAD validates the body headers and rebuilds the
@@ -654,29 +924,20 @@ func buildBodyParamsWithAAD(env *cose.Envelope) (bodyParams, []byte, error) {
 	return body, aad, nil
 }
 
-// checkCEK reports whether a caller-provided content-encryption key is the right
-// length for the FEE body cipher. It is the one spelling of the check every
-// external-CEK entry point applies, so they all report ErrInvalidCEK the same way.
+// checkCEK reports whether a content-encryption key is usable by the FEE body
+// cipher: exactly 32 bytes and not all zeros. It is the one spelling of the
+// check every entry point applies, to caller-provided keys and to keys
+// recovered by unwrapping alike, so they all report ErrInvalidCEK the same way.
 func checkCEK(cek []byte) error {
 	if len(cek) != aesstream.KeySize {
-		return fmt.Errorf("%w, got %d", ErrInvalidCEK, len(cek))
+		return fmt.Errorf("%w, got %d bytes", ErrInvalidCEK, len(cek))
 	}
-	return nil
-}
-
-// matchRecipient returns the first recipient whose kid equals want. A recipient
-// without a kid header never matches. An empty want, or no match, yields
-// ErrNoMatchingRecipient.
-func matchRecipient(recipients []*cose.Recipient, want []byte) (*cose.Recipient, error) {
-	if len(want) == 0 {
-		return nil, ErrNoMatchingRecipient
-	}
-	for _, r := range recipients {
-		if kid, ok := r.Headers.Unprotected.Bytes(cose.HeaderLabelKID); ok && bytes.Equal(kid, want) {
-			return r, nil
+	for _, b := range cek {
+		if b != 0 {
+			return nil
 		}
 	}
-	return nil, ErrNoMatchingRecipient
+	return fmt.Errorf("%w, got an all-zero key", ErrInvalidCEK)
 }
 
 // zero overwrites b, a best-effort wipe of the CEK once it has been copied into
