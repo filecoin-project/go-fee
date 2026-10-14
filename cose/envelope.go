@@ -171,7 +171,7 @@ func (h Headers) ProtectedBytes() ([]byte, error) {
 // protected header the AAD authenticates.
 func ParseEncStructure(data []byte) (context string, protected Header, externalAAD []byte, err error) {
 	if err := checkStrictEncoding(data, false); err != nil {
-		return "", nil, nil, fmt.Errorf("Enc_structure: %w", err)
+		return "", nil, nil, fmt.Errorf("cose: Enc_structure: %w", err)
 	}
 	var arr []cbor.RawMessage
 	if err := decMode.Unmarshal(data, &arr); err != nil {
@@ -196,11 +196,11 @@ func ParseEncStructure(data []byte) (context string, protected Header, externalA
 	// The Enc_structure has no unprotected header, so an empty map stands in.
 	headers, err := decodeHeaders(arr[1], []byte{0xa0})
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("Enc_structure: %w", err)
+		return "", nil, nil, fmt.Errorf("cose: Enc_structure: %w", err)
 	}
 	if len(headers.RawProtected) > 0 {
 		if err := checkStrictEncoding(headers.RawProtected, false); err != nil {
-			return "", nil, nil, fmt.Errorf("Enc_structure protected header: %w", err)
+			return "", nil, nil, fmt.Errorf("cose: Enc_structure protected header: %w", err)
 		}
 	}
 	return context, headers.Protected, externalAAD, nil
