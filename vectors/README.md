@@ -25,6 +25,8 @@ plaintext length at `-65789`, and one encoding per plaintext length (see
 | `empty-file-go` | Go seals → TS decrypts | tag 16 |
 | `empty-file-ts` | TS seals → Go decrypts | tag 16 |
 | `exact-multiple-go` | Go seals → TS decrypts (plaintext is exactly 3 chunks) | tag 16 |
+| `kidless-recipient-go` | Go seals → TS decrypts, and unwraps an A256KW recipient that has no kid | tag 96 |
+| `kidless-recipient-ts` | TS seals → Go decrypts, and unwraps an A256KW recipient that has no kid | tag 96 |
 
 Four framing cases are covered: a single chunk, a final partial chunk (the
 multi-chunk fixtures end mid-chunk), the empty file, and a full final chunk
@@ -40,12 +42,15 @@ Both directions are exercised:
 
 - **Go decrypts every fixture** — `go test ./vectors` (`TestVectors`), both
   through this package's own decoder and through `fee.DecryptWithCEK`. For the
-  tag-96 fixture it also *unwraps* each recipient's CEK (ECDH-ES+A256KW over
-  X25519, and A256KW) and checks it equals the shared CEK.
+  tag-96 fixtures it also *unwraps* each recipient's CEK (ECDH-ES+A256KW over
+  X25519, and A256KW) and checks it equals the shared CEK, and decrypts each
+  A256KW recipient through `fee.Decrypt`, with a key that has its kid and with
+  one that has none.
 - **The TypeScript reference reads every fixture** — `pull-synapse-fee.sh`
   drives the pinned reference to decrypt each `blob.bin` whole from the CEK in
   `meta.json`, decrypt a range from the middle of it, and unwrap the CEK from
-  each A256KW recipient; it also (re)generates the TS-produced fixtures. The
+  each A256KW recipient, with a key that has its kid and with one that has
+  none; it also (re)generates the TS-produced fixtures. The
   reference has no ECDH-ES unwrap, so that recipient is checked on the Go side
   only.
 
@@ -60,8 +65,8 @@ envelope    = 16([ protected, unprotected, null ])              # no recipients
 protected   = { 1: -65793, 16: "application/vnd.filecoin-encryption+cose",
                 5: baseNonce(7B), -1: chunkSize, ? -65789: plaintextLength }
 unprotected = { }
-recipient   = [ h'',        { 1: -5, 4: kid }, wrappedKey ]               # A256KW
-            | [ { 1: -31 }, { 4: kid, -1: ephemeralKey }, wrappedKey ]    # ECDH-ES+A256KW
+recipient   = [ h'',        { 1: -5, ? 4: kid }, wrappedKey ]             # A256KW
+            | [ { 1: -31 }, { ? 4: kid, -1: ephemeralKey }, wrappedKey ]  # ECDH-ES+A256KW
 ```
 
 - **Body cipher** — chunked AES-256-GCM-STREAM, alg `-65793`. Per-chunk nonce is
@@ -91,10 +96,11 @@ run deterministic decrypt/unwrap). To recreate them:
 
 ```bash
 # Go-produced fixtures (single-chunk-go, multi-chunk-go, empty-file-go,
-# multi-recipient-go):
+# exact-multiple-go, multi-recipient-go, kidless-recipient-go):
 FEE_VECTORS_REGEN=1 go test ./vectors -run TestGenerate -v
 
-# Missing TS-produced fixtures (multi-chunk-ts, empty-file-ts) + verify every
+# Missing TS-produced fixtures (multi-chunk-ts, empty-file-ts,
+# kidless-recipient-ts) + verify every
 # fixture under the pinned TypeScript reference:
 ./vectors/pull-synapse-fee.sh
 ```

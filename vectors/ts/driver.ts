@@ -8,14 +8,16 @@
 //   node driver.ts [generate|verify|all]   (default: all)
 //
 // generate — encrypt with the reference and write the TS-produced fixtures
-//            (`multi-chunk-ts`, `empty-file-ts`: TS seals, Go decrypts). A
+//            (`multi-chunk-ts`, `empty-file-ts`, `kidless-recipient-ts`: TS
+//            seals, Go decrypts). A
 //            fixture that already exists on disk is left alone unless
 //            FEE_VECTORS_REGEN=1 is set: the reference draws a random base nonce
 //            per encrypt, so regenerating rewrites a committed blob.
 // verify   — for every committed fixture, decrypt the whole object from the CEK,
 //            decrypt a range from the CEK, and unwrap the CEK from each A256KW
-//            recipient, checking the recovered plaintext each time (TS reads
-//            the Go-sealed blobs). Exits non-zero on any mismatch.
+//            recipient with a key that has its kid and with one that has none,
+//            checking the recovered plaintext each time (TS reads the
+//            Go-sealed blobs). Exits non-zero on any mismatch.
 import * as fee from './vendor/filecoin-encryption-envelope/src/index.ts'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -27,6 +29,7 @@ const TESTDATA = join(HERE, '..', 'testdata')
 // Must match the Go side (fee/vectors/helpers_test.go) and FIP-1253.
 const FEE_TYP = 'application/vnd.filecoin-encryption+cose'
 const ALG_CHUNKED = -65793
+const ALG_A256KW = -5
 const CHUNK_SIZE = 4096
 
 function sha256(label: string, n = 32): Uint8Array {
@@ -63,8 +66,15 @@ const collect = async (stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
 // The TS-produced fixtures. Each carries its own CEK label: no two fixtures may
 // share a CEK, since several are single-chunk and a shared CEK would give them
 // identical chunk-0 nonces (baseNonce ‖ 0 ‖ lastFlag) over different plaintexts.
-// The Go side documents the same rule on testCEK (../helpers_test.go).
-const TS_FIXTURES = [
+// The Go side documents the same rule on testCEK (../helpers_test.go). A
+// fixture with a kekLabel gets one A256KW recipient without a kid (tag 96).
+const TS_FIXTURES: {
+  name: string
+  cekLabel: string
+  kekLabel?: string
+  description: string
+  plaintext: () => Uint8Array
+}[] = [
   {
     name: 'multi-chunk-ts',
     cekLabel: 'fil-473-fee-cek-ts-v1',
@@ -78,6 +88,14 @@ const TS_FIXTURES = [
     description:
       'Empty plaintext encrypted in filecoin-encryption-envelope (TS) (one empty final chunk, tag-only body); decrypts in Go.',
     plaintext: () => new Uint8Array(0),
+  },
+  {
+    name: 'kidless-recipient-ts',
+    cekLabel: 'fee-cek-ts-kidless-v1',
+    kekLabel: 'fee-kek-ts-kidless-v1',
+    description:
+      'A256KW recipient without a kid, encrypted in filecoin-encryption-envelope (TS); Go unwraps it by trying its key.',
+    plaintext: () => new TextEncoder().encode('FEE cross-impl vector: an A256KW recipient with no kid, sealed in TS.\n'),
   },
 ]
 
@@ -98,10 +116,16 @@ async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> 
   }
 
   const cek = sha256(fixture.cekLabel)
+  const kek = fixture.kekLabel === undefined ? undefined : sha256(fixture.kekLabel)
   const plaintext = fixture.plaintext()
   const blob = await through(
     plaintext,
-    fee.encrypt({ cek: new Uint8Array(cek), chunkSize: CHUNK_SIZE, contentLength: plaintext.length }),
+    fee.encrypt({
+      cek: new Uint8Array(cek),
+      chunkSize: CHUNK_SIZE,
+      contentLength: plaintext.length,
+      ...(kek === undefined ? {} : { recipients: [{ alg: ALG_A256KW, kek: new Uint8Array(kek) }] }),
+    }),
   )
   const info = await fee.parse(blob)
   if (info.scheme !== 'chunked') throw new Error(`${name}: expected a chunked envelope, got ${info.scheme}`)
@@ -117,12 +141,15 @@ async function generateTS(fixture: (typeof TS_FIXTURES)[number]): Promise<void> 
         name,
         producer: 'ts',
         description,
-        tag: 16,
+        tag: kek === undefined ? 16 : 96,
         algorithm: ALG_CHUNKED,
         typ: FEE_TYP,
         chunk_size: info.params.chunkSize,
         chunk_count: chunkCount,
         cek_hex: toHex(cek),
+        ...(kek === undefined
+          ? {}
+          : { recipients: [{ algorithm: ALG_A256KW, kind: 'a256kw', a256kw_kek_hex: toHex(kek) }] }),
       },
       null,
       2,
@@ -154,9 +181,16 @@ async function verifyFixture(meta: any, blob: Uint8Array, expected: Uint8Array):
 
   for (const r of meta.recipients ?? []) {
     if (r.kind !== 'a256kw') continue
-    const unwrapper = await fee.recipients.createA256KWUnwrapper([{ kek: fromHex(r.a256kw_kek_hex), kid: fromHex(r.kid_hex) }])
-    const got = await through(blob, fee.decryptWith(unwrapper))
-    if (!equal(got, expected)) failures.push('plaintext via the A256KW recipient does not match')
+    // A key with the recipient's kid (if it has one), then a key with none,
+    // which the reference tries against every A256KW recipient.
+    const kek = fromHex(r.a256kw_kek_hex)
+    const keys = r.kid_hex === undefined ? [{ kek }] : [{ kek, kid: fromHex(r.kid_hex) }, { kek }]
+    for (const key of keys) {
+      const unwrapper = await fee.recipients.createA256KWUnwrapper([key])
+      const got = await through(blob, fee.decryptWith(unwrapper))
+      const which = key.kid === undefined ? 'a key without a kid' : 'a key with its kid'
+      if (!equal(got, expected)) failures.push(`plaintext via the A256KW recipient, with ${which}, does not match`)
+    }
   }
   return failures
 }

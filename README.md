@@ -124,8 +124,8 @@ func main() {
 ### Multiple recipients, mixed algorithms
 
 The same CEK is wrapped to every recipient, so any one of them can recover the
-object. Wrap algorithms may be mixed in one envelope; on decrypt the recipient
-is selected by kid and the algorithm comes from its COSE header — the caller
+object. Wrap algorithms may be mixed in one envelope; on decrypt a recipient is
+found by its kid and the algorithm comes from its COSE header — the caller
 never chooses it.
 
 ```go
@@ -152,6 +152,34 @@ func decryptWithKEK(blob, kek []byte) ([]byte, error) {
     return io.ReadAll(r)
 }
 ```
+
+### Recipients without a kid
+
+A kid is optional. Pass `nil` and the recipient is written without one; a
+decryptor then finds it by trying its keys, since a wrong key fails the
+key-wrap integrity check. An unwrapper built with a `nil` kid is likewise tried
+against every recipient of its algorithm. To try several keys in one decrypt,
+combine them with `MultiUnwrapper`:
+
+```go
+func decryptWithAnyKEK(blob []byte, keks [][]byte) ([]byte, error) {
+    var keys []fee.RecipientUnwrapper
+    for _, kek := range keks {
+        keys = append(keys, fee.NewA256KWUnwrapper(nil, kek))
+    }
+    r, err := fee.Decrypt(bytes.NewReader(blob), fee.MultiUnwrapper(keys...))
+    if err != nil {
+        return nil, err
+    }
+    return io.ReadAll(r)
+}
+```
+
+A recipient with a kid is tried first with the keys that share it, then with
+the keys that have none, and never with a key whose kid differs. A recipient
+without a kid is tried with every key, in order. One decrypt attempts at most
+`MaxUnwrapAttempts` (64) unwraps, so pass a kid wherever a decryptor may hold
+more than one key.
 
 ### Streaming
 
@@ -438,8 +466,8 @@ protected   = { 1: -65793, 16: "application/vnd.filecoin-encryption+cose",
                 5: baseNonce(7B), -1: chunkSize,
                 ? -65789: plaintextLength, ? -65792: appMetadata }
 unprotected = { }
-recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
-            | [ { 1: -31 },   { 4: kid, -1: ephemeralKey }, wrappedKey ]  # ECDH-ES+A256KW
+recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
+            | [ { 1: -31 },   { ? 4: kid, -1: ephemeralKey }, wrappedKey ]  # ECDH-ES+A256KW
 ```
 
 - **Body cipher** — chunked AES-256-GCM-STREAM (private-use COSE algorithm
@@ -477,8 +505,10 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
   limited to 256 levels and duplicate labels are rejected. `crit` must
   be protected and may name only parameters this package processes that are
   present in the same protected header, never `crit` itself. A Partial IV
-  in either content bucket is rejected. Unknown non-critical parameters are
-  ignored.
+  in either content bucket is rejected, as is any label in both the protected
+  and unprotected header, for the body and for each recipient. Every recipient
+  is checked when the envelope is read, whether or not it is used. Unknown
+  non-critical parameters are ignored.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
@@ -500,9 +530,12 @@ recipient   = [ h'',          { 1: -5, 4: kid }, wrappedKey ]   # A256KW
 - **CEK uniqueness.** `Encrypt` generates a fresh CEK per envelope. With
   `EncryptWithCEK`, reusing a CEK across envelopes erodes the 7-byte base
   nonce's birthday bound (see above).
-- **Recipient matching is exact.** `Decrypt` selects the recipient whose kid
-  byte-for-byte equals the unwrapper's key id; no unwrap is attempted
-  otherwise.
+- **Recipient matching.** A key is tried only against recipients of its own
+  algorithm whose kid, in either header bucket, byte-for-byte equals its own,
+  or where the key or the recipient has no kid. A wrong key fails the AES key
+  wrap integrity check, so trying one is safe, and one decrypt tries at most
+  `MaxUnwrapAttempts` keys. The recipient array is not authenticated by the
+  body, so anyone can add recipients; this bounds the work they can cause.
 - **Envelope type pinning.** Encrypt writes, and Decrypt requires, the COSE
   `typ` `application/vnd.filecoin-encryption+cose`, so non-FEE blobs are rejected
   before any key material is touched.

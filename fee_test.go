@@ -411,7 +411,8 @@ func TestEncryptReaderCloseReleases(t *testing.T) {
 
 // TestDecryptKidMismatch covers the explicit acceptance criterion: an unwrapper
 // whose key id matches no recipient yields ErrNoMatchingRecipient rather than a
-// panic or a silent failure. It checks both recipient kinds.
+// panic or a silent failure, without trying the key. It checks both recipient
+// kinds.
 func TestDecryptKidMismatch(t *testing.T) {
 	plaintext := patternBytes(5000)
 
@@ -436,15 +437,18 @@ func TestDecryptKidMismatch(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		// The KEK is right, but a key with a different kid is never tried.
 		r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper([]byte("kid-b"), kek))
 		require.Nil(t, r)
 		require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+		require.NotErrorIs(t, err, aeskw.ErrIntegrity)
 	})
 }
 
 // TestDecryptWrongECDHKey confirms that when the kid matches but the private key
-// is wrong, the ECDH-ES unwrap fails with the AES-KW integrity error and no
-// plaintext reader is produced — decryption is never reached.
+// is wrong, the ECDH-ES unwrap fails the AES-KW integrity check, so no
+// recipient can be unwrapped, and no plaintext reader is produced — decryption
+// is never reached.
 func TestDecryptWrongECDHKey(t *testing.T) {
 	key := newX25519Key(t)
 	blob, err := encrypt(t, patternBytes(9000),
@@ -458,13 +462,14 @@ func TestDecryptWrongECDHKey(t *testing.T) {
 	wrong := newX25519Key(t)
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewECDHESUnwrapper(ecdhKID, wrong))
 	require.Nil(t, r)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity)
 	require.NotErrorIs(t, err, aesstream.ErrCorrupted, "STREAM decryption must not be attempted")
 }
 
 // TestDecryptWrongA256KWKEK confirms that when the kid matches but the KEK is
-// wrong, the unwrap fails with the AES-KW integrity error and no plaintext
-// reader is produced — decryption is never reached.
+// wrong, the unwrap fails the AES-KW integrity check, so no recipient can be
+// unwrapped, and no plaintext reader is produced — decryption is never reached.
 func TestDecryptWrongA256KWKEK(t *testing.T) {
 	blob, err := encrypt(t, patternBytes(9000),
 		[]fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))},
@@ -474,14 +479,14 @@ func TestDecryptWrongA256KWKEK(t *testing.T) {
 
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
 	require.Nil(t, r)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
 	require.ErrorIs(t, err, aeskw.ErrIntegrity)
 	require.NotErrorIs(t, err, aesstream.ErrCorrupted, "STREAM decryption must not be attempted")
 }
 
-// TestDecryptAlgMismatch confirms the unwrapper rejects a matched recipient whose
-// key-wrap algorithm is not the one it handles. An A256KW unwrapper is pointed at
-// an ECDH-ES recipient by reusing its kid, so the entry matches by kid but
-// carries ECDH-ES+A256KW, not A256KW.
+// TestDecryptAlgMismatch confirms a key is never tried against a recipient of
+// another key-wrap algorithm. An A256KW unwrapper is pointed at an ECDH-ES
+// recipient by reusing its kid, so the kids match but the algorithms do not.
 func TestDecryptAlgMismatch(t *testing.T) {
 	key := newX25519Key(t)
 	blob, err := encrypt(t, patternBytes(5000),
@@ -493,7 +498,8 @@ func TestDecryptAlgMismatch(t *testing.T) {
 	// Same kid as the ECDH-ES entry, but an A256KW unwrapper.
 	r, err := fee.Decrypt(bytes.NewReader(blob), fee.NewA256KWUnwrapper(ecdhKID, newKEK(t)))
 	require.Nil(t, r)
-	require.ErrorIs(t, err, fee.ErrUnsupportedRecipientAlg)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+	require.NotErrorIs(t, err, aeskw.ErrIntegrity)
 }
 
 // TestDecryptCorruptedProtectedHeader confirms that flipping a byte in the
@@ -812,20 +818,9 @@ func TestDecryptStreamsIncrementally(t *testing.T) {
 // TestEncryptInvalidRecipient confirms a malformed recipient is rejected up
 // front (before the plaintext is sealed), not deep inside the wrap step.
 func TestEncryptInvalidRecipient(t *testing.T) {
-	key := newX25519Key(t)
 	t.Run("ECDH-ES nil public key", func(t *testing.T) {
 		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, nil)})
-		require.Error(t, err)
-	})
-	t.Run("ECDH-ES empty kid", func(t *testing.T) {
-		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
-			[]fee.Recipient{fee.NewECDHESRecipient(nil, key.PublicKey())})
-		require.Error(t, err)
-	})
-	t.Run("A256KW empty kid", func(t *testing.T) {
-		_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)),
-			[]fee.Recipient{fee.NewA256KWRecipient(nil, newKEK(t))})
 		require.Error(t, err)
 	})
 	t.Run("A256KW wrong KEK length", func(t *testing.T) {
@@ -1338,4 +1333,243 @@ func TestAppMetadataNesting(t *testing.T) {
 	blob = sealEnvelope(t, bodyHeader().Set(labelAppMetadata, map[any]any{"x": nested(300)}), plaintext, cek)
 	_, err = fee.DecryptWithCEK(bytes.NewReader(blob), cek)
 	require.ErrorIs(t, err, cose.ErrMalformed, "300 levels are refused")
+}
+
+// TestDecryptRejectsBodyLabelOverlap: no label may appear in both the body's
+// protected and unprotected headers, including ones FEE does not define.
+func TestDecryptRejectsBodyLabelOverlap(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	for name, label := range map[string]any{
+		"content_type":  cose.HeaderLabelContentType,
+		"unknown label": int64(99),
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob := sealEnvelope(t, bodyHeader().Set(label, "x"), plaintext, cek)
+			blob = withUnprotected(t, blob, label, "y")
+			_, err := fee.DecryptWithCEK(bytes.NewReader(blob), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+		})
+	}
+}
+
+// TestDecryptValidatesEveryRecipient: a malformed recipient fails the whole
+// envelope on every path, even when the recipient the caller uses is sound and
+// even when no recipient is used at all.
+func TestDecryptValidatesEveryRecipient(t *testing.T) {
+	kek1, kek2 := newKEK(t), newKEK(t)
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{
+		fee.NewA256KWRecipient([]byte("kek-1"), kek1),
+		fee.NewA256KWRecipient([]byte("kek-2"), kek2),
+	})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	for name, mutate := range map[string]func(*cose.Recipient){
+		"short A256KW wrapped key": func(r *cose.Recipient) { r.Ciphertext = r.Ciphertext[:39] },
+		"no algorithm":             func(r *cose.Recipient) { delete(r.Headers.Unprotected, cose.HeaderLabelAlg) },
+		"kid not a byte string":    func(r *cose.Recipient) { r.Headers.Unprotected.Set(cose.HeaderLabelKID, "kek-2") },
+		"ECDH-ES recipient without an ephemeral key": func(r *cose.Recipient) {
+			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+			r.Headers.RawProtected = nil
+		},
+		"kid in both buckets": func(r *cose.Recipient) {
+			// A256KW must keep its protected header empty, so this second
+			// recipient becomes an unknown algorithm to carry a protected kid.
+			r.Headers.Unprotected.Set(cose.HeaderLabelAlg, int64(-65536))
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelKID, []byte("kek-2"))
+			r.Headers.RawProtected = nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, ciphertext, err := cose.Decode(blob)
+			require.NoError(t, err)
+			mutate(env.Recipients[1])
+			header, err := env.Encode()
+			require.NoError(t, err)
+			bad := append(header, ciphertext...)
+
+			_, err = fee.Decrypt(bytes.NewReader(bad), fee.NewA256KWUnwrapper([]byte("kek-1"), kek1))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt with the sound recipient")
+			_, err = fee.DecryptWithCEK(bytes.NewReader(bad), cek)
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+			_, err = fee.PlaintextSize(bytes.NewReader(bad), int64(len(bad)))
+			require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize")
+		})
+	}
+}
+
+// TestDecryptMatchesProtectedKID: a recipient's kid is read from the protected
+// header as well as the unprotected one. The ECDH-ES recipient here was wrapped
+// with its kid protected, since the protected header feeds the key derivation.
+func TestDecryptMatchesProtectedKID(t *testing.T) {
+	key := newX25519Key(t)
+	cek, plaintext := newCEK(t), patternBytes(100)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, []fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	protected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW).Set(cose.HeaderLabelKID, ecdhKID)
+	protectedBytes, err := cose.Headers{Protected: protected}.ProtectedBytes()
+	require.NoError(t, err)
+	w, err := ecdhkw.Wrap(key.PublicKey(), cek, protectedBytes)
+	require.NoError(t, err)
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Recipients[0] = &cose.Recipient{
+		Headers: cose.Headers{
+			Protected: protected,
+			Unprotected: cose.Header{}.Set(cose.HeaderLabelEphemeralKey, map[any]any{
+				coseKeyKty: coseKtyOKP, coseKeyCrv: coseCrvX25519, coseKeyX: w.EphemeralPublicKey.Bytes(),
+			}),
+		},
+		Ciphertext: w.WrappedCEK,
+	}
+	header, err := env.Encode()
+	require.NoError(t, err)
+
+	require.Equal(t, plaintext, decryptAll(t, append(header, ciphertext...), fee.NewECDHESUnwrapper(ecdhKID, key)))
+}
+
+// TestKidlessRecipients: a recipient written without a kid leaves the label
+// out, and is unwrapped by trying keys: a key with a kid and a key without one
+// both recover it, through Decrypt and DecryptRange alike.
+func TestKidlessRecipients(t *testing.T) {
+	plaintext := patternBytes(3*aesstream.MinChunkSize + 7)
+	priv, kek := newX25519Key(t), newKEK(t)
+
+	for name, tc := range map[string]struct {
+		recipient fee.Recipient
+		keyed     fee.RecipientUnwrapper
+		kidless   fee.RecipientUnwrapper
+	}{
+		"ECDH-ES": {fee.NewECDHESRecipient(nil, priv.PublicKey()), fee.NewECDHESUnwrapper(ecdhKID, priv), fee.NewECDHESUnwrapper(nil, priv)},
+		"A256KW":  {fee.NewA256KWRecipient(nil, kek), fee.NewA256KWUnwrapper(a256kwKID, kek), fee.NewA256KWUnwrapper(nil, kek)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			blob, err := encrypt(t, plaintext, []fee.Recipient{tc.recipient}, fee.WithChunkSize(aesstream.MinChunkSize))
+			require.NoError(t, err)
+
+			env, _, err := cose.Decode(blob)
+			require.NoError(t, err)
+			r := env.Recipients[0].Headers
+			require.False(t, r.Protected.Has(cose.HeaderLabelKID), "no protected kid")
+			require.False(t, r.Unprotected.Has(cose.HeaderLabelKID), "no unprotected kid")
+
+			for uname, u := range map[string]fee.RecipientUnwrapper{"key with a kid": tc.keyed, "key without a kid": tc.kidless} {
+				require.Equal(t, plaintext, decryptAll(t, blob, u), uname)
+
+				rr, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, 100, 199)
+				require.NoError(t, err, uname)
+				got, err := io.ReadAll(rr)
+				require.NoError(t, err, uname)
+				require.Equal(t, plaintext[100:200], got, uname)
+			}
+		})
+	}
+}
+
+// TestKidlessKeyTriesKeyedRecipient: a key without a kid is tried against a
+// recipient that has one.
+func TestKidlessKeyTriesKeyedRecipient(t *testing.T) {
+	plaintext, kek := patternBytes(100), newKEK(t)
+	blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	require.Equal(t, plaintext, decryptAll(t, blob, fee.NewA256KWUnwrapper(nil, kek)))
+}
+
+// TestDecryptTriesNextCandidate: a key that fails the integrity check is not an
+// error while another candidate remains, whether the next candidate is a later
+// recipient or a later key.
+func TestDecryptTriesNextCandidate(t *testing.T) {
+	plaintext := patternBytes(100)
+	kek1, kek2 := newKEK(t), newKEK(t)
+
+	t.Run("later recipient", func(t *testing.T) {
+		blob, err := encrypt(t, plaintext, []fee.Recipient{
+			fee.NewA256KWRecipient(nil, kek1),
+			fee.NewA256KWRecipient(nil, kek2),
+		})
+		require.NoError(t, err)
+		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewA256KWUnwrapper(nil, kek2)))
+	})
+
+	t.Run("later key", func(t *testing.T) {
+		blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(nil, kek2)})
+		require.NoError(t, err)
+		u := fee.MultiUnwrapper(fee.NewA256KWUnwrapper(nil, kek1), fee.NewA256KWUnwrapper(nil, kek2))
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+
+	t.Run("matching kid first", func(t *testing.T) {
+		// MaxUnwrapAttempts kid-less wrong keys come before the key whose kid
+		// matches, so only trying the matching key first stays within the limit.
+		blob, err := encrypt(t, plaintext, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek2)})
+		require.NoError(t, err)
+		var keys []fee.RecipientUnwrapper
+		for range fee.MaxUnwrapAttempts {
+			keys = append(keys, fee.NewA256KWUnwrapper(nil, newKEK(t)))
+		}
+		u := fee.MultiUnwrapper(append(keys, fee.NewA256KWUnwrapper(a256kwKID, kek2))...)
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+
+	t.Run("mixed algorithms", func(t *testing.T) {
+		priv := newX25519Key(t)
+		blob, err := encrypt(t, plaintext, []fee.Recipient{
+			fee.NewA256KWRecipient(nil, kek1),
+			fee.NewECDHESRecipient(nil, priv.PublicKey()),
+		})
+		require.NoError(t, err)
+		u := fee.MultiUnwrapper(fee.NewA256KWUnwrapper(nil, kek2), fee.NewECDHESUnwrapper(nil, priv))
+		require.Equal(t, plaintext, decryptAll(t, blob, u))
+	})
+}
+
+// TestDecryptUnwrapAttemptLimit: at most MaxUnwrapAttempts unwraps are tried.
+// One wrong key against MaxUnwrapAttempts kid-less recipients fails as no
+// match; one more recipient trips the limit, on both decrypt paths.
+func TestDecryptUnwrapAttemptLimit(t *testing.T) {
+	envelope := func(n int) []byte {
+		recipients := make([]fee.Recipient, n)
+		for i := range recipients {
+			recipients[i] = fee.NewA256KWRecipient(nil, newKEK(t))
+		}
+		blob, err := encrypt(t, patternBytes(10), recipients)
+		require.NoError(t, err)
+		return blob
+	}
+	wrong := fee.NewA256KWUnwrapper(nil, newKEK(t))
+
+	atLimit := envelope(fee.MaxUnwrapAttempts)
+	_, err := fee.Decrypt(bytes.NewReader(atLimit), wrong)
+	require.ErrorIs(t, err, fee.ErrNoMatchingRecipient)
+	require.ErrorIs(t, err, aeskw.ErrIntegrity)
+
+	over := envelope(fee.MaxUnwrapAttempts + 1)
+	_, err = fee.Decrypt(bytes.NewReader(over), wrong)
+	require.ErrorIs(t, err, fee.ErrUnwrapAttemptLimit)
+	_, err = fee.DecryptRange(bytes.NewReader(over), int64(len(over)), wrong, 0, 0)
+	require.ErrorIs(t, err, fee.ErrUnwrapAttemptLimit)
+}
+
+// TestMultiUnwrapperNil: a MultiUnwrapper with no keys, or with a nil entry,
+// is a nil unwrapper.
+func TestMultiUnwrapperNil(t *testing.T) {
+	kek := newKEK(t)
+	blob, err := encrypt(t, patternBytes(10), []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, kek)})
+	require.NoError(t, err)
+	for name, u := range map[string]fee.RecipientUnwrapper{
+		"empty":     fee.MultiUnwrapper(),
+		"nil entry": fee.MultiUnwrapper(fee.NewA256KWUnwrapper(a256kwKID, kek), nil),
+	} {
+		_, err := fee.Decrypt(bytes.NewReader(blob), u)
+		require.ErrorIs(t, err, fee.ErrNilUnwrapper, name)
+	}
 }

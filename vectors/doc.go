@@ -19,11 +19,12 @@
 //	              "Encrypt" for a tag-96 envelope, "Encrypt0" for tag-16
 //	chunk nonce = baseNonce[7] || chunkIndex[4 BE] || lastFlag[1]
 //
-// An A256KW recipient entry is [ protected, {1: -5, 4: kid}, wrappedKey ] whose
-// protected header is a zero-length byte string, as RFC 9053 §6.2.1 requires. Both implementations
-// unwrap it. An ECDH-ES+A256KW entry is [ {1: -31}, {4: kid, -1: ephemeralKey},
-// wrappedKey ]; the reference has no ECDH-ES unwrap, so that one is asserted on
-// the Go side only, in vectors_test.go.
+// An A256KW recipient entry is [ protected, {1: -5, ? 4: kid}, wrappedKey ]
+// whose protected header is a zero-length byte string, as RFC 9053 §6.2.1
+// requires. Both implementations unwrap it, with or without a kid. An
+// ECDH-ES+A256KW entry is [ {1: -31}, {? 4: kid, -1: ephemeralKey}, wrappedKey ];
+// the reference has no ECDH-ES unwrap, so that one is asserted on the Go side
+// only, in vectors_test.go.
 //
 // Fixtures live under testdata/<name>/ as blob.bin, plaintext.bin and
 // meta.json. TestVectors reads and verifies every fixture. The Go-produced

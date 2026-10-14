@@ -28,8 +28,8 @@
 // decryptor.
 //
 // A CEK can be carried in the envelope as one or more COSE_Recipient entries
-// (a COSE_Encrypt, tag 96), each keyed by a caller-supplied key id (kid —
-// opaque to this package, e.g. a DID verification method ID). Two wrap
+// (a COSE_Encrypt, tag 96), each normally named by a caller-supplied key id
+// (kid — opaque to this package, e.g. a DID verification method ID). Two wrap
 // algorithms are available and may be mixed in one envelope; on decrypt the
 // caller never selects the algorithm, the recipient's COSE header does:
 //
@@ -85,7 +85,6 @@
 package fee
 
 import (
-	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -153,6 +152,19 @@ var envelopeDecodeOptions = []cose.DecodeOption{
 	cose.WithStrictEncoding(),
 }
 
+// checkDisjoint rejects a header pair that carries any label in both its
+// protected and unprotected maps. RFC 9052 §3 would let a reader prefer the
+// protected copy; refusing the overlap instead leaves every reader one value to
+// read.
+func checkDisjoint(h cose.Headers) error {
+	for label := range h.Protected {
+		if h.Unprotected.Has(label) {
+			return fmt.Errorf("%w: header %v is in both the protected and unprotected maps", ErrMalformedEnvelope, label)
+		}
+	}
+	return nil
+}
+
 // checkCrit processes a header pair's crit parameter (label 2, RFC 9052 §3.1):
 // it must be protected, it must be a non-empty array of labels, and every label
 // it names must be one the caller understands and must be present in the same
@@ -193,10 +205,15 @@ var (
 	// recoverable; use EncryptWithCEK for a recipient-less (external-CEK) envelope.
 	ErrNoRecipients = errors.New("fee: at least one recipient is required")
 
-	// ErrNoMatchingRecipient means no recipient entry in the envelope carries a
-	// kid equal to the unwrapper's key id, so there is no wrapped CEK for this
-	// unwrapper to recover.
-	ErrNoMatchingRecipient = errors.New("fee: no envelope recipient matches the unwrapper's key id")
+	// ErrNoMatchingRecipient means no recipient in the envelope could be
+	// unwrapped with the unwrapper's keys: none was a candidate for any key, or
+	// every candidate failed the key-wrap integrity check, in which case the
+	// error also wraps aeskw.ErrIntegrity.
+	ErrNoMatchingRecipient = errors.New("fee: no envelope recipient could be unwrapped with the unwrapper's keys")
+
+	// ErrUnwrapAttemptLimit means Decrypt or DecryptRange gave up after
+	// MaxUnwrapAttempts failed recipient unwraps.
+	ErrUnwrapAttemptLimit = errors.New("fee: recipient unwrap attempt limit reached")
 
 	// ErrNoRecipientsInEnvelope means Decrypt was given a recipient-less
 	// COSE_Encrypt0 (tag 16) envelope; recover it with DecryptWithCEK instead.
@@ -205,11 +222,6 @@ var (
 	// ErrUnsupportedBodyAlg means the envelope's body algorithm header is absent
 	// or is not the FEE chunked AES-256-GCM-STREAM cipher.
 	ErrUnsupportedBodyAlg = errors.New("fee: unsupported body algorithm")
-
-	// ErrUnsupportedRecipientAlg means a matched recipient's key-wrap algorithm
-	// header does not match the unwrapper that was asked to recover it (e.g. an
-	// ECDH-ES unwrapper matched against an A256KW recipient).
-	ErrUnsupportedRecipientAlg = errors.New("fee: unsupported recipient key-wrap algorithm")
 
 	// ErrMalformedEnvelope means a required body header was missing or had the
 	// wrong type, or a declared parameter was out of range.
@@ -524,9 +536,9 @@ func (e *encryptReader) Close() error { return e.body.Close() }
 // Decrypt recovers the plaintext from a FEE COSE_Encrypt (tag 96) envelope read
 // from src.
 //
-// It decodes the envelope header from src (requiring the FEE typ), finds the
-// recipient whose kid matches unwrap's key id, recovers the CEK through unwrap,
-// and returns a streaming reader over the decrypted plaintext. Only the header
+// It decodes the envelope header from src (requiring the FEE typ), recovers
+// the CEK from a recipient with one of unwrap's keys (see [RecipientUnwrapper]
+// for the order they are tried in), and returns a streaming reader over the decrypted plaintext. Only the header
 // is read up front; the detached ciphertext is streamed from src on demand.
 //
 // Decryption is streaming: a non-EOF error from the returned reader (see
@@ -536,10 +548,11 @@ func (e *encryptReader) Close() error { return e.body.Close() }
 // stream.
 //
 // If the envelope carries no recipients (a COSE_Encrypt0), Decrypt returns
-// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient kid matches
-// unwrap, it returns [ErrNoMatchingRecipient] without attempting an unwrap. If
-// the matched recipient's wrapped CEK cannot be recovered (e.g. the wrong key),
-// the unwrap error is returned and no plaintext reader is produced.
+// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient can be
+// unwrapped with unwrap's keys, it returns [ErrNoMatchingRecipient] (wrapping
+// aeskw.ErrIntegrity if a candidate was tried and failed), or
+// [ErrUnwrapAttemptLimit] after [MaxUnwrapAttempts] failures, and no plaintext
+// reader is produced.
 func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 	if src == nil {
 		return nil, errors.New("fee: nil envelope reader")
@@ -555,12 +568,13 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 	if len(env.Recipients) == 0 {
 		return nil, ErrNoRecipientsInEnvelope
 	}
-
-	match, err := matchRecipient(env.Recipients, unwrap.keyID())
-	if err != nil {
+	// The whole envelope, every recipient included, is checked before any key
+	// is used.
+	if _, err := validateBodyParams(env); err != nil {
 		return nil, err
 	}
-	cek, err := unwrap.unwrap(match)
+
+	cek, err := recoverCEK(env.Recipients, unwrap)
 	if err != nil {
 		return nil, err
 	}
@@ -679,8 +693,9 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 	}
 }
 
-// validateBodyParams checks a decoded envelope's FEE body headers — every FEE
-// parameter is protected, the algorithm is the chunked AES-256-GCM-STREAM
+// validateBodyParams checks a decoded envelope's headers — every recipient is
+// well formed (see [validateRecipient]), no body label is in both buckets,
+// every FEE parameter is protected, the algorithm is the chunked AES-256-GCM-STREAM
 // cipher, the base nonce (iv) is present and 7 bytes, the chunk size is
 // present and in range, content_type and app_metadata have the types the wire
 // format allows, and a declared plaintext length is a non-negative integer.
@@ -691,6 +706,12 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 // body header they cannot honour.
 func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	if err := checkCrit(env.Headers, bodyUnderstoodLabels); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkDisjoint(env.Headers); err != nil {
+		return bodyParams{}, err
+	}
+	if err := validateRecipients(env.Recipients); err != nil {
 		return bodyParams{}, err
 	}
 	// The nonce is the iv, never rebuilt from a Partial IV, so a Partial IV in
@@ -808,21 +829,6 @@ func checkCEK(cek []byte) error {
 		}
 	}
 	return fmt.Errorf("%w, got an all-zero key", ErrInvalidCEK)
-}
-
-// matchRecipient returns the first recipient whose kid equals want. A recipient
-// without a kid header never matches. An empty want, or no match, yields
-// ErrNoMatchingRecipient.
-func matchRecipient(recipients []*cose.Recipient, want []byte) (*cose.Recipient, error) {
-	if len(want) == 0 {
-		return nil, ErrNoMatchingRecipient
-	}
-	for _, r := range recipients {
-		if kid, ok := r.Headers.Unprotected.Bytes(cose.HeaderLabelKID); ok && bytes.Equal(kid, want) {
-			return r, nil
-		}
-	}
-	return nil, ErrNoMatchingRecipient
 }
 
 // zero overwrites b, a best-effort wipe of the CEK once it has been copied into

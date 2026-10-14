@@ -26,15 +26,20 @@ import (
 //	                   parses each recipient and decrypts the body from the CEK.
 //	empty-file-go     Go seals an empty file; the TS reference decrypts it.
 //	empty-file-ts     the TS reference seals an empty file; Go decrypts it.
+//	kidless-recipient-go Go seals an envelope whose A256KW recipient has no
+//	                   kid; the TS reference unwraps it by trying its key.
+//	kidless-recipient-ts the TS reference seals the same; fee.Decrypt unwraps it.
 //
 // The empty file is its own framing case in both directions: it encodes as one
 // empty final chunk, so the whole body is a bare 16-byte tag.
 var coreVectors = map[string]string{
-	"single-chunk-go":    "go",
-	"multi-chunk-ts":     "ts",
-	"multi-recipient-go": "go",
-	"empty-file-go":      "go",
-	"empty-file-ts":      "ts",
+	"single-chunk-go":      "go",
+	"multi-chunk-ts":       "ts",
+	"multi-recipient-go":   "go",
+	"empty-file-go":        "go",
+	"empty-file-ts":        "ts",
+	"kidless-recipient-go": "go",
+	"kidless-recipient-ts": "ts",
 }
 
 // TestVectors verifies that this Go implementation decrypts every committed
@@ -134,10 +139,12 @@ func verifyRecipients(t *testing.T, f fixture, cek []byte) {
 		r := byAlg[rm.Algorithm]
 		require.NotNilf(t, r, "envelope missing recipient alg %d", rm.Algorithm)
 
-		// The kid binds the descriptor to its key.
+		// The kid binds the descriptor to its key; a recipient without one
+		// carries no kid label at all.
 		kid, ok := r.Headers.Unprotected.Bytes(cose.HeaderLabelKID)
-		require.True(t, ok, "recipient kid present")
+		require.Equal(t, rm.KidHex != "", ok, "recipient kid present")
 		require.Equal(t, rm.KidHex, hex.EncodeToString(kid), "recipient kid")
+		require.False(t, r.Headers.Protected.Has(cose.HeaderLabelKID), "no protected kid")
 
 		switch rm.Kind {
 		case "ecdh-es-a256kw":
@@ -168,6 +175,16 @@ func verifyRecipients(t *testing.T, f fixture, cek []byte) {
 			unwrapped, err := aeskw.Unwrap(kek, r.Ciphertext)
 			require.NoError(t, err, "A256KW unwrap")
 			require.Equal(t, cek, unwrapped, "unwrapped CEK matches shared CEK")
+
+			// fee.Decrypt finds the recipient by its kid, or, without one, by
+			// trying the key; a key without a kid is tried either way.
+			for _, kid := range [][]byte{kid, nil} {
+				pr, err := fee.Decrypt(bytes.NewReader(f.blob), fee.NewA256KWUnwrapper(kid, kek))
+				require.NoError(t, err, "fee.Decrypt, unwrapper kid %x", kid)
+				got, err := io.ReadAll(pr)
+				require.NoError(t, err, "fee.Decrypt, unwrapper kid %x", kid)
+				require.Equal(t, f.plaintext, got, "fee.Decrypt plaintext, unwrapper kid %x", kid)
+			}
 
 		default:
 			t.Fatalf("unknown recipient kind %q", rm.Kind)
@@ -250,6 +267,12 @@ func TestGenerate(t *testing.T) {
 	genGoMultiRecipient(t, "multi-recipient-go",
 		"AC3: multi-recipient envelope (ECDH-ES+A256KW/X25519 and A256KW) encrypted in Go; filecoin-encryption-envelope decrypts the body from the CEK and unwraps the A256KW recipient.",
 		[]byte("FEE cross-impl vector FIL-473: multi-recipient envelope, two wrapped CEKs.\n"))
+
+	// An A256KW recipient without a kid (tag 96): the FIP makes kid optional,
+	// so a decryptor finds the recipient by trying its key.
+	genGoKidlessRecipient(t, "kidless-recipient-go",
+		"A256KW recipient without a kid, encrypted in Go; filecoin-encryption-envelope unwraps it by trying its key.",
+		[]byte("FEE cross-impl vector: an A256KW recipient with no kid.\n"))
 }
 
 func genGoBody(t *testing.T, name, desc string, plaintext []byte) {
@@ -276,7 +299,7 @@ func genGoMultiRecipient(t *testing.T, name, desc string, plaintext []byte) {
 	cek, baseNonce := testCEK(name), testBaseNonce()
 	ecdhR, err := ecdhESRecipient(cek)
 	require.NoError(t, err)
-	a256R, err := a256kwRecipient(cek)
+	a256R, err := a256kwRecipient(cek, a256kwKid)
 	require.NoError(t, err)
 
 	blob, chunkCount, err := composeFEE(plaintext, cek, baseNonce, vectorChunkSize, []*cose.Recipient{ecdhR, a256R})
@@ -309,4 +332,31 @@ func genGoMultiRecipient(t *testing.T, name, desc string, plaintext []byte) {
 	require.NoError(t, err)
 	require.Equal(t, plaintext, got)
 	t.Logf("wrote %s (%d bytes, %d recipients)", name, len(blob), len(m.Recipients))
+}
+
+func genGoKidlessRecipient(t *testing.T, name, desc string, plaintext []byte) {
+	t.Helper()
+	cek, baseNonce := testCEK(name), testBaseNonce()
+	r, err := a256kwRecipient(cek, "")
+	require.NoError(t, err)
+
+	blob, chunkCount, err := composeFEE(plaintext, cek, baseNonce, vectorChunkSize, []*cose.Recipient{r})
+	require.NoError(t, err)
+
+	m := vectorMeta{
+		Name: name, Producer: "go", Description: desc,
+		Tag: cose.TagCOSEEncrypt, Algorithm: algChunkedStream, Typ: feeTyp,
+		ChunkSize: vectorChunkSize, ChunkCount: chunkCount,
+		CEKHex: hexEncode(cek), BaseNonceHex: hexEncode(baseNonce),
+		Recipients: []recipientMeta{{
+			Algorithm: cose.AlgA256KW, Kind: "a256kw",
+			A256KWKEKHex: hexEncode(testA256KWKEK()),
+		}},
+	}
+	require.NoError(t, writeFixture(name, m, blob, plaintext))
+
+	got, err := decryptFEE(blob, cek)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+	t.Logf("wrote %s (%d bytes, kid-less A256KW recipient)", name, len(blob))
 }

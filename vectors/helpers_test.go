@@ -171,19 +171,20 @@ func ecdhESRecipient(cek []byte) (*cose.Recipient, error) {
 }
 
 // a256kwRecipient wraps cek under the fixed region KEK via A256KW and returns
-// the COSE_Recipient entry (alg -5, a symmetric kid, wrapped CEK as ciphertext).
-func a256kwRecipient(cek []byte) (*cose.Recipient, error) {
+// the COSE_Recipient entry (alg -5, kid if non-empty, wrapped CEK as
+// ciphertext). An empty kid leaves the label out.
+func a256kwRecipient(cek []byte, kid string) (*cose.Recipient, error) {
 	wrapped, err := aeskw.Wrap(testA256KWKEK(), cek)
 	if err != nil {
 		return nil, err
 	}
 	// RFC 9053 §6.2.1: the protected header MUST be empty, so alg is unprotected.
+	unprotected := cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW)
+	if kid != "" {
+		unprotected.Set(cose.HeaderLabelKID, []byte(kid))
+	}
 	return &cose.Recipient{
-		Headers: cose.Headers{
-			Unprotected: cose.Header{}.
-				Set(cose.HeaderLabelAlg, cose.AlgA256KW).
-				Set(cose.HeaderLabelKID, []byte(a256kwKid)),
-		},
+		Headers:    cose.Headers{Unprotected: unprotected},
 		Ciphertext: wrapped,
 	}, nil
 }
@@ -268,8 +269,8 @@ func decryptFEE(blob, cek []byte) ([]byte, error) {
 
 type recipientMeta struct {
 	Algorithm           int64  `json:"algorithm"`
-	Kind                string `json:"kind"` // "ecdh-es-a256kw" | "a256kw"
-	KidHex              string `json:"kid_hex"`
+	Kind                string `json:"kind"`              // "ecdh-es-a256kw" | "a256kw"
+	KidHex              string `json:"kid_hex,omitempty"` // empty: the recipient has no kid
 	TenantX25519PrivHex string `json:"tenant_x25519_priv_hex,omitempty"`
 	A256KWKEKHex        string `json:"a256kw_kek_hex,omitempty"`
 }

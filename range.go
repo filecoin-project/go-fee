@@ -118,9 +118,8 @@ func (r *RangeReader) CiphertextSpan() (start, end int64) { return r.spanStart, 
 //
 // unwrap locates and recovers the content-encryption key exactly as [Decrypt]
 // does: a recipient-less COSE_Encrypt0 yields [ErrNoRecipientsInEnvelope] (use
-// [DecryptRangeWithCEK]), no recipient kid matching unwrap yields
-// [ErrNoMatchingRecipient] without attempting an unwrap, and a matched recipient
-// whose wrapped CEK cannot be recovered returns the unwrap error.
+// [DecryptRangeWithCEK]), and a recipient list none of unwrap's keys can
+// unwrap yields [ErrNoMatchingRecipient] or [ErrUnwrapAttemptLimit].
 //
 // start/end follow HTTP Range semantics: both inclusive, and an end past the
 // last plaintext byte clamps — [RangeReader.Len] reports what will actually be
@@ -152,12 +151,13 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 	if len(env.Recipients) == 0 {
 		return nil, ErrNoRecipientsInEnvelope
 	}
-
-	match, err := matchRecipient(env.Recipients, unwrap.keyID())
-	if err != nil {
+	// The whole envelope, every recipient included, is checked before any key
+	// is used.
+	if _, err := validateBodyParams(env); err != nil {
 		return nil, err
 	}
-	cek, err := unwrap.unwrap(match)
+
+	cek, err := recoverCEK(env.Recipients, unwrap)
 	if err != nil {
 		return nil, err
 	}

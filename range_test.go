@@ -498,8 +498,8 @@ func TestDecryptRangeKidMismatch(t *testing.T) {
 	f := newRangeFixture(t, 2*rangeChunk)
 
 	for name, u := range map[string]fee.RecipientUnwrapper{
-		"unknown kid": fee.NewECDHESUnwrapper([]byte("did:key:zNobody#key-1"), newX25519Key(t)),
-		"empty kid":   fee.NewECDHESUnwrapper(nil, newX25519Key(t)),
+		"unknown kid":       fee.NewECDHESUnwrapper([]byte("did:key:zNobody#key-1"), newX25519Key(t)),
+		"no kid, wrong key": fee.NewECDHESUnwrapper(nil, newX25519Key(t)),
 		"right kid, wrong wrap algorithm": fee.NewA256KWUnwrapper(
 			[]byte("did:example:custody#absent"), newKEK(t)),
 	} {
