@@ -1357,6 +1357,7 @@ func TestDecryptRejectsBodyLabelOverlap(t *testing.T) {
 // even when no recipient is used at all.
 func TestDecryptValidatesEveryRecipient(t *testing.T) {
 	kek1, kek2 := newKEK(t), newKEK(t)
+	ephX := newX25519Key(t).PublicKey().Bytes()
 	cek := newCEK(t)
 	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{
 		fee.NewA256KWRecipient([]byte("kek-1"), kek1),
@@ -1375,6 +1376,15 @@ func TestDecryptValidatesEveryRecipient(t *testing.T) {
 			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
 			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
 			r.Headers.RawProtected = nil
+		},
+		"short ECDH-ES+A256KW wrapped key": func(r *cose.Recipient) {
+			delete(r.Headers.Unprotected, cose.HeaderLabelAlg)
+			r.Headers.Protected = cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW)
+			r.Headers.RawProtected = nil
+			r.Headers.Unprotected.Set(cose.HeaderLabelEphemeralKey, map[any]any{
+				coseKeyKty: coseKtyOKP, coseKeyCrv: coseCrvX25519, coseKeyX: ephX,
+			})
+			r.Ciphertext = r.Ciphertext[:39]
 		},
 		"kid in both buckets": func(r *cose.Recipient) {
 			// A256KW must keep its protected header empty, so this second
@@ -1572,4 +1582,88 @@ func TestMultiUnwrapperNil(t *testing.T) {
 		_, err := fee.Decrypt(bytes.NewReader(blob), u)
 		require.ErrorIs(t, err, fee.ErrNilUnwrapper, name)
 	}
+}
+
+// zeroStream yields n zero bytes and records how many were read.
+type zeroStream struct{ n, read int64 }
+
+func (z *zeroStream) Read(p []byte) (int, error) {
+	if z.read >= z.n {
+		return 0, io.EOF
+	}
+	k := min(int64(len(p)), z.n-z.read)
+	clear(p[:k])
+	z.read += k
+	return int(k), nil
+}
+
+// TestDecryptEnvelopeSizeLimit: an envelope declaring a 64 MiB protected
+// header is refused as cose.ErrTooLarge on every decrypt path, and the
+// streaming paths read no more than MaxEnvelopeSize bytes of it.
+func TestDecryptEnvelopeSizeLimit(t *testing.T) {
+	const declared = 64 << 20
+	// 96([ h'<declared bytes>' ...
+	head := []byte{0xd8, 0x60, 0x84, 0x5a, byte(declared >> 24), 0, 0, 0}
+
+	stream := func() (io.Reader, *zeroStream) {
+		z := &zeroStream{n: declared}
+		return io.MultiReader(bytes.NewReader(head), z), z
+	}
+	r, z := stream()
+	_, err := fee.Decrypt(r, fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "Decrypt")
+	require.LessOrEqual(t, int64(len(head))+z.read, int64(fee.MaxEnvelopeSize), "Decrypt read")
+
+	r, z = stream()
+	_, err = fee.DecryptWithCEK(r, newCEK(t))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptWithCEK")
+	require.LessOrEqual(t, int64(len(head))+z.read, int64(fee.MaxEnvelopeSize), "DecryptWithCEK read")
+
+	blob := append(append([]byte{}, head...), make([]byte, 2*fee.MaxEnvelopeSize)...)
+	_, err = fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)), 0, 0)
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptRange")
+	_, err = fee.DecryptRangeWithCEK(bytes.NewReader(blob), int64(len(blob)), newCEK(t), 0, 0, nil)
+	require.ErrorIs(t, err, cose.ErrTooLarge, "DecryptRangeWithCEK")
+	_, err = fee.PlaintextSize(bytes.NewReader(blob), int64(len(blob)))
+	require.ErrorIs(t, err, cose.ErrTooLarge, "PlaintextSize")
+}
+
+// TestEncryptEnvelopeSizeLimit: Encrypt refuses an envelope larger than
+// MaxEnvelopeSize, which no decrypt path would accept, and an envelope just
+// under it round-trips on every path.
+func TestEncryptEnvelopeSizeLimit(t *testing.T) {
+	kek := newKEK(t)
+	// A distinct 1000-byte kid per recipient, so each encodes to 1051 bytes.
+	kid := func(i int) []byte {
+		k := make([]byte, 1000)
+		k[0], k[1] = byte(i>>8), byte(i)
+		return k
+	}
+	recipients := func(n int) []fee.Recipient {
+		rs := make([]fee.Recipient, n)
+		for i := range rs {
+			rs[i] = fee.NewA256KWRecipient(kid(i), kek)
+		}
+		return rs
+	}
+
+	_, _, err := fee.Encrypt(bytes.NewReader(patternBytes(10)), recipients(1000))
+	require.ErrorIs(t, err, cose.ErrTooLarge)
+
+	plaintext := patternBytes(100)
+	blob, err := encrypt(t, plaintext, recipients(990))
+	require.NoError(t, err)
+	env, _, err := cose.Decode(blob)
+	require.NoError(t, err)
+	header, err := env.Encode()
+	require.NoError(t, err)
+	require.Greater(t, len(header), fee.MaxEnvelopeSize-16<<10, "the envelope is close to the limit")
+
+	u := fee.NewA256KWUnwrapper(kid(989), kek)
+	require.Equal(t, plaintext, decryptAll(t, blob, u))
+	rr, err := fee.DecryptRange(bytes.NewReader(blob), int64(len(blob)), u, 0, 9)
+	require.NoError(t, err)
+	got, err := io.ReadAll(rr)
+	require.NoError(t, err)
+	require.Equal(t, plaintext[:10], got)
 }

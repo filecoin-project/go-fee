@@ -799,7 +799,7 @@ func TestDecryptRangeMalformedBlob(t *testing.T) {
 // TestDecryptRangeMalformedBlobReadsOnce pins that a blob whose leading bytes
 // decode completely but are not a FEE envelope is rejected on the strength of the
 // first read. Only a prefix cut short mid-item can be answered by reading more, so
-// a wrong object id costs one 4 KiB read rather than a walk up to maxHeaderLen
+// a wrong object id costs one 4 KiB read rather than a walk up to MaxEnvelopeSize
 // against the origin.
 func TestDecryptRangeMalformedBlobReadsOnce(t *testing.T) {
 	f := newRangeFixture(t, rangeChunk)

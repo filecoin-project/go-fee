@@ -248,7 +248,8 @@ var recipientUnderstoodLabels = map[int64]bool{
 }
 
 // a256kwWrappedSize is the wire length of an A256KW-wrapped CEK: the 32-byte key
-// plus RFC 3394's 8-byte integrity block.
+// plus RFC 3394's 8-byte integrity block. ECDH-ES+A256KW wraps with A256KW too,
+// so it applies to both recipient algorithms.
 const a256kwWrappedSize = aesstream.KeySize + 8
 
 // validateRecipients checks the structure of every recipient in an envelope,
@@ -270,8 +271,8 @@ func validateRecipients(recipients []*cose.Recipient) error {
 // the algorithms FEE profiles it also checks placement: an A256KW recipient's
 // protected header is empty (RFC 9053 §6.2.1), so its alg is unprotected, and
 // its wrapped key is exactly 40 bytes; an ECDH-ES+A256KW recipient's alg is
-// protected, since those bytes feed its key derivation, and it carries a valid
-// X25519 ephemeral key. A recipient that passes can fail to unwrap only by
+// protected, since those bytes feed its key derivation, it carries a valid
+// X25519 ephemeral key, and its wrapped key is exactly 40 bytes too. A recipient that passes can fail to unwrap only by
 // being wrapped under a different key.
 func validateRecipient(r *cose.Recipient) error {
 	h := r.Headers
@@ -318,6 +319,9 @@ func validateRecipient(r *cose.Recipient) error {
 		}
 		if _, err := ephemeralX25519(h.Unprotected); err != nil {
 			return err
+		}
+		if len(r.Ciphertext) != a256kwWrappedSize {
+			return fmt.Errorf("%w: ECDH-ES+A256KW wrapped key is %d bytes, want %d", ErrMalformedEnvelope, len(r.Ciphertext), a256kwWrappedSize)
 		}
 	}
 	return nil

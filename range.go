@@ -24,18 +24,11 @@ var ErrSizeMismatch = errors.New("fee: blob size disagrees with the envelope's d
 // from a nil blob, whether or not it decodes an envelope first.
 var errNilBlob = errors.New("fee: nil blob reader")
 
-const (
-	// headerProbeSize is the first prefix length the envelope-header probe
-	// reads. A FEE envelope with a handful of recipients is a few hundred
-	// bytes, so one read of this size decodes essentially every real blob.
-	headerProbeSize = 4096
-
-	// maxHeaderLen bounds the probe's growth, so a blob whose prefix declares
-	// an enormous CBOR item cannot make the probe allocate its way up to the
-	// full blob size. It still admits thousands of recipients (a recipient
-	// entry is a couple of hundred bytes).
-	maxHeaderLen = 1 << 20
-)
+// headerProbeSize is the first prefix length the envelope-header probe reads.
+// A FEE envelope with a handful of recipients is a few hundred bytes, so one
+// read of this size decodes essentially every real blob. The probe grows no
+// further than MaxEnvelopeSize.
+const headerProbeSize = 4096
 
 // RangeReader streams the decrypted plaintext of one byte range of a FEE blob.
 // It is returned by [DecryptRange] and [DecryptRangeWithCEK], and reads
@@ -129,7 +122,8 @@ func (r *RangeReader) CiphertextSpan() (start, end int64) { return r.spanStart, 
 // [aesstream.ErrRange] (an HTTP consumer's 416); there is no empty range. A
 // blobSize that cannot be a FEE blob fails with [aesstream.ErrCiphertextSize],
 // and one that contradicts the envelope's declared plaintext length with
-// [ErrSizeMismatch]. An envelope larger than 1 MiB is rejected as malformed.
+// [ErrSizeMismatch]. An envelope larger than [MaxEnvelopeSize] fails with an
+// error matching cose.ErrTooLarge.
 //
 // Every chunk the range overlaps is authenticated, so a tampered chunk surfaces
 // as an error from Read rather than as corrupt plaintext. Chunks outside the range
@@ -175,7 +169,7 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 // key instead of one recovered from an in-envelope recipient — for when the CEK
 // was obtained out of band (e.g. unwrapped by a custody service). It accepts
 // either a COSE_Encrypt (tag 96) or a recipient-less COSE_Encrypt0 (tag 16); any
-// recipients are ignored. cek must be 32 bytes (AES-256).
+// recipients are validated but not used. cek must be 32 bytes (AES-256).
 //
 // If desc is nil, it decodes the envelope header from blob exactly as
 // [DecryptRange] does. A caller that already cached the needed
@@ -326,7 +320,7 @@ func envelopePlaintextSize(env *cose.Envelope, blobSize, headerLen int64, chunkS
 // reports how many bytes it consumed (as the remainder it hands back) — but the
 // prefix has to be long enough to hold the whole item. This reads a small prefix
 // and, only if that turns out to be too short, doubles it and retries, up to
-// maxHeaderLen. Every realistic envelope decodes on the first read.
+// MaxEnvelopeSize. Every realistic envelope decodes on the first read.
 func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, error) {
 	if blob == nil {
 		return nil, 0, errNilBlob
@@ -335,7 +329,7 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		return nil, 0, fmt.Errorf("fee: negative blob size %d", blobSize)
 	}
 
-	limit := min(blobSize, int64(maxHeaderLen))
+	limit := min(blobSize, int64(MaxEnvelopeSize))
 	probe := min(int64(headerProbeSize), limit)
 	for {
 		buf := make([]byte, probe)
@@ -355,7 +349,7 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		// decode failure — not a COSE tag, wrong typ, a duplicate header label —
 		// was decided on complete bytes, so a longer prefix reaches the same
 		// verdict. Retrying those would turn one wrong object id into a walk up to
-		// maxHeaderLen against the store.
+		// MaxEnvelopeSize against the store.
 		if !errors.Is(derr, io.ErrUnexpectedEOF) || atEnd || probe >= limit {
 			return nil, 0, fmt.Errorf("fee: decoding envelope: %w", derr)
 		}

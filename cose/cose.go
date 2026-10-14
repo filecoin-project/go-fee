@@ -116,6 +116,9 @@ var (
 	// therefore tell "read more bytes" from "these bytes are complete and wrong";
 	// no other decode failure carries that signal.
 	ErrMalformed = errors.New("cose: malformed COSE envelope")
+	// ErrTooLarge means the envelope is larger than the limit set with
+	// WithMaxSize. It is always reported together with ErrMalformed.
+	ErrTooLarge = errors.New("cose: envelope exceeds the size limit")
 	// ErrDetachedPayload means the body ciphertext field was not CBOR null;
 	// this package only handles detached payloads.
 	ErrDetachedPayload = errors.New("cose: body ciphertext must be null (detached payload)")
@@ -145,13 +148,19 @@ const (
 // default is 32.
 const maxNestedLevels = 256
 
+// maxCollectionItems is the most elements an array, or pairs a map, may
+// declare. It is the CBOR library's default, set here so the limit is stated
+// rather than inherited.
+const maxCollectionItems = 131072
+
 // encMode encodes in RFC 8949 core deterministic form (definite lengths,
 // shortest integers, canonical map-key ordering). Deterministic encoding is
 // what keeps the protected header — and therefore the AAD — byte-stable.
 //
 // decMode rejects duplicate map keys (which COSE forbids), allows up to
-// maxNestedLevels of nesting, and decodes CBOR integers leniently — unsigned to
-// uint64, negative to int64. Decoded header values then pass through
+// maxNestedLevels of nesting and maxCollectionItems per array or map, and
+// decodes CBOR integers leniently — unsigned to uint64, negative to int64.
+// Decoded header values then pass through
 // normalizeValue, which folds every integer that fits into an int64 and keeps
 // only an unsigned value exceeding int64 as a uint64.
 // This mirrors the encode-side normalization, so any header this package can
@@ -170,9 +179,11 @@ func init() {
 	encMode = em
 
 	dm, err := cbor.DecOptions{
-		DupMapKey:       cbor.DupMapKeyEnforcedAPF,
-		IntDec:          cbor.IntDecConvertNone,
-		MaxNestedLevels: maxNestedLevels,
+		DupMapKey:        cbor.DupMapKeyEnforcedAPF,
+		IntDec:           cbor.IntDecConvertNone,
+		MaxNestedLevels:  maxNestedLevels,
+		MaxArrayElements: maxCollectionItems,
+		MaxMapPairs:      maxCollectionItems,
 	}.DecMode()
 	if err != nil {
 		panic(fmt.Sprintf("cose: building CBOR decode mode: %v", err))

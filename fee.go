@@ -144,12 +144,20 @@ var bodyUnderstoodLabels = map[int64]bool{
 	labelChunkSize: true, labelPlaintextLength: true, labelAppMetadata: true,
 }
 
+// MaxEnvelopeSize is the largest encoded envelope, outer tag included, that
+// any decrypt path accepts: 1 MiB, the Synapse SDK's limit. Reading stops once
+// this much input has failed to complete an envelope, which fails with an
+// error matching cose.ErrTooLarge. It still admits thousands of recipients (a
+// recipient entry is a couple of hundred bytes).
+const MaxEnvelopeSize = 1 << 20
+
 // envelopeDecodeOptions are the cose decode rules every FEE envelope is held
-// to: the FEE envelope type, and one accepted CBOR encoding (definite lengths,
-// shortest-form arguments, no floats).
+// to: the FEE envelope type, one accepted CBOR encoding (definite lengths,
+// shortest-form arguments, no floats), and at most MaxEnvelopeSize bytes.
 var envelopeDecodeOptions = []cose.DecodeOption{
 	cose.WithExpectedType(EnvelopeType),
 	cose.WithStrictEncoding(),
+	cose.WithMaxSize(MaxEnvelopeSize),
 }
 
 // checkDisjoint rejects a header pair that carries any label in both its
@@ -284,8 +292,10 @@ func WithContentLength(n int64) EncryptOption {
 // O(chunk size) memory. The same CEK is wrapped to every recipient, so any one
 // of them can recover the object. recipients must be non-empty (the generated
 // CEK would otherwise be unrecoverable); a nil or invalid recipient is reported
-// before any plaintext is read. To seal under a CEK you already hold, or a
-// recipient-less envelope, use [EncryptWithCEK].
+// before any plaintext is read, as is an envelope larger than
+// [MaxEnvelopeSize] (cose.ErrTooLarge), which no decrypt path would accept. To
+// seal under a CEK you already hold, or a recipient-less envelope, use
+// [EncryptWithCEK].
 //
 // The plaintext is pulled through the body cipher as the returned reader is
 // read (no goroutine or pipe stands between them), and the reader implements
@@ -435,6 +445,11 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	if err != nil {
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: encoding envelope: %w", err)
 	}
+	// An envelope no decrypt path would accept is refused here, before any
+	// plaintext is read.
+	if len(header) > MaxEnvelopeSize {
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: envelope is %d bytes, over the %d-byte limit: %w", len(header), MaxEnvelopeSize, cose.ErrTooLarge)
+	}
 
 	// Every fallible step above has succeeded, so the body cipher can be
 	// built; NewEncryptReader's own validation (key, base nonce, chunk size) is
@@ -548,7 +563,9 @@ func (e *encryptReader) Close() error { return e.body.Close() }
 // stream.
 //
 // If the envelope carries no recipients (a COSE_Encrypt0), Decrypt returns
-// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. If no recipient can be
+// [ErrNoRecipientsInEnvelope] — use [DecryptWithCEK]. An envelope larger than
+// [MaxEnvelopeSize] fails with an error matching cose.ErrTooLarge after at most
+// that many bytes are read. If no recipient can be
 // unwrapped with unwrap's keys, it returns [ErrNoMatchingRecipient] (wrapping
 // aeskw.ErrIntegrity if a candidate was tried and failed), or
 // [ErrUnwrapAttemptLimit] after [MaxUnwrapAttempts] failures, and no plaintext
@@ -592,7 +609,9 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 // instead of one recovered from an in-envelope recipient — for when the CEK was
 // obtained out of band (e.g. unwrapped by a custody service). It accepts either
 // a COSE_Encrypt (tag 96) or a recipient-less COSE_Encrypt0 (tag 16); any
-// recipients are ignored. cek must be 32 bytes (AES-256).
+// recipients are validated but not used. cek must be 32 bytes (AES-256). The
+// envelope is held to the same rules as for Decrypt, [MaxEnvelopeSize]
+// included.
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.

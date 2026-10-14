@@ -1,6 +1,8 @@
 package cose
 
 import (
+	"bytes"
+	"encoding/binary"
 	"io"
 	"testing"
 
@@ -138,4 +140,72 @@ func TestDecodeExpectedType(t *testing.T) {
 		_, _, err := Decode(withoutType())
 		require.NoError(t, err)
 	})
+}
+
+// countingReader yields n zero bytes and records how many were read.
+type countingReader struct{ n, read int64 }
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.read >= c.n {
+		return 0, io.EOF
+	}
+	k := min(int64(len(p)), c.n-c.read)
+	clear(p[:k])
+	c.read += k
+	return int(k), nil
+}
+
+// TestDecodeWithMaxSize: an envelope of exactly the limit decodes, one byte
+// over fails as ErrTooLarge, and input that simply ends early stays a plain
+// truncation. Both entry points agree, and the reader keeps the detached
+// payload intact.
+func TestDecodeWithMaxSize(t *testing.T) {
+	header, err := sampleEnvelope().Encode()
+	require.NoError(t, err)
+	payload := []byte("detached-ciphertext")
+	blob := append(append([]byte{}, header...), payload...)
+	size := int64(len(header))
+
+	env, rest, err := Decode(blob, WithMaxSize(size))
+	require.NoError(t, err, "Decode at the limit")
+	require.NotNil(t, env)
+	require.Equal(t, payload, rest)
+
+	env, restR, err := DecodeReader(bytes.NewReader(blob), WithMaxSize(size))
+	require.NoError(t, err, "DecodeReader at the limit")
+	require.NotNil(t, env)
+	got, err := io.ReadAll(restR)
+	require.NoError(t, err)
+	require.Equal(t, payload, got, "the payload is read past the limit")
+
+	_, _, err = Decode(blob, WithMaxSize(size-1))
+	require.ErrorIs(t, err, ErrTooLarge, "Decode over the limit")
+	require.ErrorIs(t, err, ErrMalformed)
+	require.NotErrorIs(t, err, io.ErrUnexpectedEOF, "an oversized envelope is not a truncated one")
+	_, _, err = DecodeReader(bytes.NewReader(blob), WithMaxSize(size-1))
+	require.ErrorIs(t, err, ErrTooLarge, "DecodeReader over the limit")
+	require.ErrorIs(t, err, ErrMalformed)
+
+	truncated := header[:size-1]
+	_, _, err = Decode(truncated, WithMaxSize(size+100))
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF, "Decode of a truncated envelope")
+	require.NotErrorIs(t, err, ErrTooLarge)
+	_, _, err = DecodeReader(bytes.NewReader(truncated), WithMaxSize(size+100))
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF, "DecodeReader of a truncated envelope")
+	require.NotErrorIs(t, err, ErrTooLarge)
+}
+
+// TestDecodeReaderMaxSizeBoundsReads: an envelope declaring a 64 MiB protected
+// header is refused after reading no more than the limit.
+func TestDecodeReaderMaxSizeBoundsReads(t *testing.T) {
+	const declared = 64 << 20
+	const limit = 1 << 20
+	// 96([ h'<declared bytes>' ...
+	head := []byte{0xd8, 0x60, 0x84, 0x5a, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(head[4:], declared)
+	body := &countingReader{n: declared}
+
+	_, _, err := DecodeReader(io.MultiReader(bytes.NewReader(head), body), WithMaxSize(limit))
+	require.ErrorIs(t, err, ErrTooLarge)
+	require.LessOrEqual(t, int64(len(head))+body.read, int64(limit))
 }

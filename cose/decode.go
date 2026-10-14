@@ -14,6 +14,7 @@ type decodeConfig struct {
 	checkType    bool
 	expectedType string
 	strict       bool
+	maxSize      int64
 }
 
 // DecodeOption configures [Decode] and [DecodeReader].
@@ -39,6 +40,38 @@ func WithExpectedType(typ string) DecodeOption {
 // accepted encoding. Duplicate map labels are rejected with or without it.
 func WithStrictEncoding() DecodeOption {
 	return func(c *decodeConfig) { c.strict = true }
+}
+
+// WithMaxSize limits the encoded envelope, outer tag included, to at most n
+// bytes. Decoding reads no more than n bytes looking for the end of the
+// envelope, so an envelope that declares a huge item cannot make it buffer an
+// unbounded amount of input. A larger envelope fails with an error matching
+// both ErrMalformed and ErrTooLarge. n must be positive; without this option
+// the envelope size is not limited.
+func WithMaxSize(n int64) DecodeOption {
+	return func(c *decodeConfig) { c.maxSize = n }
+}
+
+// readItem reads the single CBOR item at the front of r, reading at most
+// cfg.maxSize bytes when a limit is set, and returns the item with the decoder
+// that read it, whose buffer may hold bytes read past the item.
+func (cfg decodeConfig) readItem(r io.Reader) (cbor.RawMessage, *cbor.Decoder, error) {
+	var limited *io.LimitedReader
+	if cfg.maxSize > 0 {
+		limited = &io.LimitedReader{R: r, N: cfg.maxSize}
+		r = limited
+	}
+	dec := decMode.NewDecoder(r)
+	var item cbor.RawMessage
+	if err := dec.Decode(&item); err != nil {
+		// The limit was used up before the item ended, so the envelope is
+		// larger than it, whether or not more input followed.
+		if limited != nil && limited.N == 0 && errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, nil, fmt.Errorf("%w: %w: larger than %d bytes", ErrMalformed, ErrTooLarge, cfg.maxSize)
+		}
+		return nil, nil, malformedItem(err)
+	}
+	return item, dec, nil
 }
 
 // checkStrict enforces WithStrictEncoding against the envelope item and the
@@ -101,10 +134,10 @@ func (cfg decodeConfig) checkTyp(protected Header) error {
 // tag; [Envelope] relies on exactly that invariant.
 func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err error) {
 	// Read exactly one CBOR item; the remainder is the detached payload.
-	dec := decMode.NewDecoder(bytes.NewReader(data))
-	var first cbor.RawMessage
-	if err := dec.Decode(&first); err != nil {
-		return nil, nil, malformedItem(err)
+	cfg := newDecodeConfig(opts)
+	first, dec, err := cfg.readItem(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, err
 	}
 	rest = data[dec.NumBytesRead():]
 
@@ -116,7 +149,6 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg := newDecodeConfig(opts)
 	if err := cfg.checkStrict(first, env); err != nil {
 		return nil, nil, err
 	}
@@ -231,11 +263,12 @@ func PeekTag(data []byte) (uint64, error) {
 // returns an error (wrapping a package sentinel) and a nil envelope.
 func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Reader, err error) {
 	// Read exactly one CBOR item. Whatever the decoder buffered past that item,
-	// followed by the unread remainder of r, is the detached payload.
-	dec := decMode.NewDecoder(r)
-	var first cbor.RawMessage
-	if err := dec.Decode(&first); err != nil {
-		return nil, nil, malformedItem(err)
+	// followed by the unread remainder of r, is the detached payload. The size
+	// limit applies only to that read: rest draws on r directly.
+	cfg := newDecodeConfig(opts)
+	first, dec, err := cfg.readItem(r)
+	if err != nil {
+		return nil, nil, err
 	}
 	rest = io.MultiReader(dec.Buffered(), r)
 
@@ -247,7 +280,6 @@ func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Rea
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg := newDecodeConfig(opts)
 	if err := cfg.checkStrict(first, env); err != nil {
 		return nil, nil, err
 	}

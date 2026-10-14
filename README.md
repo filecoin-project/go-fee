@@ -497,18 +497,19 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
 - **Application metadata** (label −65792) — accepted and ignored; this package
   does not write it.
 - **A256KW recipients** (alg −5) — the protected header is empty (`h''`) and
-  `alg` is unprotected, as RFC 9053 §6.2.1 requires.
+  `alg` is unprotected, as RFC 9053 §6.2.1 requires. For both recipient
+  algorithms the wrapped CEK is exactly 40 bytes.
 - **Envelope processing** — every CBOR item, including the serialized protected
   headers, must use definite lengths and shortest-form arguments, and may
   contain no floats, no tags besides the envelope's own, and no simple values
-  other than `false`, `true` and `null` (`cose.WithStrictEncoding`); nesting is
-  limited to 256 levels and duplicate labels are rejected. `crit` must
-  be protected and may name only parameters this package processes that are
-  present in the same protected header, never `crit` itself. A Partial IV
-  in either content bucket is rejected, as is any label in both the protected
-  and unprotected header, for the body and for each recipient. Every recipient
-  is checked when the envelope is read, whether or not it is used. Unknown
-  non-critical parameters are ignored.
+  other than `false`, `true` and `null` (`cose.WithStrictEncoding`). Duplicate
+  labels are rejected. `crit` must be protected and may name only parameters
+  this package processes that are present in the same protected header, never
+  `crit` itself. A Partial IV in either content bucket is rejected, as is any
+  label in both the protected and unprotected header, for the body and for
+  each recipient. Every recipient is checked when the envelope is read,
+  whether or not it is used. Unknown non-critical parameters are ignored. See
+  [Security notes](#security-notes) for the parser's size limits.
 - **ECDH-ES key derivation** (alg −31) — HKDF-SHA-256 (RFC 5869) over the X25519
   shared secret, as RFC 9053 §6.3.1 requires, with the §5.2 `COSE_KDF_Context`
   as the info parameter: `AlgorithmID` −5 (A256KW), empty PartyU/PartyV,
@@ -536,6 +537,11 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
   wrap integrity check, so trying one is safe, and one decrypt tries at most
   `MaxUnwrapAttempts` keys. The recipient array is not authenticated by the
   body, so anyone can add recipients; this bounds the work they can cause.
+- **Parser limits.** The envelope is parsed before anything is authenticated,
+  so every decrypt path limits it: at most `MaxEnvelopeSize` (1 MiB, as in the
+  Synapse SDK) is read looking for its end, nesting is limited to 256 levels,
+  and an array or map may hold at most 131,072 entries. A larger envelope fails
+  with `cose.ErrTooLarge`, and `Encrypt` refuses to write one.
 - **Envelope type pinning.** Encrypt writes, and Decrypt requires, the COSE
   `typ` `application/vnd.filecoin-encryption+cose`, so non-FEE blobs are rejected
   before any key material is touched.
