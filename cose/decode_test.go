@@ -209,3 +209,20 @@ func TestDecodeReaderMaxSizeBoundsReads(t *testing.T) {
 	require.ErrorIs(t, err, ErrTooLarge)
 	require.LessOrEqual(t, int64(len(head))+body.read, int64(limit))
 }
+
+// TestDecodeWithMaxSizeNotPositive: a limit of zero or less is a caller error
+// that fails every decode before any input is read, rather than lifting the
+// limit.
+func TestDecodeWithMaxSizeNotPositive(t *testing.T) {
+	header, err := sampleEnvelope().Encode()
+	require.NoError(t, err)
+	for _, n := range []int64{0, -1} {
+		_, _, err := Decode(header, WithMaxSize(n))
+		require.ErrorIs(t, err, ErrInvalidMaxSize, "Decode, limit %d", n)
+
+		r := &countingReader{n: int64(len(header))}
+		_, _, err = DecodeReader(r, WithMaxSize(n))
+		require.ErrorIs(t, err, ErrInvalidMaxSize, "DecodeReader, limit %d", n)
+		require.Zero(t, r.read, "DecodeReader read input, limit %d", n)
+	}
+}

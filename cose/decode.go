@@ -14,6 +14,7 @@ type decodeConfig struct {
 	checkType    bool
 	expectedType string
 	strict       bool
+	limitSize    bool
 	maxSize      int64
 }
 
@@ -46,10 +47,14 @@ func WithStrictEncoding() DecodeOption {
 // bytes. Decoding reads no more than n bytes looking for the end of the
 // envelope, so an envelope that declares a huge item cannot make it buffer an
 // unbounded amount of input. A larger envelope fails with an error matching
-// both ErrMalformed and ErrTooLarge. n must be positive; without this option
-// the envelope size is not limited.
+// both ErrMalformed and ErrTooLarge. n must be positive: with a smaller n,
+// every decode fails with ErrInvalidMaxSize before reading any input, rather
+// than going unlimited. Without this option the envelope size is not limited.
 func WithMaxSize(n int64) DecodeOption {
-	return func(c *decodeConfig) { c.maxSize = n }
+	return func(c *decodeConfig) {
+		c.limitSize = true
+		c.maxSize = n
+	}
 }
 
 // readItem reads the single CBOR item at the front of r, reading at most
@@ -57,7 +62,10 @@ func WithMaxSize(n int64) DecodeOption {
 // that read it, whose buffer may hold bytes read past the item.
 func (cfg decodeConfig) readItem(r io.Reader) (cbor.RawMessage, *cbor.Decoder, error) {
 	var limited *io.LimitedReader
-	if cfg.maxSize > 0 {
+	if cfg.limitSize {
+		if cfg.maxSize <= 0 {
+			return nil, nil, fmt.Errorf("%w: got %d", ErrInvalidMaxSize, cfg.maxSize)
+		}
 		limited = &io.LimitedReader{R: r, N: cfg.maxSize}
 		r = limited
 	}

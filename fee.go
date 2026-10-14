@@ -327,7 +327,7 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // EncryptWithCEK is [Encrypt] with a caller-provided content-encryption key
 // instead of a freshly generated one — for when the CEK is managed out of band
 // (derived deterministically, or issued by a custody service). cek must be 32
-// bytes (AES-256).
+// bytes (AES-256) and not all zeros, or the call fails with [ErrInvalidCEK].
 //
 // With one or more recipients it produces a COSE_Encrypt (tag 96) that also
 // carries the wrapped CEK; with no recipients it produces a recipient-less
@@ -609,9 +609,9 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 // instead of one recovered from an in-envelope recipient — for when the CEK was
 // obtained out of band (e.g. unwrapped by a custody service). It accepts either
 // a COSE_Encrypt (tag 96) or a recipient-less COSE_Encrypt0 (tag 16); any
-// recipients are validated but not used. cek must be 32 bytes (AES-256). The
-// envelope is held to the same rules as for Decrypt, [MaxEnvelopeSize]
-// included.
+// recipients are validated but not used. cek must be 32 bytes (AES-256) and
+// not all zeros, or the call fails with [ErrInvalidCEK]. The envelope is held
+// to the same rules as for Decrypt, [MaxEnvelopeSize] included.
 //
 // The caller retains ownership of cek: it is copied into the body cipher but
 // neither retained nor wiped by this call.
@@ -767,9 +767,15 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 	}
 
 	// content_type is informational and otherwise ignored, but its type is
-	// part of the wire format: a text string or a non-negative integer.
-	if v, ok := env.Headers.Protected.Get(cose.HeaderLabelContentType); ok {
-		switch ct := v.(type) {
+	// part of the wire format: a text string or a non-negative integer. It
+	// may be in either bucket, and checkDisjoint has ensured it is in at most
+	// one.
+	contentType, ok := env.Headers.Protected.Get(cose.HeaderLabelContentType)
+	if !ok {
+		contentType, ok = env.Headers.Unprotected.Get(cose.HeaderLabelContentType)
+	}
+	if ok {
+		switch ct := contentType.(type) {
 		case string:
 		case int64:
 			if ct < 0 {

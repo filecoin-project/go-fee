@@ -119,6 +119,9 @@ var (
 	// ErrTooLarge means the envelope is larger than the limit set with
 	// WithMaxSize. It is always reported together with ErrMalformed.
 	ErrTooLarge = errors.New("cose: envelope exceeds the size limit")
+	// ErrInvalidMaxSize means WithMaxSize was given a limit that is not
+	// positive. It is a caller error, reported before any input is read.
+	ErrInvalidMaxSize = errors.New("cose: WithMaxSize limit must be positive")
 	// ErrDetachedPayload means the body ciphertext field was not CBOR null;
 	// this package only handles detached payloads.
 	ErrDetachedPayload = errors.New("cose: body ciphertext must be null (detached payload)")

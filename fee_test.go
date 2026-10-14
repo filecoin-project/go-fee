@@ -1667,3 +1667,42 @@ func TestEncryptEnvelopeSizeLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, plaintext[:10], got)
 }
+
+// TestContentTypeEitherBucket: content_type may be unprotected, and is held to
+// the same type rules there: a text string or non-negative integer decrypts,
+// anything else is malformed on every path.
+func TestContentTypeEitherBucket(t *testing.T) {
+	cek, plaintext := newCEK(t), patternBytes(100)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil)
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	withContentType := func(v any) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		env.Headers.Unprotected.Set(cose.HeaderLabelContentType, v)
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+
+	for name, v := range map[string]any{"text": "application/pdf", "integer": int64(50)} {
+		r, err := fee.DecryptWithCEK(bytes.NewReader(withContentType(v)), cek)
+		require.NoError(t, err, name)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err, name)
+		require.Equal(t, plaintext, got, name)
+	}
+
+	for name, v := range map[string]any{"negative integer": int64(-1), "byte string": []byte("application/pdf")} {
+		bad := withContentType(v)
+		_, err := fee.DecryptWithCEK(bytes.NewReader(bad), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(bad), int64(len(bad)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+		_, err = fee.DecryptRangeWithCEK(bytes.NewReader(bad), int64(len(bad)), cek, 0, 0, nil)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRangeWithCEK, %s", name)
+	}
+}

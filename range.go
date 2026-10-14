@@ -169,7 +169,8 @@ func DecryptRange(blob io.ReaderAt, blobSize int64, unwrap RecipientUnwrapper, s
 // key instead of one recovered from an in-envelope recipient — for when the CEK
 // was obtained out of band (e.g. unwrapped by a custody service). It accepts
 // either a COSE_Encrypt (tag 96) or a recipient-less COSE_Encrypt0 (tag 16); any
-// recipients are validated but not used. cek must be 32 bytes (AES-256).
+// recipients are validated but not used. cek must be 32 bytes (AES-256) and
+// not all zeros, or the call fails with [ErrInvalidCEK].
 //
 // If desc is nil, it decodes the envelope header from blob exactly as
 // [DecryptRange] does. A caller that already cached the needed
