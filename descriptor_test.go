@@ -417,8 +417,9 @@ func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 
 // TestBodyDescriptorChecksDeclaredLength: the plaintext length the protected
 // header declares is read from the cached AAD, so the descriptor path rejects a
-// blob truncated or padded inside its final chunk with ErrSizeMismatch, exactly
-// as the envelope-backed paths do, even for a range that never reads that chunk.
+// truncated or padded blob with ErrSizeMismatch, exactly as the envelope-backed
+// paths do, even for a range that never reads the final chunk, and even when
+// the truncated length is not a valid FEE layout.
 func TestBodyDescriptorChecksDeclaredLength(t *testing.T) {
 	const size = 3*rangeChunk + 100
 	plaintext := patternBytes(size)
@@ -432,7 +433,11 @@ func TestBodyDescriptorChecksDeclaredLength(t *testing.T) {
 
 	for name, b := range map[string][]byte{
 		"truncated in the final chunk": blob[:len(blob)-10],
-		"padded in the final chunk":    append(bytes.Clone(blob), make([]byte, 10)...),
+		// The final chunk holds 100 plaintext bytes, so 116 of ciphertext.
+		// Cutting 110 leaves 6, which no FEE layout allows.
+		"truncated to a final chunk under 16 bytes": blob[:len(blob)-110],
+		"truncated to a chunk boundary":             blob[:len(blob)-116],
+		"padded in the final chunk":                 append(bytes.Clone(blob), make([]byte, 10)...),
 	} {
 		_, err := desc.PlaintextSize(int64(len(b)))
 		require.ErrorIs(t, err, fee.ErrSizeMismatch, "PlaintextSize, %s", name)

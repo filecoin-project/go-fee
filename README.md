@@ -456,6 +456,42 @@ or corrupted record cannot serve wrong plaintext, since the AAD is bound into
 every chunk's GCM tag and the envelope length decides which bytes are read; it
 fails with `aesstream.ErrCorrupted` instead.
 
+## Upgrading from v0.2
+
+**Envelopes written by v0.2 do not decrypt with this version.** The wire format
+now follows the Synapse SDK (see [Wire format](#wire-format)): a new `typ`,
+every body parameter protected, the chunk size at label `-1`, a plaintext
+length in place of the chunk count, and an empty protected header on A256KW
+recipients. Decrypt existing objects with v0.2 and re-encrypt them with this
+version.
+
+API changes:
+
+- `BodyDescriptor` holds only `HeaderLen` and `AAD`. The base nonce and chunk
+  size are read from the protected header in the AAD, through the new
+  `ChunkSize()` and `BaseNonce()` methods. A store that persists descriptors
+  keeps those two values.
+- `Decrypt` and `DecryptRange` find a recipient by trying keys (see
+  [Recipients without a kid](#recipients-without-a-kid)), so a `kid` is now
+  optional when encrypting and decrypting. New: `MultiUnwrapper`,
+  `MaxUnwrapAttempts` and `ErrUnwrapAttemptLimit`.
+- `ErrNoMatchingRecipient` now means no recipient could be unwrapped. When a
+  key was tried and failed it also wraps `aeskw.ErrIntegrity`, which a wrong
+  KEK used to return on its own. `ErrUnsupportedRecipientAlg` is removed: a key
+  is only tried against recipients of its own algorithm.
+- `WithContentLength` records the plaintext length rather than a chunk count,
+  and must be at most `MaxPlaintextLength`. `ErrSizeMismatch` now compares the
+  blob size with that length, on every range path, cached descriptors
+  included.
+- Every decode path limits the envelope to `MaxEnvelopeSize` (1 MiB), and
+  `Encrypt` refuses to write a larger one (`cose.ErrTooLarge`).
+- A failure to decode an envelope also matches `ErrMalformedEnvelope`. A
+  failure to read it from its source wraps the source's error instead.
+- An all-zero CEK is rejected (`ErrInvalidCEK`), whether supplied or
+  recovered by unwrapping.
+- `cose` adds `WithStrictEncoding`, `WithMaxSize` and `ParseEncStructure`.
+  `aesstream.MaxChunks` is 2^32 − 1.
+
 ## Wire format
 
 `blob = envelope ‖ ciphertext` (COSE detached payload). The envelope is
@@ -505,7 +541,8 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
   headers, must use definite lengths and shortest-form arguments, and may
   contain no floats, no tags besides the envelope's own, and no simple values
   other than `false`, `true` and `null` (`cose.WithStrictEncoding`). Duplicate
-  labels are rejected. `crit` must be protected and may name only parameters
+  labels are rejected, as is any integer outside ±(2^53 − 1), which the Synapse
+  SDK cannot represent. `crit` must be protected and may name only parameters
   this package processes that are present in the same protected header, never
   `crit` itself. A Partial IV in either content bucket is rejected, as is any
   label in both the protected and unprotected header, for the body and for

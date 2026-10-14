@@ -294,21 +294,24 @@ func spanRangeReader(blob io.ReaderAt, blobSize, headerLen int64, body bodyParam
 }
 
 // checkedPlaintextSize is [plaintextSizeFrom] with the cross-check of the
-// declared plaintext length, when body carries one, against the length the
-// ciphertext actually holds. It catches a blob size that describes a different
-// object than the protected header does. Each plaintext length has exactly one
-// valid ciphertext length, so the comparison is exact. The envelope-backed paths
+// declared plaintext length, when body carries one, against the ciphertext
+// length. It catches a blob size that describes a different object than the
+// protected header does, reporting [ErrSizeMismatch] for any such size. Each
+// plaintext length has exactly one valid ciphertext length, so the comparison
+// is exact. The envelope-backed paths
 // and the cached-descriptor path share it, so they report the same errors.
 func checkedPlaintextSize(blobSize, headerLen int64, body bodyParams) (int64, error) {
-	plainSize, err := plaintextSizeFrom(blobSize, headerLen, body.chunkSize)
-	if err != nil {
-		return 0, err
+	// With a declared length the expected ciphertext length is known exactly,
+	// so it is compared first: any other length is a size mismatch, including
+	// one whose layout could not be a FEE body at all.
+	if body.plaintextLength >= 0 && blobSize >= headerLen {
+		want := aesstream.EncryptedSize(body.plaintextLength, body.chunkSize)
+		if got := blobSize - headerLen; got != want {
+			return 0, fmt.Errorf("%w: envelope declares %d plaintext bytes, which encrypt to %d ciphertext bytes, but the blob holds %d",
+				ErrSizeMismatch, body.plaintextLength, want, got)
+		}
 	}
-	if body.plaintextLength >= 0 && body.plaintextLength != plainSize {
-		return 0, fmt.Errorf("%w: envelope declares %d plaintext bytes, the ciphertext holds %d",
-			ErrSizeMismatch, body.plaintextLength, plainSize)
-	}
-	return plainSize, nil
+	return plaintextSizeFrom(blobSize, headerLen, body.chunkSize)
 }
 
 // decodeHeaderAt decodes the FEE envelope at the front of blob and reports its
@@ -350,7 +353,7 @@ func decodeHeaderAt(blob io.ReaderAt, blobSize int64) (*cose.Envelope, int64, er
 		// verdict. Retrying those would turn one wrong object id into a walk up to
 		// MaxEnvelopeSize against the store.
 		if !errors.Is(derr, io.ErrUnexpectedEOF) || atEnd || probe >= limit {
-			return nil, 0, fmt.Errorf("fee: decoding envelope: %w", derr)
+			return nil, 0, envelopeDecodeError(derr)
 		}
 		probe = min(probe*2, limit)
 	}

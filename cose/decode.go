@@ -61,6 +61,10 @@ func WithMaxSize(n int64) DecodeOption {
 // cfg.maxSize bytes when a limit is set, and returns the item with the decoder
 // that read it, whose buffer may hold bytes read past the item.
 func (cfg decodeConfig) readItem(r io.Reader) (cbor.RawMessage, *cbor.Decoder, error) {
+	// Watch r for a read error, so a failing source is reported as one rather
+	// than as a malformed envelope.
+	watched := &errReader{r: r}
+	r = watched
 	var limited *io.LimitedReader
 	if cfg.limitSize {
 		if cfg.maxSize <= 0 {
@@ -72,6 +76,9 @@ func (cfg decodeConfig) readItem(r io.Reader) (cbor.RawMessage, *cbor.Decoder, e
 	dec := decMode.NewDecoder(r)
 	var item cbor.RawMessage
 	if err := dec.Decode(&item); err != nil {
+		if watched.err != nil {
+			return nil, nil, fmt.Errorf("cose: reading envelope: %w", watched.err)
+		}
 		// The limit was used up before the item ended, so the envelope is
 		// larger than it, whether or not more input followed.
 		if limited != nil && limited.N == 0 && errors.Is(err, io.ErrUnexpectedEOF) {
@@ -164,6 +171,21 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 		return nil, nil, err
 	}
 	return env, rest, nil
+}
+
+// errReader passes reads through to r and records the first error r returns
+// other than io.EOF.
+type errReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // malformedItem reports a failure to read the single leading CBOR item as
@@ -268,7 +290,9 @@ func PeekTag(data []byte) (uint64, error) {
 // as strict — both share the decodeEnvelope validation core: a byte-string
 // protected header, map headers without duplicate labels, a null detached body,
 // and, for tag 96, at least one well-formed 3-element recipient. Any deviation
-// returns an error (wrapping a package sentinel) and a nil envelope.
+// returns an error (wrapping a package sentinel) and a nil envelope. If r
+// itself fails while the envelope is read, that error is returned wrapped,
+// and is not reported as ErrMalformed.
 func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Reader, err error) {
 	// Read exactly one CBOR item. Whatever the decoder buffered past that item,
 	// followed by the unread remainder of r, is the detached payload. The size

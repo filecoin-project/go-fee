@@ -3,8 +3,10 @@ package cose
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/require"
 )
@@ -259,5 +261,20 @@ func TestParseEncStructure(t *testing.T) {
 	for name, h := range malformed {
 		_, _, _, err := ParseEncStructure(hexDec(t, h))
 		require.ErrorIs(t, err, ErrMalformed, name)
+	}
+}
+
+// TestDecodeReaderReadError: a source that fails partway through the envelope
+// is reported as that failure, not as a malformed envelope, with or without a
+// size limit.
+func TestDecodeReaderReadError(t *testing.T) {
+	header, err := sampleEnvelope().Encode()
+	require.NoError(t, err)
+	boom := errors.New("connection reset")
+	for name, opts := range map[string][]DecodeOption{"no limit": nil, "with a limit": {WithMaxSize(1 << 20)}} {
+		r := io.MultiReader(bytes.NewReader(header[:len(header)/2]), iotest.ErrReader(boom))
+		_, _, err := DecodeReader(r, opts...)
+		require.ErrorIs(t, err, boom, name)
+		require.NotErrorIs(t, err, ErrMalformed, name)
 	}
 }

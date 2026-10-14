@@ -267,7 +267,8 @@ func validateRecipients(recipients []*cose.Recipient) error {
 
 // validateRecipient checks one recipient. Its ciphertext is a byte string. In
 // its headers, crit is processed (only alg and kid may be named), no label
-// appears in both buckets, kid, wherever it is, is a byte string, and alg is
+// appears in both buckets, every integer is within ±(2^53 - 1), kid, wherever
+// it is, is a byte string, and alg is
 // present, as an integer or a text string. For the algorithms FEE profiles it
 // also checks placement and size. An A256KW recipient's protected header is
 // empty (RFC 9053 §6.2.1), so its alg is unprotected. An ECDH-ES+A256KW
@@ -287,6 +288,12 @@ func validateRecipient(r *cose.Recipient) error {
 		return err
 	}
 	if err := checkDisjoint(h); err != nil {
+		return err
+	}
+	if err := checkSafeIntegers(h.Protected, "recipient protected"); err != nil {
+		return err
+	}
+	if err := checkSafeIntegers(h.Unprotected, "recipient unprotected"); err != nil {
 		return err
 	}
 	for _, m := range []cose.Header{h.Protected, h.Unprotected} {

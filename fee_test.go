@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"errors"
 	"io"
 	"strconv"
 	"testing"
@@ -740,7 +741,8 @@ func TestContentLengthPlaintextLength(t *testing.T) {
 
 // TestContentLengthMismatch confirms that when the declared content length does
 // not match the plaintext actually streamed, the returned reader surfaces
-// ErrContentLengthMismatch (the already-written chunk count cannot be trusted).
+// ErrContentLengthMismatch (the already-written plaintext length cannot be
+// trusted).
 func TestContentLengthMismatch(t *testing.T) {
 	key := newX25519Key(t)
 	// Multiple chunks, so some full chunks are emitted before the final chunk is
@@ -1750,4 +1752,112 @@ func TestPlaintextLengthSafeIntegerBound(t *testing.T) {
 	rc, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithContentLength(fee.MaxPlaintextLength))
 	require.NoError(t, err, "WithContentLength at the bound")
 	require.NoError(t, rc.Close())
+}
+
+// TestEnvelopeErrorClassification: an envelope whose bytes are not a valid FEE
+// envelope is ErrMalformedEnvelope on every path, alongside the cose sentinel,
+// while a source that fails partway through the envelope keeps its own error
+// and is not reported as malformed.
+func TestEnvelopeErrorClassification(t *testing.T) {
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	env, ciphertext, err := cose.Decode(blob)
+	require.NoError(t, err)
+	env.Headers.Protected.Set(cose.HeaderLabelType, "application/cose")
+	env.Headers.RawProtected = nil
+	header, err := env.Encode()
+	require.NoError(t, err)
+	wrongTyp := append(header, ciphertext...)
+
+	for name, tc := range map[string]struct {
+		blob []byte
+		also error
+	}{
+		"not CBOR":           {[]byte{0xff, 0xff, 0xff}, cose.ErrMalformed},
+		"not a COSE_Encrypt": {[]byte{0x01}, cose.ErrNotEncrypt},
+		"wrong typ":          {wrongTyp, cose.ErrUnexpectedType},
+		"oversized":          {append([]byte{0xd8, 0x60, 0x84, 0x5a, 0x01, 0, 0, 0}, make([]byte, fee.MaxEnvelopeSize)...), cose.ErrTooLarge},
+	} {
+		u := fee.NewA256KWUnwrapper(a256kwKID, newKEK(t))
+		_, err := fee.Decrypt(bytes.NewReader(tc.blob), u)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt, %s", name)
+		require.ErrorIs(t, err, tc.also, "Decrypt, %s", name)
+		_, err = fee.DecryptWithCEK(bytes.NewReader(tc.blob), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.DecryptRange(bytes.NewReader(tc.blob), int64(len(tc.blob)), u, 0, 0)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptRange, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(tc.blob), int64(len(tc.blob)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+	}
+
+	boom := errors.New("connection reset")
+	failing := func() io.Reader { return io.MultiReader(bytes.NewReader(blob[:20]), iotest.ErrReader(boom)) }
+	_, err = fee.Decrypt(failing(), fee.NewA256KWUnwrapper(a256kwKID, newKEK(t)))
+	require.ErrorIs(t, err, boom, "Decrypt")
+	require.NotErrorIs(t, err, fee.ErrMalformedEnvelope, "Decrypt")
+	_, err = fee.DecryptWithCEK(failing(), cek)
+	require.ErrorIs(t, err, boom, "DecryptWithCEK")
+	require.NotErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK")
+}
+
+// TestSafeIntegersOnly: an integer outside ±(2^53 - 1) anywhere in the
+// envelope's headers is malformed, as the Synapse SDK requires, wherever it
+// sits; integers at the bound are accepted.
+func TestSafeIntegersOnly(t *testing.T) {
+	const maxSafe = int64(1)<<53 - 1
+	cek := newCEK(t)
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, []fee.Recipient{fee.NewA256KWRecipient(a256kwKID, newKEK(t))})
+	require.NoError(t, err)
+	blob, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	edited := func(edit func(*cose.Envelope)) []byte {
+		env, ciphertext, err := cose.Decode(blob)
+		require.NoError(t, err)
+		edit(env)
+		header, err := env.Encode()
+		require.NoError(t, err)
+		return append(header, ciphertext...)
+	}
+	unprotected := func(label, v any) []byte {
+		return edited(func(e *cose.Envelope) { e.Headers.Unprotected.Set(label, v) })
+	}
+
+	for name, b := range map[string][]byte{
+		"unprotected value above": unprotected(int64(99), maxSafe+1),
+		"unprotected value below": unprotected(int64(99), -maxSafe-1),
+		"unsigned beyond int64":   unprotected(int64(99), uint64(1)<<63),
+		"label above":             unprotected(maxSafe+1, int64(1)),
+		"nested in an array":      unprotected(int64(99), []any{int64(1), maxSafe + 1}),
+		"nested map key":          unprotected(int64(99), map[any]any{maxSafe + 1: "x"}),
+		"protected app_metadata": edited(func(e *cose.Envelope) {
+			e.Headers.Protected.Set(labelAppMetadata, map[any]any{"n": maxSafe + 1})
+			e.Headers.RawProtected = nil
+		}),
+		"recipient header": edited(func(e *cose.Envelope) {
+			e.Recipients[0].Headers.Unprotected.Set(int64(99), maxSafe+1)
+		}),
+	} {
+		_, err := fee.DecryptWithCEK(bytes.NewReader(b), cek)
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "DecryptWithCEK, %s", name)
+		_, err = fee.PlaintextSize(bytes.NewReader(b), int64(len(b)))
+		require.ErrorIs(t, err, fee.ErrMalformedEnvelope, "PlaintextSize, %s", name)
+	}
+
+	for name, b := range map[string][]byte{
+		"unprotected value at the bound": unprotected(int64(99), maxSafe),
+		"negative value at the bound":    unprotected(int64(99), -maxSafe),
+		"label at the bound":             unprotected(maxSafe, int64(1)),
+	} {
+		r, err := fee.DecryptWithCEK(bytes.NewReader(b), cek)
+		require.NoError(t, err, name)
+		_, err = io.ReadAll(r)
+		require.NoError(t, err, name)
+	}
 }

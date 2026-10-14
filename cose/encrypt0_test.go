@@ -24,7 +24,7 @@ func sampleEncrypt0() *Envelope {
 				Set(HeaderLabelType, encrypt0TestType),
 			Unprotected: Header{}.
 				Set(HeaderLabelIV, bytes.Repeat([]byte{0xAB}, 7)).
-				Set(int64(-65790), 262144), // FEE chunk-size private-use label
+				Set(int64(-65790), 262144), // an arbitrary private-use integer parameter
 		},
 	}
 }

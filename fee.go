@@ -89,6 +89,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/filecoin-project/go-fee/cose"
@@ -148,7 +149,12 @@ var bodyUnderstoodLabels = map[int64]bool{
 // 2^53 - 1, JavaScript's largest safe integer. The Synapse SDK rejects a larger
 // declared length, so a decoder rejects one as malformed and [WithContentLength]
 // refuses to write one. It is about 8 PiB, far beyond any real object.
-const MaxPlaintextLength = 1<<53 - 1
+const MaxPlaintextLength = maxSafeInteger
+
+// maxSafeInteger is JavaScript's largest safe integer, 2^53 - 1. The Synapse
+// SDK rejects any envelope with an integer outside ±maxSafeInteger anywhere in
+// its headers, so a decoder here does too (see checkSafeIntegers).
+const maxSafeInteger = 1<<53 - 1
 
 // MaxEnvelopeSize is the largest encoded envelope, outer tag included, that
 // any decrypt path accepts: 1 MiB, the Synapse SDK's limit. Reading stops once
@@ -164,6 +170,62 @@ var envelopeDecodeOptions = []cose.DecodeOption{
 	cose.WithExpectedType(EnvelopeType),
 	cose.WithStrictEncoding(),
 	cose.WithMaxSize(MaxEnvelopeSize),
+}
+
+// checkSafeIntegers rejects a header holding an integer outside
+// ±maxSafeInteger anywhere in it: as a label, a value, or nested in an array
+// or map, map keys included. COSE allows any 64-bit integer, but the Synapse
+// SDK rejects these, so an envelope that carries one cannot be read by both
+// libraries. where names the header in the error.
+func checkSafeIntegers(h cose.Header, where string) error {
+	if err := checkSafeValue(map[any]any(h)); err != nil {
+		return fmt.Errorf("%w: %s header: %w", ErrMalformedEnvelope, where, err)
+	}
+	return nil
+}
+
+// checkSafeValue reports the first integer in v outside ±maxSafeInteger. The
+// CBOR decoder bounds how deeply v nests.
+func checkSafeValue(v any) error {
+	switch x := v.(type) {
+	case int64:
+		if x > maxSafeInteger || x < -maxSafeInteger {
+			return fmt.Errorf("integer %d is outside ±(2^53 - 1)", x)
+		}
+	case uint64, big.Int, *big.Int:
+		return fmt.Errorf("integer %v is outside ±(2^53 - 1)", x)
+	case []any:
+		for _, e := range x {
+			if err := checkSafeValue(e); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		for k, e := range x {
+			if err := checkSafeValue(k); err != nil {
+				return err
+			}
+			if err := checkSafeValue(e); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// envelopeDecodeError reports a cose decode failure. One caused by the
+// envelope's bytes is also [ErrMalformedEnvelope]; one caused by reading them,
+// or by a caller error, keeps only its own classification.
+func envelopeDecodeError(err error) error {
+	for _, malformed := range []error{
+		cose.ErrMalformed, cose.ErrNotEncrypt, cose.ErrUnexpectedType,
+		cose.ErrDetachedPayload, cose.ErrNoRecipients, cose.ErrInvalidLabel,
+	} {
+		if errors.Is(err, malformed) {
+			return fmt.Errorf("%w: decoding envelope: %w", ErrMalformedEnvelope, err)
+		}
+	}
+	return fmt.Errorf("fee: decoding envelope: %w", err)
 }
 
 // checkDisjoint rejects a header pair that carries any label in both its
@@ -237,8 +299,12 @@ var (
 	// or is not the FEE chunked AES-256-GCM-STREAM cipher.
 	ErrUnsupportedBodyAlg = errors.New("fee: unsupported body algorithm")
 
-	// ErrMalformedEnvelope means a required body header was missing or had the
-	// wrong type, or a declared parameter was out of range.
+	// ErrMalformedEnvelope means the envelope's bytes are not a valid FEE
+	// envelope: they do not decode as one (the error also wraps the cose
+	// sentinel, such as cose.ErrMalformed or cose.ErrUnexpectedType), a
+	// required body header was missing or had the wrong type, or a declared
+	// parameter was out of range. A failure to read the envelope from its
+	// source is not reported as ErrMalformedEnvelope.
 	ErrMalformedEnvelope = errors.New("fee: malformed FEE envelope")
 
 	// ErrNilUnwrapper means Decrypt was given a nil RecipientUnwrapper.
@@ -590,7 +656,7 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 
 	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
+		return nil, envelopeDecodeError(err)
 	}
 	if len(env.Recipients) == 0 {
 		return nil, ErrNoRecipientsInEnvelope
@@ -634,7 +700,7 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 	}
 	env, ciphertext, err := cose.DecodeReader(src, envelopeDecodeOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
+		return nil, envelopeDecodeError(err)
 	}
 	return openStream(env, ciphertext, cek)
 }
@@ -724,10 +790,11 @@ func (b bodyParams) streamConfig(cek, aad []byte) aesstream.Config {
 
 // validateBodyParams checks a decoded envelope's headers — every recipient is
 // well formed (see [validateRecipient]), no body label is in both buckets,
-// every FEE parameter is protected, the algorithm is the chunked AES-256-GCM-STREAM
-// cipher, the base nonce (iv) is present and 7 bytes, the chunk size is
-// present and in range, content_type and app_metadata have the types the wire
-// format allows, and a declared plaintext length is a non-negative integer.
+// every integer is within ±(2^53 - 1), every FEE parameter is protected, the
+// algorithm is the chunked AES-256-GCM-STREAM cipher, the base nonce (iv) is
+// present and 7 bytes, the chunk size is present and in range, content_type
+// and app_metadata have the types the wire format allows, and a declared
+// plaintext length is from 0 to [MaxPlaintextLength].
 //
 // It is shared by the whole-object path's AAD-building resolution
 // ([buildBodyParamsWithAAD]) and the header-only sizing path ([PlaintextSize]),
@@ -738,6 +805,12 @@ func validateBodyParams(env *cose.Envelope) (bodyParams, error) {
 		return bodyParams{}, err
 	}
 	if err := checkDisjoint(env.Headers); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkSafeIntegers(env.Headers.Protected, "protected"); err != nil {
+		return bodyParams{}, err
+	}
+	if err := checkSafeIntegers(env.Headers.Unprotected, "unprotected"); err != nil {
 		return bodyParams{}, err
 	}
 	if err := validateRecipients(env.Recipients); err != nil {
