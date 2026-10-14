@@ -209,10 +209,10 @@ func encryptFile(src, dst string, recipients []fee.Recipient) error {
         return err
     }
 
-    // WithContentLength is optional: it records the plaintext length in the
+    // WithPlaintextLength is optional: it records the plaintext length in the
     // envelope, so readers detect a truncated blob from its size, and fails
     // the stream if the plaintext turns out to be a different length.
-    r, _, err := fee.Encrypt(in, recipients, fee.WithContentLength(info.Size()))
+    r, _, err := fee.Encrypt(in, recipients, fee.WithPlaintextLength(info.Size()))
     if err != nil {
         return err
     }
@@ -479,10 +479,11 @@ API changes:
   key was tried and failed it also wraps `aeskw.ErrIntegrity`, which a wrong
   KEK used to return on its own. `ErrUnsupportedRecipientAlg` is removed: a key
   is only tried against recipients of its own algorithm.
-- `WithContentLength` records the plaintext length rather than a chunk count,
-  and must be at most `MaxPlaintextLength`. `ErrSizeMismatch` now compares the
-  blob size with that length, on every range path, cached descriptors
-  included.
+- `WithContentLength` is renamed `WithPlaintextLength`, and
+  `ErrContentLengthMismatch` is renamed `ErrPlaintextLengthMismatch`. The option
+  records the plaintext length rather than a chunk count, and must be at most
+  `MaxPlaintextLength`. `ErrSizeMismatch` now compares the blob size with that
+  length, on every range path, cached descriptors included.
 - Every decode path limits the envelope to `MaxEnvelopeSize` (1 MiB), and
   `Encrypt` refuses to write a larger one (`cose.ErrTooLarge`).
 - A failure to decode an envelope also matches `ErrMalformedEnvelope`. A

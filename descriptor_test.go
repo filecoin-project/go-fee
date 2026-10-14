@@ -88,7 +88,7 @@ func TestIngotWriteReadFlow(t *testing.T) {
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, tenantKey.PublicKey())},
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	// The writer's copy of the CEK is done with; only the wrapped form persists.
 	clear(cek)
@@ -225,7 +225,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorEncrypt0(t *testing.T) {
 	cek := newCEK(t)
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	// It really is the recipient-less form.
 	tag, err := cose.PeekTag(blob)
@@ -253,7 +253,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorMatchesEnvelopePath(t *testing.T) {
 
 	blob, desc := encryptWithDescriptor(t, plaintext, cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, tenantKey.PublicKey())},
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 	unwrapper := fee.NewECDHESUnwrapper(ecdhKID, tenantKey)
 
 	for _, start := range []int64{0, 1, rangeChunk - 1, rangeChunk, 2 * rangeChunk, size - 7} {
@@ -349,14 +349,14 @@ func TestDecryptRangeWithCEKAndBodyDescriptorPoisoned(t *testing.T) {
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	for name, mutate := range map[string]func(m *fee.BodyDescriptor){
 		"header length off by one": func(m *fee.BodyDescriptor) { m.HeaderLen++ },
 		"aad from another object": func(m *fee.BodyDescriptor) {
 			// Well formed and the same shape, but a different base nonce.
 			_, other := encryptWithDescriptor(t, plaintext, cek, nil,
-				fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+				fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 			m.AAD = other.AAD
 		},
 		"tampered aad": func(m *fee.BodyDescriptor) {
@@ -386,7 +386,7 @@ func TestDecryptRangeWithCEKAndBodyDescriptorInvalidArgs(t *testing.T) {
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 	blobSize := int64(len(blob))
 
 	t.Run("short cek", func(t *testing.T) {
@@ -425,7 +425,7 @@ func TestBodyDescriptorChecksDeclaredLength(t *testing.T) {
 	plaintext := patternBytes(size)
 	cek := newCEK(t)
 	blob, desc := encryptWithDescriptor(t, plaintext, cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(size))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(size))
 
 	got, err := desc.PlaintextSize(int64(len(blob)))
 	require.NoError(t, err)

@@ -118,7 +118,7 @@ const (
 	labelChunkSize int64 = -1
 	// labelPlaintextLength holds the exact plaintext length, in bytes. It is
 	// emitted only when the length is known before encryption
-	// ([WithContentLength]) and is not required to decrypt. Each plaintext
+	// ([WithPlaintextLength]) and is not required to decrypt. Each plaintext
 	// length has one valid ciphertext length, so a reader checks it against
 	// the blob size and detects any truncation, even a range that never reads
 	// the final chunk.
@@ -147,7 +147,7 @@ var bodyUnderstoodLabels = map[int64]bool{
 
 // MaxPlaintextLength is the largest plaintext length an envelope may declare:
 // 2^53 - 1, JavaScript's largest safe integer. The Synapse SDK rejects a larger
-// declared length, so a decoder rejects one as malformed and [WithContentLength]
+// declared length, so a decoder rejects one as malformed and [WithPlaintextLength]
 // refuses to write one. It is about 8 PiB, far beyond any real object.
 const MaxPlaintextLength = maxSafeInteger
 
@@ -315,17 +315,17 @@ var (
 	// was not 32 bytes or was all zeros.
 	ErrInvalidCEK = errors.New("fee: content-encryption key must be 32 bytes and not all zeros")
 
-	// ErrContentLengthMismatch means the plaintext length declared via
-	// WithContentLength did not match the number of bytes actually read; it
+	// ErrPlaintextLengthMismatch means the plaintext length declared via
+	// WithPlaintextLength did not match the number of bytes actually read; it
 	// surfaces from the returned reader, and the envelope's declared length
 	// (already written) is not to be trusted.
-	ErrContentLengthMismatch = errors.New("fee: plaintext length did not match the declared content length")
+	ErrPlaintextLengthMismatch = errors.New("fee: plaintext did not match the declared plaintext length")
 )
 
 // encryptConfig holds the resolved, optional Encrypt parameters.
 type encryptConfig struct {
-	chunkSize     int
-	contentLength int64 // < 0 means unknown (plaintext length omitted)
+	chunkSize       int
+	plaintextLength int64 // < 0 means unknown (plaintext length omitted)
 }
 
 // EncryptOption configures [Encrypt] and [EncryptWithCEK].
@@ -339,11 +339,12 @@ func WithChunkSize(n int) EncryptOption {
 	return func(c *encryptConfig) { c.chunkSize = n }
 }
 
-// WithContentLength declares the total plaintext length in bytes. When set to a
-// non-negative value, the envelope records it in the protected header, which
-// lets a reader detect a truncated blob from its size alone, and the returned
-// reader fails with [ErrContentLengthMismatch] if the plaintext turns out to be
-// a different length.
+// WithPlaintextLength declares the total plaintext length in bytes, such as
+// the Content-Length of an upload being encrypted. When set to a non-negative
+// value, the envelope records it in the protected header, which lets a reader
+// detect a truncated blob from its size alone, and the returned reader fails
+// with [ErrPlaintextLengthMismatch] if the plaintext turns out to be a
+// different length.
 //
 // n must be at most [MaxPlaintextLength]; a larger n fails the encrypt call
 // before any plaintext is read.
@@ -353,8 +354,8 @@ func WithChunkSize(n int) EncryptOption {
 // behavior (no recorded length, no mismatch check) rather than an error. When
 // unknown, the length is omitted — the object still decrypts, and range
 // decryption derives the geometry from the ciphertext length alone.
-func WithContentLength(n int64) EncryptOption {
-	return func(c *encryptConfig) { c.contentLength = n }
+func WithPlaintextLength(n int64) EncryptOption {
+	return func(c *encryptConfig) { c.plaintextLength = n }
 }
 
 // Encrypt seals plaintext into a FEE envelope (a COSE_Encrypt, tag 96) addressed
@@ -456,7 +457,7 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		}
 	}
 
-	cfg := encryptConfig{chunkSize: aesstream.DefaultChunkSize, contentLength: -1}
+	cfg := encryptConfig{chunkSize: aesstream.DefaultChunkSize, plaintextLength: -1}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -470,8 +471,8 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		// sentinel aesstream.NewWriter would return for this size.
 		return nil, BodyDescriptor{}, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
 	}
-	if cfg.contentLength > MaxPlaintextLength {
-		return nil, BodyDescriptor{}, fmt.Errorf("fee: content length %d exceeds MaxPlaintextLength (%d)", cfg.contentLength, int64(MaxPlaintextLength))
+	if cfg.plaintextLength > MaxPlaintextLength {
+		return nil, BodyDescriptor{}, fmt.Errorf("fee: plaintext length %d exceeds MaxPlaintextLength (%d)", cfg.plaintextLength, int64(MaxPlaintextLength))
 	}
 
 	baseNonce, err := aesstream.NewBaseNonce()
@@ -488,8 +489,8 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		Set(cose.HeaderLabelType, EnvelopeType).
 		Set(cose.HeaderLabelIV, baseNonce).
 		Set(labelChunkSize, int64(cfg.chunkSize))
-	if cfg.contentLength >= 0 {
-		protected.Set(labelPlaintextLength, cfg.contentLength)
+	if cfg.plaintextLength >= 0 {
+		protected.Set(labelPlaintextLength, cfg.plaintextLength)
 	}
 	headers := cose.Headers{
 		Protected:   protected,
@@ -535,8 +536,8 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	// is read: no goroutine, no pipe, and each sealed chunk reaches the consumer
 	// in one piece (see aesstream.EncryptReader).
 	src := plaintext
-	if cfg.contentLength >= 0 {
-		src = &lengthCheckedReader{r: plaintext, declared: cfg.contentLength}
+	if cfg.plaintextLength >= 0 {
+		src = &lengthCheckedReader{r: plaintext, declared: cfg.plaintextLength}
 	}
 	body, err := aesstream.NewEncryptReader(src, aesstream.Config{
 		Key:       cek,
@@ -559,8 +560,8 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	return &encryptReader{header: header, body: body}, descriptor, nil
 }
 
-// lengthCheckedReader enforces [WithContentLength]: it passes plaintext
-// through and turns the source's EOF into [ErrContentLengthMismatch] when the
+// lengthCheckedReader enforces [WithPlaintextLength]: it passes plaintext
+// through and turns the source's EOF into [ErrPlaintextLengthMismatch] when the
 // byte count differs from the declared length (and fails as soon as the
 // count exceeds it). The body cipher sees a read error, not EOF, so it never
 // seals the final chunk: the ciphertext produced so far is truncated and
@@ -576,10 +577,10 @@ func (l *lengthCheckedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	l.n += int64(n)
 	if l.n > l.declared {
-		return n, fmt.Errorf("%w: declared %d, got more", ErrContentLengthMismatch, l.declared)
+		return n, fmt.Errorf("%w: declared %d, got more", ErrPlaintextLengthMismatch, l.declared)
 	}
 	if err == io.EOF && l.n != l.declared {
-		return n, fmt.Errorf("%w: declared %d, got %d", ErrContentLengthMismatch, l.declared, l.n)
+		return n, fmt.Errorf("%w: declared %d, got %d", ErrPlaintextLengthMismatch, l.declared, l.n)
 	}
 	return n, err
 }

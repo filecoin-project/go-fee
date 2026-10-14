@@ -13,7 +13,7 @@ import (
 // with the plaintext length the envelope declares: the blob is truncated or
 // padded, or the size came from the wrong object.
 //
-// The length rides in the protected header ([WithContentLength] writes it when
+// The length rides in the protected header ([WithPlaintextLength] writes it when
 // the plaintext length is known), so the envelope AAD covers it: an attacker can
 // neither adjust it to match a shortened blob nor strip it, since either change
 // fails every chunk's tag. The declared value is trustworthy once a chunk

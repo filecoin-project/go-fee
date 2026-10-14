@@ -699,31 +699,31 @@ func TestECDHRecipientProtectedBytes(t *testing.T) {
 	require.Equal(t, []byte{0xa1, 0x01, 0x38, 0x1e}, got, "recipient protected header")
 }
 
-// TestContentLengthPlaintextLength confirms the plaintext length is written to
+// TestPlaintextLengthWritten confirms the plaintext length is written to
 // the protected header only when it is declared, and that the envelope
 // decrypts either way.
-func TestContentLengthPlaintextLength(t *testing.T) {
+func TestPlaintextLengthWritten(t *testing.T) {
 	key := newX25519Key(t)
 	const chunk = aesstream.MinChunkSize
 	plaintext := patternBytes(3*chunk + 10) // 4 chunks
 
-	t.Run("present and correct when content length declared", func(t *testing.T) {
+	t.Run("present and correct when the length is declared", func(t *testing.T) {
 		blob, err := encrypt(t, plaintext,
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
-			fee.WithChunkSize(chunk), fee.WithContentLength(int64(len(plaintext))),
+			fee.WithChunkSize(chunk), fee.WithPlaintextLength(int64(len(plaintext))),
 		)
 		require.NoError(t, err)
 
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
 		n, ok := env.Headers.Protected.Int(labelPlaintextLength)
-		require.True(t, ok, "plaintext length present when content length declared")
+		require.True(t, ok, "plaintext length present when declared")
 		require.Equal(t, int64(len(plaintext)), n)
 
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewECDHESUnwrapper(ecdhKID, key)))
 	})
 
-	t.Run("omitted when content length unknown", func(t *testing.T) {
+	t.Run("omitted when the length is unknown", func(t *testing.T) {
 		blob, err := encrypt(t, plaintext,
 			[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 			fee.WithChunkSize(chunk),
@@ -733,17 +733,17 @@ func TestContentLengthPlaintextLength(t *testing.T) {
 		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
 		require.False(t, env.Headers.Protected.Has(labelPlaintextLength),
-			"plaintext length omitted when content length unknown")
+			"plaintext length omitted when unknown")
 
 		require.Equal(t, plaintext, decryptAll(t, blob, fee.NewECDHESUnwrapper(ecdhKID, key)))
 	})
 }
 
-// TestContentLengthMismatch confirms that when the declared content length does
+// TestPlaintextLengthMismatch confirms that when the declared plaintext length does
 // not match the plaintext actually streamed, the returned reader surfaces
-// ErrContentLengthMismatch (the already-written plaintext length cannot be
+// ErrPlaintextLengthMismatch (the already-written plaintext length cannot be
 // trusted).
-func TestContentLengthMismatch(t *testing.T) {
+func TestPlaintextLengthMismatch(t *testing.T) {
 	key := newX25519Key(t)
 	// Multiple chunks, so some full chunks are emitted before the final chunk is
 	// withheld on the mismatch.
@@ -752,14 +752,14 @@ func TestContentLengthMismatch(t *testing.T) {
 	enc, _, err := fee.Encrypt(bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize),
-		fee.WithContentLength(int64(len(plaintext)+1)), // declare one byte too many
+		fee.WithPlaintextLength(int64(len(plaintext)+1)), // declare one byte too many
 	)
 	require.NoError(t, err)
 	defer enc.Close()
 
 	// The mismatch surfaces as a non-EOF error from the reader...
 	blob, err := io.ReadAll(enc)
-	require.ErrorIs(t, err, fee.ErrContentLengthMismatch)
+	require.ErrorIs(t, err, fee.ErrPlaintextLengthMismatch)
 
 	// ...and because the final chunk was withheld, the bytes produced so far do
 	// not decrypt cleanly: a caller that ignored the error and stored the blob
@@ -1168,7 +1168,7 @@ func withUnprotected(t *testing.T, blob []byte, label, value any) []byte {
 func TestDecryptReaderCloses(t *testing.T) {
 	cek, plaintext := newCEK(t), patternBytes(3*aesstream.MinChunkSize)
 	for name, opts := range map[string][]fee.EncryptOption{
-		"declared length": {fee.WithChunkSize(aesstream.MinChunkSize), fee.WithContentLength(int64(len(plaintext)))},
+		"declared length": {fee.WithChunkSize(aesstream.MinChunkSize), fee.WithPlaintextLength(int64(len(plaintext)))},
 		"no length":       {fee.WithChunkSize(aesstream.MinChunkSize)},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1716,10 +1716,10 @@ func TestContentTypeEitherBucket(t *testing.T) {
 // TestPlaintextLengthSafeIntegerBound: a declared plaintext length above
 // MaxPlaintextLength (2^53 - 1, which the Synapse SDK rejects) is malformed on
 // every decode path, MaxPlaintextLength itself gets as far as the size check,
-// and WithContentLength refuses to write a larger one.
+// and WithPlaintextLength refuses to write a larger one.
 func TestPlaintextLengthSafeIntegerBound(t *testing.T) {
 	cek := newCEK(t)
-	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, nil, fee.WithContentLength(100))
+	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(patternBytes(100)), cek, nil, fee.WithPlaintextLength(100))
 	require.NoError(t, err)
 	blob, err := io.ReadAll(rc)
 	require.NoError(t, err)
@@ -1747,10 +1747,10 @@ func TestPlaintextLengthSafeIntegerBound(t *testing.T) {
 	_, err = fee.PlaintextSize(bytes.NewReader(atMax), int64(len(atMax)))
 	require.ErrorIs(t, err, fee.ErrSizeMismatch, "the bound itself is a valid length")
 
-	_, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithContentLength(fee.MaxPlaintextLength+1))
-	require.Error(t, err, "WithContentLength over the bound")
-	rc, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithContentLength(fee.MaxPlaintextLength))
-	require.NoError(t, err, "WithContentLength at the bound")
+	_, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithPlaintextLength(fee.MaxPlaintextLength+1))
+	require.Error(t, err, "WithPlaintextLength over the bound")
+	rc, _, err = fee.EncryptWithCEK(bytes.NewReader(nil), cek, nil, fee.WithPlaintextLength(fee.MaxPlaintextLength))
+	require.NoError(t, err, "WithPlaintextLength at the bound")
 	require.NoError(t, rc.Close())
 }
 

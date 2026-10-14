@@ -200,7 +200,7 @@ func TestDecryptRangeRoundTrip(t *testing.T) {
 
 func testRangeRoundTrip(t *testing.T, size int64) {
 	t.Helper()
-	f := newRangeFixture(t, int(size), fee.WithContentLength(size))
+	f := newRangeFixture(t, int(size), fee.WithPlaintextLength(size))
 
 	cases := []struct {
 		name       string
@@ -650,7 +650,7 @@ func TestDecryptRangeGeometryCorners(t *testing.T) {
 // unchanged.
 func TestDecryptRangePlaintextLengthMismatch(t *testing.T) {
 	const size = 4 * rangeChunk
-	f := newRangeFixture(t, size, fee.WithContentLength(size))
+	f := newRangeFixture(t, size, fee.WithPlaintextLength(size))
 	blobSize := int64(len(f.blob))
 	encChunk := int64(rangeChunk + aesstream.TagSize)
 
@@ -709,7 +709,7 @@ func TestDecryptRejectsTrailingEmptyFinalChunk(t *testing.T) {
 // affected chunks are read.
 func TestDecryptRangeWrongBlobSizeNoPlaintextLength(t *testing.T) {
 	const size = 4 * rangeChunk
-	f := newRangeFixture(t, size) // no WithContentLength, so no declared length
+	f := newRangeFixture(t, size) // no WithPlaintextLength, so no declared length
 	blobSize := int64(len(f.blob))
 	encChunk := int64(rangeChunk + aesstream.TagSize)
 
@@ -879,7 +879,7 @@ func TestPlaintextSize(t *testing.T) {
 // agree byte-for-byte with the corresponding slice of a full Decrypt.
 func TestDecryptRangeMatchesFullDecrypt(t *testing.T) {
 	const size = 5*rangeChunk + 123
-	f := newRangeFixture(t, size, fee.WithContentLength(size))
+	f := newRangeFixture(t, size, fee.WithPlaintextLength(size))
 
 	full := decryptAll(t, f.blob, f.unwrapper)
 	require.Equal(t, f.plaintext, full)
@@ -898,7 +898,7 @@ func TestDecryptRangeMatchesFullDecrypt(t *testing.T) {
 func encryptWithCEKBlob(t *testing.T, plaintext, cek []byte) []byte {
 	t.Helper()
 	rc, _, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek, nil,
-		fee.WithChunkSize(rangeChunk), fee.WithContentLength(int64(len(plaintext))))
+		fee.WithChunkSize(rangeChunk), fee.WithPlaintextLength(int64(len(plaintext))))
 	require.NoError(t, err)
 	defer rc.Close()
 	blob, err := io.ReadAll(rc)
