@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.2
-	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/stretchr/testify v1.11.1
 )
 
