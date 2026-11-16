@@ -1,5 +1,5 @@
 // driver.ts drives the real (pinned) TypeScript FEE reference,
-// @filoz/filecoin-encryption-envelope from synapse-sdk, to (re)generate and
+// filecoin-encryption-envelope from synapse-sdk, to (re)generate and
 // verify the FEE cross-implementation fixtures under ../testdata. It is invoked
 // by ../pull-synapse-fee.sh, which vendors the pinned source into
 // ./vendor/filecoin-encryption-envelope and installs its dependencies. Run with
@@ -26,7 +26,7 @@ import { join } from 'node:path'
 const HERE = import.meta.dirname
 const TESTDATA = join(HERE, '..', 'testdata')
 
-// Must match the Go side (fee/vectors/helpers_test.go) and FIP-1253.
+// Must match the Go side (fee/vectors/helpers_test.go) and FRC-0120.
 const FEE_TYP = 'application/vnd.filecoin-encryption+cose'
 const ALG_CHUNKED = -65793
 const ALG_A256KW = -5
