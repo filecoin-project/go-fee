@@ -19,7 +19,7 @@ import (
 )
 
 // FEE wire constants mirrored for white-box assertions. They MUST match the
-// unexported values in fee.go (and FIP-1253): the body algorithm and the
+// unexported values in fee.go (and FRC-0120): the body algorithm and the
 // protected header labels carrying the STREAM geometry and application
 // metadata. Tests read them straight off a produced envelope with the cose
 // package, so a drift in either place surfaces here.
@@ -617,7 +617,7 @@ func TestDecryptNilArgs(t *testing.T) {
 }
 
 // TestEnvelopeWireConventions decodes a produced envelope with the cose package
-// directly and asserts the FEE wire conventions of FIP-1253: the protected
+// directly and asserts the FEE wire conventions of FRC-0120: the protected
 // header carries the envelope type, the STREAM body algorithm, the base nonce
 // in the iv and the chunk size at label -1; the unprotected header is empty;
 // and the recipient entry carries the expected algorithm, kid and a

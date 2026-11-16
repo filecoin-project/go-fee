@@ -4,12 +4,12 @@ Fixed fixtures that pin the **FEE (Filecoin Encryption Envelope)** wire format
 across two implementations:
 
 - **Go** — this repo's `cose`, `aesstream`, `ecdhkw`, `aeskw`.
-- **TypeScript** — `@filoz/filecoin-encryption-envelope`
+- **TypeScript** — `filecoin-encryption-envelope`
   ([`FilOzone/synapse-sdk`](https://github.com/FilOzone/synapse-sdk),
   `packages/filecoin-encryption-envelope`), **pinned** in
   [`pull-synapse-fee.sh`](./pull-synapse-fee.sh) to `6883ba8…` on `master`.
 
-Both follow FIP-1253 with the amendments FilOz's implementation guide adopts:
+Both follow FRC-0120:
 every body parameter protected, chunk size at label `-1`, an optional
 plaintext length at `-65789`, and one encoding per plaintext length (see
 [Wire format](#wire-format)).

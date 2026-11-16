@@ -2,11 +2,10 @@
 // cross-implementation test vectors: fixed fixture blobs that must decrypt
 // identically under this Go implementation (fee/cose, fee/aesstream,
 // fee/ecdhkw, fee/aeskw) and under the TypeScript reference implementation,
-// @filoz/filecoin-encryption-envelope (github.com/FilOzone/synapse-sdk,
+// filecoin-encryption-envelope (github.com/FilOzone/synapse-sdk,
 // packages/filecoin-encryption-envelope), pinned in pull-synapse-fee.sh.
 //
-// Both follow FIP-1253 with the amendments FilOz's implementation guide
-// adopts. The shape, verified against the pinned commit, is:
+// Both follow FRC-0120. The shape, verified against the pinned commit, is:
 //
 //	blob        = envelope || ciphertext          (detached payload)
 //	envelope    = 16([protected, unprotected, null])                for no recipients

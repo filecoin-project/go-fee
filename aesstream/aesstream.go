@@ -12,8 +12,7 @@
 //
 // lastFlag is 0x01 on the final chunk and 0x00 on every other chunk.
 // This is the STREAM construction of Hoang, Reyhanitabar, Rogaway and
-// Vizár, with the nonce layout fixed by the FEE spec (see the FilOne
-// encryption RFC and filecoin-project/FIPs discussion #1253). The
+// Vizár, with the nonce layout fixed by the FEE spec, FRC-0120. The
 // io.Reader/io.Writer wrapping, the last-chunk look-ahead and the
 // truncation/reorder detection follow the same idioms as
 // filippo.io/age's internal/stream — age uses ChaCha20-Poly1305 and an
@@ -157,8 +156,10 @@ type Config struct {
 	Key []byte
 
 	// BaseNonce is the 7-byte base nonce (the envelope's `iv`). Required.
-	// It must be unique per (Key) — the fee/envelope layer generates a
-	// fresh random one per segment; see NewBaseNonce.
+	// An encryptor must draw a fresh random one for every stream with
+	// NewBaseNonce, as the fee package does; FRC-0120 reserves a fixed
+	// value for test tooling that needs reproducible output. A decryptor
+	// passes the one the envelope carries.
 	BaseNonce []byte
 
 	// AAD is additional authenticated data bound to every chunk (the COSE
