@@ -1,10 +1,10 @@
 {
   "name": "empty-file-go",
   "producer": "go",
-  "description": "Empty plaintext encrypted in Go (one empty final chunk, tag-only body); decrypts in foc-encryption (TS).",
+  "description": "Empty plaintext encrypted in Go (one empty final chunk, tag-only body); decrypts in filecoin-encryption-envelope (TS).",
   "tag": 16,
   "algorithm": -65793,
-  "typ": "application/vnd.foc-envelope+cose",
+  "typ": "application/vnd.filecoin-encryption+cose",
   "chunk_size": 4096,
   "chunk_count": 1,
   "cek_hex": "6f5534da03dcab453ffb8d3f4f52f466f1d41f4daeb8c5170ba7b1a489172ef9",

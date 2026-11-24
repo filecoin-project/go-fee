@@ -52,7 +52,7 @@ func ExampleDecryptRangeWithCEK_withBodyDescriptor() {
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
 	enc, descriptor, err := fee.EncryptWithCEK(bytes.NewReader(plaintext), cek,
 		[]fee.Recipient{fee.NewECDHESRecipient(kid, priv.PublicKey())},
-		fee.WithContentLength(int64(len(plaintext))))
+		fee.WithPlaintextLength(int64(len(plaintext))))
 	if err != nil {
 		log.Fatal(err)
 	}

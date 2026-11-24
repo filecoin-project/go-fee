@@ -15,7 +15,7 @@ import (
 // is a self-describing COSE_Key map — not raw bytes — so a decoder learns the
 // curve from the key itself; this matches standard COSE (RFC 9052 §7,
 // RFC 9053 §7.1; IANA "COSE Key Common Parameters" and "COSE Key Type
-// Parameters") and the foc-encryption reference. The map is:
+// Parameters"). The map is:
 //
 //	{ 1: 1 (kty: OKP), -1: 4 (crv: X25519), -2: <x, the public-key bytes> }
 const (
@@ -59,17 +59,16 @@ type ecdhESRecipient struct {
 // ECDH-ES+A256KW: a fresh ephemeral X25519 key agreement derives a key-encryption
 // key, which A256KW-wraps the CEK. pub must be an X25519 key (the only curve the
 // scheme supports). kid names the recipient key — e.g. a DID verification method
-// ID — and must be non-empty; the library treats it as opaque and records it in
-// the recipient entry so an [NewECDHESUnwrapper] with the same kid can be matched
-// to it.
+// ID; the library treats it as opaque and records it in the recipient entry so
+// an [NewECDHESUnwrapper] with the same kid is matched to it. An empty kid is
+// left out of the entry, and a decryptor then finds the recipient by trying
+// its keys (see [RecipientUnwrapper]); pass one wherever a decryptor may hold
+// more than one key.
 func NewECDHESRecipient(kid []byte, pub *ecdh.PublicKey) Recipient {
 	return &ecdhESRecipient{pub: pub, kid: kid}
 }
 
 func (r *ecdhESRecipient) validate() error {
-	if len(r.kid) == 0 {
-		return errors.New("ECDH-ES recipient requires a non-empty kid")
-	}
 	if r.pub == nil {
 		return errors.New("nil ECDH-ES recipient public key")
 	}
@@ -101,8 +100,7 @@ func (r *ecdhESRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 	return &cose.Recipient{
 		Headers: cose.Headers{
 			Protected: protected,
-			Unprotected: cose.Header{}.
-				Set(cose.HeaderLabelKID, r.kid).
+			Unprotected: withKID(cose.Header{}, r.kid).
 				Set(cose.HeaderLabelEphemeralKey, map[any]any{
 					coseKeyLabelKty:    coseKeyTypeOKP,
 					coseKeyLabelCrv:    coseKeyCurveX25519,
@@ -114,7 +112,8 @@ func (r *ecdhESRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 }
 
 // a256kwRecipient wraps the CEK under a symmetric key-encryption key (KEK) with
-// A256KW (RFC 3394). Its kid is supplied by the caller and names the KEK.
+// A256KW (RFC 3394). Its kid, if any, is supplied by the caller and names the
+// KEK.
 type a256kwRecipient struct {
 	kid []byte
 	kek []byte
@@ -122,8 +121,10 @@ type a256kwRecipient struct {
 
 // NewA256KWRecipient returns a [Recipient] that wraps the CEK under kek with
 // A256KW. kid names the KEK and is recorded in the recipient entry so an
-// [NewA256KWUnwrapper] holding the same KEK can be matched to it; kid must be
-// non-empty. kek must be 32 bytes: A256KW is AES-256 Key Wrap, and the recipient
+// [NewA256KWUnwrapper] with the same kid is matched to it. An empty kid is left
+// out of the entry, and a decryptor then finds the recipient by trying its
+// keys (see [RecipientUnwrapper]); pass one wherever a decryptor may hold more
+// than one key. kek must be 32 bytes: A256KW is AES-256 Key Wrap, and the recipient
 // declares that algorithm, so a shorter key would misname the wrap.
 //
 // Where the KEK is held by an external custody service that unwraps the CEK
@@ -134,9 +135,6 @@ func NewA256KWRecipient(kid, kek []byte) Recipient {
 }
 
 func (r *a256kwRecipient) validate() error {
-	if len(r.kid) == 0 {
-		return errors.New("A256KW recipient requires a non-empty kid")
-	}
 	if len(r.kek) != 32 {
 		return fmt.Errorf("A256KW recipient KEK must be 32 bytes, got %d", len(r.kek))
 	}
@@ -151,13 +149,22 @@ func (r *a256kwRecipient) wrap(cek []byte) (*cose.Recipient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fee: A256KW wrap: %w", err)
 	}
+	// RFC 9053 §6.2.1: an AES Key Wrap recipient's protected header MUST be
+	// empty (encoded as a zero-length byte string), so its algorithm rides in
+	// the unprotected header.
 	return &cose.Recipient{
 		Headers: cose.Headers{
-			Protected: cose.Header{}.
-				Set(cose.HeaderLabelAlg, cose.AlgA256KW),
-			Unprotected: cose.Header{}.
-				Set(cose.HeaderLabelKID, r.kid),
+			Unprotected: withKID(cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgA256KW), r.kid),
 		},
 		Ciphertext: wrapped,
 	}, nil
+}
+
+// withKID sets kid in h, unless it is empty: a recipient without a kid leaves
+// the label out rather than carrying an empty byte string.
+func withKID(h cose.Header, kid []byte) cose.Header {
+	if len(kid) == 0 {
+		return h
+	}
+	return h.Set(cose.HeaderLabelKID, kid)
 }

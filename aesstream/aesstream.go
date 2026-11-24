@@ -12,8 +12,7 @@
 //
 // lastFlag is 0x01 on the final chunk and 0x00 on every other chunk.
 // This is the STREAM construction of Hoang, Reyhanitabar, Rogaway and
-// Vizár, with the nonce layout fixed by the FEE spec (see the FilOne
-// encryption RFC and filecoin-project/FIPs discussion #1253). The
+// Vizár, with the nonce layout fixed by the FEE spec, FRC-0120. The
 // io.Reader/io.Writer wrapping, the last-chunk look-ahead and the
 // truncation/reorder detection follow the same idioms as
 // filippo.io/age's internal/stream — age uses ChaCha20-Poly1305 and an
@@ -35,6 +34,12 @@
 // remainder (1..ChunkSize bytes), or is empty for empty input. The
 // empty plaintext is encoded as a single empty final chunk (just the
 // 16-byte tag), so the ciphertext stream is never zero-length.
+//
+// Each plaintext length has exactly one encoding. A plaintext that is an
+// exact multiple of ChunkSize ends in a full final chunk, never in a full
+// chunk followed by an empty one; an empty final chunk is valid only as
+// the sole chunk of an empty plaintext, and decoders reject it anywhere
+// else (ErrCiphertextSize).
 //
 // The chunk index is a 4-byte counter, so a single stream holds at most
 // MaxChunks chunks (~1 PiB at the default chunk size); exceeding that is
@@ -95,9 +100,10 @@ const (
 	MinChunkSize = 4 * 1024
 	MaxChunkSize = 16 * 1024 * 1024
 
-	// MaxChunks is the number of chunks a single stream may contain. The
-	// chunk index is a uint32, so valid indices run 0 .. MaxChunks-1.
-	MaxChunks = 1 << 32
+	// MaxChunks is the number of chunks a single stream may contain, per the
+	// FEE spec: 2^32 − 1, so the uint32 chunk index runs 0 .. MaxChunks-1 and
+	// never reaches its last value.
+	MaxChunks = 1<<32 - 1
 )
 
 // last-chunk flag values for the final nonce byte.
@@ -150,8 +156,10 @@ type Config struct {
 	Key []byte
 
 	// BaseNonce is the 7-byte base nonce (the envelope's `iv`). Required.
-	// It must be unique per (Key) — the fee/envelope layer generates a
-	// fresh random one per segment; see NewBaseNonce.
+	// An encryptor must draw a fresh random one for every stream with
+	// NewBaseNonce, as the fee package does; FRC-0120 reserves a fixed
+	// value for test tooling that needs reproducible output. A decryptor
+	// passes the one the envelope carries.
 	BaseNonce []byte
 
 	// AAD is additional authenticated data bound to every chunk (the COSE

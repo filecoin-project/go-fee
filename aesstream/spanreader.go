@@ -11,12 +11,14 @@ import (
 // Range-decryption errors, in addition to the decryption sentinels in
 // aesstream.go.
 var (
-	// ErrCiphertextSize is returned when a declared ciphertext length cannot
-	// be a structurally valid stream: it is shorter than a single (empty)
-	// chunk, or its trailing chunk is too short to hold an authentication
-	// tag. It is a structural complaint about the length the caller supplied,
-	// distinct from ErrCorrupted (a chunk that failed authentication).
-	ErrCiphertextSize = fmt.Errorf("aesstream: ciphertext length is not a valid stream (the final chunk must be at least %d bytes, to hold the tag)", TagSize)
+	// ErrCiphertextSize is returned when a ciphertext length cannot be a
+	// structurally valid stream: it is shorter than a single (empty) chunk,
+	// its trailing chunk is too short to hold an authentication tag, or it
+	// ends in an empty chunk after a full one (only an empty plaintext has
+	// an empty final chunk). It is a structural complaint about the length,
+	// whether declared for a range or found by Reader at the end of the
+	// stream, distinct from ErrCorrupted (a chunk that failed authentication).
+	ErrCiphertextSize = errors.New("aesstream: ciphertext length is not a valid stream")
 
 	// ErrRange is returned when a requested plaintext range is unsatisfiable:
 	// a negative start, an end before the start, or a start past the last
@@ -50,8 +52,9 @@ func resolveChunkSize(chunkSize int) (int, error) {
 
 // chunkLayout derives a stream's chunk geometry from its total ciphertext
 // length. Each ciphertext chunk is chunkSize+TagSize bytes except the
-// final one, which holds the remainder (TagSize..chunkSize+TagSize bytes;
-// exactly TagSize for an empty-plaintext stream). It returns the chunk
+// final one, which holds the remainder (TagSize+1..chunkSize+TagSize
+// bytes, or exactly TagSize when it is the only chunk, for an empty
+// plaintext). It returns the chunk
 // count, the byte length of the final chunk, and the total plaintext
 // length, or ErrCiphertextSize if ciphertextSize is not a structurally
 // valid stream length, or ErrTooManyChunks if it implies more than
@@ -73,9 +76,14 @@ func chunkLayout(ciphertextSize int64, chunkSize int) (numChunks, lastCipherLen,
 	case r < TagSize:
 		// A trailing fragment too short to even hold a tag: malformed.
 		return 0, 0, 0, ErrCiphertextSize
+	case r == TagSize && q > 0:
+		// An empty final chunk after full ones: the last full chunk should
+		// have been the final chunk. Only an empty plaintext ends in an empty
+		// chunk, as its only chunk.
+		return 0, 0, 0, ErrCiphertextSize
 	default:
-		// A partial (1..chunkSize-byte plaintext) or empty (TagSize-byte)
-		// final chunk follows q full chunks.
+		// A partial (1..chunkSize-byte plaintext) final chunk follows q full
+		// chunks, or the stream is a single empty (TagSize-byte) chunk.
 		numChunks, lastCipherLen = q+1, r
 	}
 
@@ -109,14 +117,8 @@ func DecryptedSize(ciphertextLen int64, chunkSize int) (int64, error) {
 // (else ErrChunkSize), the same rule as Config.ChunkSize. It returns
 // ErrCiphertextSize if ciphertextLen is not a structurally valid stream length.
 //
-// The count is not derivable from the plaintext length, which is why this is
-// worth asking for: the final chunk may be full, partial, or empty, so a
-// plaintext of exactly k*chunkSize bytes is a valid stream of either k chunks
-// (the last one full) or k+1 (the last one empty). Both are read the same way
-// and yield the same plaintext, and only the ciphertext length tells them apart.
-// A caller checking a stream against a separately recorded chunk count should
-// compare against this rather than against ceil(plaintextLen/chunkSize), which
-// only describes the first form.
+// Each plaintext length has one encoding, so the count is also
+// max(1, ceil(plaintextLen/chunkSize)) for the stream's plaintext length.
 func ChunkCount(ciphertextLen int64, chunkSize int) (int64, error) {
 	chunkSize, err := resolveChunkSize(chunkSize)
 	if err != nil {

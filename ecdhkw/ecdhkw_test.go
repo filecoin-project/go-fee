@@ -210,7 +210,7 @@ func TestUnwrapInputValidation(t *testing.T) {
 // TestKnownAnswerVector pins the ECDH-ES+A256KW construction to a fixed
 // decryption vector: a known recipient private key, ephemeral public key, and
 // wrapped CEK must Unwrap to a known CEK. This is the gold vector for the
-// cross-implementation tests (foc-encryption / FIL-473). Encryption is
+// cross-implementation tests (fee/vectors). Encryption is
 // nondeterministic (a fresh ephemeral key per wrap), so the shared anchor is
 // the decrypt direction — which any conforming implementation must reproduce
 // without an injection seam. It exercises the full path end to end: X25519
