@@ -52,7 +52,7 @@
 // algorithm (chunked AES-256-GCM-STREAM), the STREAM base nonce in the COSE iv
 // parameter, the plaintext chunk size and — when the plaintext length is known —
 // the plaintext length. The body unprotected header is empty. These conventions
-// follow FIP-1253 and the FEE cross-implementation vectors (see fee/vectors).
+// follow FRC-0120 and the FEE cross-implementation vectors (see fee/vectors).
 //
 // # Streaming
 //
@@ -98,7 +98,7 @@ import (
 // EnvelopeType is the COSE "typ" (RFC 9596, header label 16) that every FEE
 // envelope is pinned to. [Encrypt] writes it into the body protected header and
 // [Decrypt] requires it on decode, so a blob that is not a FEE envelope is
-// rejected before any key material is touched. Its value is the one FIP-1253
+// rejected before any key material is touched. Its value is the one FRC-0120
 // defines.
 const EnvelopeType = "application/vnd.filecoin-encryption+cose"
 
@@ -113,7 +113,7 @@ const algChunkedAES256GCMStream int64 = -65793
 // them, or the iv, in its unprotected header is malformed.
 const (
 	// labelChunkSize holds the STREAM plaintext chunk size, in bytes. It is
-	// required. FIP-1253 places it at -1, a label whose meaning COSE scopes to
+	// required. FRC-0120 places it at -1, a label whose meaning COSE scopes to
 	// the algorithm (RFC 9052 §3.1), here chunked AES-256-GCM-STREAM.
 	labelChunkSize int64 = -1
 	// labelPlaintextLength holds the exact plaintext length, in bytes. It is
@@ -402,7 +402,7 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 
 // EncryptWithCEK is [Encrypt] with a caller-provided content-encryption key
 // instead of a freshly generated one — for when the CEK is managed out of band
-// (derived deterministically, or issued by a custody service). cek must be 32
+// (derived from a master key, or issued by a custody service). cek must be 32
 // bytes (AES-256) and not all zeros, or the call fails with [ErrInvalidCEK].
 //
 // With one or more recipients it produces a COSE_Encrypt (tag 96) that also
@@ -410,16 +410,19 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // COSE_Encrypt0 (tag 16). Pair it with [DecryptWithCEK] to recover without an
 // in-envelope unwrap.
 //
-// The caller MUST use a distinct cek per envelope (or keep reuse far below the
-// birthday bound below). Unlike [Encrypt], which draws a fresh CEK each call,
-// this seals under a caller-supplied key — so the only cross-envelope nonce
-// separation is the random base nonce, which is [aesstream.BaseNonceSize] (7)
-// bytes. Under a reused CEK, two envelopes drawing the same base nonce reuse an
-// AES-GCM (key, nonce) pair, which is catastrophic (keystream reuse + tag
-// forgery). A 7-byte random nonce collides at a ~2^28-envelope birthday bound,
-// so sealing on the order of 2^30 objects under one CEK makes a collision
-// essentially certain. The wire format is fixed by the FEE spec, so this is a
-// caller obligation, not something this package can enforce.
+// The caller MUST NOT use a cek for more than one encryption, as FRC-0120
+// requires; a retry of the same plaintext or an aborted attempt is another
+// encryption. A derived cek therefore needs an input that changes every time,
+// such as a random salt: one derived from the object's identifier alone repeats
+// when the object is encrypted again. Unlike [Encrypt], which draws a fresh
+// CEK each call, this seals under a caller-supplied key — so the only
+// cross-envelope nonce separation is the random base nonce, which is
+// [aesstream.BaseNonceSize] (7) bytes. Under a reused CEK, two envelopes
+// drawing the same base nonce reuse an AES-GCM (key, nonce) pair, which is
+// catastrophic (keystream reuse + tag forgery), and a 7-byte random nonce
+// collides at a ~2^28-envelope birthday bound. The wire format is fixed by the
+// FEE spec, so this is a caller obligation, not something this package can
+// enforce.
 //
 // The caller retains ownership of cek: it is copied into the body cipher (and
 // wrapped to any recipients) but neither retained nor wiped by this call.

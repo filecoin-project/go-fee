@@ -17,7 +17,7 @@ import (
 	"github.com/filecoin-project/go-fee/ecdhkw"
 )
 
-// FEE wire constants, per FIP-1253. The FEE-specific labels live here (the
+// FEE wire constants, per FRC-0120. The FEE-specific labels live here (the
 // caller), not in the FEE-agnostic cose package.
 const (
 	// feeTyp is the COSE protected "typ" (label 16) that pins the envelope

@@ -1,8 +1,8 @@
 # go-fee
 
 Go implementation of the **FEE (Filecoin Encryption Envelope)** — the
-standardized encryption container proposed in
-[filecoin-project/FIPs discussion #1253](https://github.com/filecoin-project/FIPs/discussions/1253).
+standard encryption container specified in
+[FRC-0120](https://github.com/filecoin-project/FIPs/blob/master/FRCs/frc-0120.md).
 
 FEE decouples encryption metadata from ciphertext so that encrypted data stored
 on Filecoin is portable across applications and key-management systems. A FEE
@@ -23,10 +23,9 @@ number of recipients — **ECDH-ES+A256KW** to an X25519 public key,
 **A256KW** under a pre-shared symmetric key, or managed entirely out of band —
 without re-encrypting the data.
 
-The wire format follows FIP-1253 with the amendments FilOz's TypeScript
-implementation, `@filoz/filecoin-encryption-envelope` in
-[`synapse-sdk`](https://github.com/FilOzone/synapse-sdk), adopts; this repo is
-pinned to that implementation by
+The wire format follows FRC-0120. This repo is pinned to FilOz's TypeScript
+implementation, `filecoin-encryption-envelope` in
+[`synapse-sdk`](https://github.com/FilOzone/synapse-sdk), by
 [cross-implementation test vectors](./vectors/README.md).
 
 ## Install
@@ -320,7 +319,7 @@ are built on `EncryptReader`, which is why their readers implement
 
 ### External CEK (recipient-less envelopes)
 
-When the CEK is managed out of band — derived deterministically, or issued and
+When the CEK is managed out of band — derived from a master key, or issued and
 unwrapped by a custody service — use `EncryptWithCEK` / `DecryptWithCEK`. With
 no recipients, the envelope is a recipient-less `COSE_Encrypt0` (tag 16).
 
@@ -349,11 +348,15 @@ func roundTripExternalCEK(data []byte) ([]byte, error) {
 }
 ```
 
-> **Warning:** use a distinct CEK per envelope. The only cross-envelope nonce
-> separation is the random 7-byte base nonce, which collides at a
-> ~2²⁸-envelope birthday bound — and an AES-GCM (key, nonce) reuse is
-> catastrophic. `fee.Encrypt` draws a fresh CEK every call; with
-> `EncryptWithCEK` this is the caller's obligation.
+> **Warning:** never use a CEK for more than one encryption. FRC-0120 forbids
+> it, and a retry of the same plaintext or an aborted attempt counts as another
+> encryption. The only cross-envelope nonce separation is the random 7-byte
+> base nonce, which collides at a ~2²⁸-envelope birthday bound, and an AES-GCM
+> (key, nonce) reuse is catastrophic. `fee.Encrypt` draws a fresh CEK every
+> call; with `EncryptWithCEK` this is the caller's obligation. A derived CEK
+> needs an input that changes for every encryption, such as a random salt: one
+> derived from the object's identifier alone repeats when the object is
+> encrypted again.
 
 A CEK must be 32 bytes and not all zeros. Every entry point that takes one
 rejects any other key with `fee.ErrInvalidCEK`, and so does decryption when a
@@ -526,7 +529,7 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
   plaintext length has exactly one encoding: a plaintext of exactly
   `k × chunkSize` bytes ends in a full final chunk, and a stream that ends in an
   empty chunk after full ones is rejected (`aesstream.ErrCiphertextSize`).
-- **Chunk size** (label −1) — required. FIP-1253 places it in COSE's
+- **Chunk size** (label −1) — required. FRC-0120 places it in COSE's
   algorithm-scoped label range (RFC 9052 §3.1).
 - **Plaintext length** (label −65789) — emitted only when the length is known
   before encryption, and not required to decrypt. Because each length has one
@@ -569,8 +572,8 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
   non-EOF error from a plaintext reader as "discard everything"; only a clean
   `io.EOF` means the object was intact and complete.
 - **CEK uniqueness.** `Encrypt` generates a fresh CEK per envelope. With
-  `EncryptWithCEK`, reusing a CEK across envelopes erodes the 7-byte base
-  nonce's birthday bound (see above).
+  `EncryptWithCEK` the caller must supply a new CEK for every encryption (see
+  above).
 - **Recipient matching.** A key is tried only against recipients of its own
   algorithm whose kid, in either header bucket, byte-for-byte equals its own,
   or where the key or the recipient has no kid. A wrong key fails the AES key
@@ -588,9 +591,11 @@ recipient   = [ h'',          { 1: -5, ? 4: kid }, wrappedKey ]   # A256KW
 
 ## Specifications and related work
 
-- [FIP discussion #1253 — Filecoin Encryption Envelope](https://github.com/filecoin-project/FIPs/discussions/1253)
-- [`@filoz/filecoin-encryption-envelope`](https://github.com/FilOzone/synapse-sdk/tree/master/packages/filecoin-encryption-envelope)
-  — TypeScript implementation and its implementation guide; see
+- [FRC-0120 — Filecoin Encryption Envelope](https://github.com/filecoin-project/FIPs/blob/master/FRCs/frc-0120.md), and the
+  [discussion](https://github.com/filecoin-project/FIPs/discussions/1253) it
+  came out of
+- [`filecoin-encryption-envelope`](https://github.com/FilOzone/synapse-sdk/tree/master/packages/filecoin-encryption-envelope)
+  — TypeScript implementation; see
   [`vectors/`](./vectors/README.md) for the cross-implementation fixtures
 - [`foc-encryption`](https://github.com/Kubuxu/foc-encryption-demo) — the
   original TypeScript demo of the envelope
