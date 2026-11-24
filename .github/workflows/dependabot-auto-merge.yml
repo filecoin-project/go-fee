@@ -20,8 +20,16 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for patch and minor updates
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+      # Go module updates change the library we ship, so they always wait for
+      # a manual review. GitHub Actions and the vectors/ts fixture harness
+      # don't, so their patch and minor updates merge once CI passes.
+      - name: Enable auto-merge for GitHub Actions and vectors/ts updates
+        if: >-
+          (steps.metadata.outputs.package-ecosystem == 'github_actions' ||
+            (steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' &&
+              steps.metadata.outputs.directory == '/vectors/ts')) &&
+          (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+            steps.metadata.outputs.update-type == 'version-update:semver-minor')
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
