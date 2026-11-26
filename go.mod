@@ -3,7 +3,7 @@ module github.com/filecoin-project/go-fee
 go 1.25.7
 
 require (
-	github.com/fxamacker/cbor/v2 v2.9.2
+	github.com/fxamacker/cbor/v2 v2.10.0
 	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/stretchr/testify v1.11.1
 )
